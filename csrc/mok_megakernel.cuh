@@ -1477,59 +1477,39 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
-#if defined(MOK_SM90_STEPB)
-        mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256> *acc_p = nullptr;
-        __shared__ char acc_store[sizeof(mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256>) > 1 ? 1 : 1];
-        (void)acc_store;
-        mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256> acc;
-        acc_p = &acc;
-        if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) { // SM90 wgmma: fwd bf16 (wgrad=training-only, deferred)
+#if defined(KITTENS_SM90)
+        mok_sm90::wgmma_quad<a_tile, b_tile> quad;
+        if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
             int input_ring = 0;
-            if (warpgroup::laneid() == 0 && blockIdx.x < 2)
-                printf("[MOKDBG] cta=%d consumer enter iters=%d\n", (int)blockIdx.x, iters_per_task);
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 if (warpgroup::laneid() == 0)
                     tma::expect_bytes(gemm_inputs_arrived[input_ring],
-                        sizeof(a_tile) + sizeof(b_tile)); // SM90: 1x per local barrier
+                        2 * (sizeof(a_tile) + sizeof(b_tile)));
                 warpgroup::sync(2);
-                if (warpgroup::laneid() == 0 && blockIdx.x < 2 && idx == 0)
-                    printf("[MOKDBG] cta=%d expect done, waiting ring0\n", (int)blockIdx.x);
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
-                if (warpgroup::laneid() == 0 && blockIdx.x < 2 && idx == 0)
-                    printf("[MOKDBG] cta=%d input ring0 ARRIVED\n", (int)blockIdx.x);
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                acc.step(a_smem[input_ring], b_smem[input_ring], idx == 0);
+                quad.step(a_smem[input_ring], a_smem2[input_ring],
+                          b_smem[input_ring], b_smem2[input_ring], idx == 0);
                 if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
                 input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
             if (warpgroup::laneid() == 0) arrive(gemm_outputs_arrived);
         }
-
-#endif // MOK_SM90_STEPB
+#endif
 #endif
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
-#if defined(MOK_SM90_STEPB)
-            __shared__ st_bf<64, config::MLP_Nb> d_stage; // step-A staging (half 0)
+#if defined(KITTENS_SM90)
+            __shared__ st_bf<2 * 64, config::MLP_Nb> d_stage; // full task tile staging
             if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
-                warpgroup::store(d_stage, acc_p->acc[0]);
-                warpgroup::sync(1);
-                #pragma unroll
-                for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
-                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i});
-                    warpgroup::load(d_reg[i], stg);
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
-                    warp::zero(d_reg[i]);
+                quad.drain_to(d_stage);
             }
 #else
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
-                warp::zero(d_reg[i]); // pre-step-B scaffold
+                warp::zero(d_reg[i]);
 #endif
             tensor_load_wait();
             warpgroup::sync(1);
