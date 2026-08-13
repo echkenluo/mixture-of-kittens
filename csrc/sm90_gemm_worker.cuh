@@ -20,8 +20,7 @@ struct wgmma_acc {
     __device__ inline void step_ABt(const AST &a, const BST &b, bool first) {
         #pragma unroll
         for (int m = 0; m < MCH; ++m) {
-            auto &a_sub = subtile_inplace<64, AST::cols>(
-                const_cast<AST &>(a), {m, 0});
+            auto a_sub = const_cast<AST &>(a).template subtile<64, AST::cols>(int2{m, 0});
             if (first) warpgroup::mm_ABt (acc[m], a_sub, b);
             else       warpgroup::mma_ABt(acc[m], a_sub, b);
         }
@@ -30,7 +29,8 @@ struct wgmma_acc {
     template<typename DST> __device__ inline void drain_to(DST &d_smem) {
         #pragma unroll
         for (int m = 0; m < MCH; ++m)
-            warpgroup::store(subtile_inplace<64, DST::cols>(d_smem, {m, 0}), acc[m]);
+            { auto d_sub = d_smem.template subtile<64, DST::cols>(int2{m, 0});
+              warpgroup::store(d_sub, acc[m]); }
         warpgroup::sync(1);
     }
 };
