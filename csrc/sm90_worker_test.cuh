@@ -10,7 +10,7 @@ using namespace kittens;
 
 namespace wtest {
 using a_st = st_bf<128, 64>;
-using b_st = st_bf<64, 128>;
+using b_st = st_bf<64, 64>;
 using d_st = st_bf<128, 128>;
 using a_gl = gl<bf16, 1, 1, -1, -1, a_st>;
 using b_gl = gl<bf16, 1, 1, -1, -1, b_st>;
@@ -22,14 +22,20 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
     extern __shared__ int __shm[];
     shared_allocator al((int*)&__shm[0]);
     a_st &a_smem = al.allocate<a_st>();
-    b_st &b_smem = al.allocate<b_st>();
+    b_st &b_smem0 = al.allocate<b_st>();
+    b_st &b_smem1 = al.allocate<b_st>();
     d_st &d_smem = al.allocate<d_st>();
-    wgmma_acc<a_st, b_st, 128, 256> acc; // NB=256 -> acc cols 128 (N-half legacy param)
+    using a_half = st_bf<64, 64>;
+    wgmma_quad<a_half, b_st> acc;
     for (int k = 0; k < g.k_chunks; ++k) {
         warpgroup::load(a_smem, g.A, {0, k});
-        warpgroup::load(b_smem, g.B, {k, 0});
+        warpgroup::load(b_smem0, g.B, {k, 0});
+        warpgroup::load(b_smem1, g.B, {k, 1});
         warpgroup::sync(0);
-        acc.step(a_smem, b_smem, k == 0);
+        auto &a0 = *reinterpret_cast<a_half *>(&a_smem);
+        auto &a1 = *reinterpret_cast<a_half *>(
+            reinterpret_cast<char *>(&a_smem) + sizeof(a_half));
+        acc.step(a0, a1, b_smem0, b_smem1, k == 0);
         warpgroup::sync(0);
     }
     acc.drain_to(d_smem);
