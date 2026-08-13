@@ -41,8 +41,18 @@ RSHA=$(sha256sum "$REC" | cut -d' ' -f1)
 RC_COPY=$(sha256sum "$RCOPY" | cut -d' ' -f1)
 [ "$RC_COPY" = "$EXPR_SHA" ] || vf "receipt copy tampered (copy $RC_COPY != expected)"
 bash "$DIR/validate_receipt_sm90.sh" "$REC" --check-mode >/dev/null || vf "receipt failed shared validator"
+# implementation identity comes from the manifest, never from a hardcoded
+# path: a DeepEP cell checked against the MoK harness would fail on drift
+IMPL=$(grep '^IMPL=' "$MAN" | head -1 | cut -d= -f2-); [ -n "$IMPL" ] || IMPL=mok_sm90
+case "$IMPL" in
+  mok_sm90)     JSCHEMA=bench-sm90-fwd.v1;   HMOD=benchmarks.bench_sm90_fwd ;;
+  deepep_torch) JSCHEMA=bench-deepep-fwd.v1; HMOD=benchmarks.bench_deepep_fwd ;;
+  *) vf "unknown IMPL $IMPL" ;;
+esac
+HFILE=$M/mixture-of-kittens/$(echo "$HMOD" | tr '.' '/').py
+[ -f "$HFILE" ] || vf "harness file for $HMOD missing"
 bash "$DIR/validate_manifest_sm90.sh" "$MAN" \
-  --harness "$M/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" \
+  --harness "$HFILE" \
   --so-dir "$M/mixture-of-kittens/mok" >/dev/null || vf "manifest failed shared validator (schema or drift)"
 bash "$DIR/validate_manifest_sm90.sh" "$MCOPY" >/dev/null || vf "per-run copy failed shared validator"
 cnt1() { [ "$(grep -c "$2" "$1" || true)" -eq 1 ] || vf "need exactly one '$2' line in $(basename "$1")"; }
@@ -84,13 +94,6 @@ cnt1 "$SIDE" '^FORMAL_VALIDITY:'; FV=$(grep '^FORMAL_VALIDITY:' "$SIDE" | cut -d
 [ "$FV" = "INVALID_FOR_FORMAL" ] || vf "canary mode but validity=$FV"
 SHA=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256); FC=$(mget FROZEN_COMMIT)
 BGP=$(mget BENCH_GPUS)
-# schema 2 pins which implementation ran; schema 1 is MoK-only by definition
-IMPL=$(mget IMPL); [ -n "$IMPL" ] || IMPL=mok_sm90
-case "$IMPL" in
-  mok_sm90)     JSCHEMA=bench-sm90-fwd.v1;   HMOD=benchmarks.bench_sm90_fwd ;;
-  deepep_torch) JSCHEMA=bench-deepep-fwd.v1; HMOD=benchmarks.bench_deepep_fwd ;;
-  *) vf "unknown IMPL $IMPL" ;;
-esac
 if [ "$(grep -c '^HARNESS_MODULE:' "$LOG")" -eq 1 ]; then
   [ "$(grep '^HARNESS_MODULE:' "$LOG" | cut -d: -f2)" = "$HMOD" ] || vf "log harness module != manifest IMPL"
 elif [ "$IMPL" != "mok_sm90" ]; then
@@ -132,7 +135,7 @@ cnt1 "$SIDE" '^RUNNING_CLOCK_LIVENESS:'
 grep '^RUNNING_CLOCK_LIVENESS:' "$SIDE" | grep -q 'low=0$' || vf "running clock liveness below floor"
 cnt1 "$SIDE" '^LOAD1_DELTA_GATE:'
 grep '^LOAD1_DELTA_GATE:' "$SIDE" | grep -q 'ok=1$' || vf "load1 delta gate not ok"
-python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$EXPR_SHA" "$BGP" "$SMODE" "$JSCHEMA" <<'PY' || exit 1
+python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$EXPR_SHA" "$BGP" "$SMODE" "$JSCHEMA" "$IMPL" <<'PY' || exit 1
 import json, math, statistics, sys
 d = json.load(open(sys.argv[1]))
 m = d["meta"]; p = m["provenance"]
@@ -165,6 +168,27 @@ for k, loc in (("tokens_per_rank", sh), ("hidden", sh), ("intermediate", sh),
                ("comm_sms", m), ("minibatch", m), ("macrobatch", m),
                ("warmup_iters", m), ("timed_iters", m)):
     checks.append((int(man[k]) == int(loc[k]), f"manifest {k}={man[k]} != json {loc[k]}"))
+if sys.argv[12] == "deepep_torch":
+    # the comparator's runtime pins must equal the manifest's, exactly - a
+    # stack that drifted underneath a frozen contract invalidates the cell
+    pins = m.get("environment_pins") or {}
+    checks += [
+        (pins.get("torch") == man["TORCH_VERSION_PIN"],
+         f"json torch pin {pins.get('torch')} != manifest {man['TORCH_VERSION_PIN']}"),
+        (pins.get("deepep_py_tree_sha256") == man["DEEPEP_PY_TREE_SHA256"],
+         "json deepep python-tree sha != manifest"),
+        (pins.get("deepep_ext_sha256") == man["DEEPEP_EXT_SHA256"],
+         "json deepep extension sha != manifest"),
+        (pins.get("sm90_compiled") is True, "json does not record an SM90-compiled deepep build"),
+        (m.get("torch_compile") == man["DEEPEP_TORCH_COMPILE"],
+         f"json torch_compile {m.get('torch_compile')} != manifest {man['DEEPEP_TORCH_COMPILE']}"),
+        (isinstance(m.get("recv_contract"), dict)
+         and m["recv_contract"].get("per_expert_counts_match") is True,
+         "json does not record a passed recv-contract check"),
+        (isinstance(m.get("recv_contract"), dict)
+         and int(m["recv_contract"].get("routes_total", -1)) >= int(m["recv_contract"].get("recv_rows", 0)),
+         "recv contract routes_total < recv_rows (route expansion cannot shrink)"),
+    ]
 for ok, msg in checks:
     if not ok:
         print(f"VERIFY_FAIL:{msg}"); sys.exit(1)

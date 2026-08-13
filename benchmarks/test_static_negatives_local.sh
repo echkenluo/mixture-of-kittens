@@ -253,8 +253,37 @@ NLEFT=$(ls "$TMPD"/.receipt.* 2>/dev/null | wc -l)
 echo "  MK6 rc=$MKRC want=2(invalid receipt not published; OUT unchanged=$([ "$PRESHA" = "$POSTSHA" ] && echo yes || echo no); temps left=$NLEFT)"
 
 # ---- manifest schema v2 (matrix cells) ----
-M2MOK=$DIR/manifests/matrix-repo_micro-mok_sm90-sm24.manifest
-M2DEEP=$DIR/manifests/matrix-repo_micro-deepep_torch-sm24.manifest
+# Fixtures are synthesized here rather than read from benchmarks/manifests/:
+# a test must not depend on the very artifacts it exists to validate, and the
+# committed cell manifests are frozen in a SEPARATE commit from this code.
+DEEPH=$(sha256sum "$DIR/bench_deepep_fwd.py" | cut -d' ' -f1)
+mkv2() { # out impl
+  local OUT=$1 IMPL=$2
+  { echo "MANIFEST_SCHEMA=2"; echo "FROZEN_COMMIT=$(H40 0)"; echo "IMPL=$IMPL"
+    echo "SHAPE_ID=tiny_h20"
+    if [ "$IMPL" = mok_sm90 ]; then
+      echo "HARNESS_MODULE=benchmarks.bench_sm90_fwd"
+      echo "EXPECTED_HARNESS_SHA256=$HSHA"
+      echo "TIMING_SEMANTICS=build_schedule+forward.v2"
+    else
+      echo "HARNESS_MODULE=benchmarks.bench_deepep_fwd"
+      echo "EXPECTED_HARNESS_SHA256=$DEEPH"
+      echo "TIMING_SEMANTICS=dispatch+expert+combine.v2"
+    fi
+    echo "EXPECTED_SO_SHA256=$SOSHA"; echo "BENCH_GPUS=0,1,2,3"
+    echo "tokens_per_rank=512"; echo "hidden=256"; echo "intermediate=256"
+    echo "experts=4"; echo "topk=1"; echo "world_size=4"; echo "comm_sms=24"
+    echo "minibatch=256"; echo "macrobatch=4096"; echo "warmup_iters=20"; echo "timed_iters=100"
+    if [ "$IMPL" = deepep_torch ]; then
+      echo "TORCH_VERSION_PIN=2.11.0+cu130"
+      echo "DEEPEP_PY_TREE_SHA256=$(H64 7)"
+      echo "DEEPEP_EXT_SHA256=$(H64 8)"
+      echo "DEEPEP_TORCH_COMPILE=on"
+    fi; } > "$OUT"
+  chmod 444 "$OUT"
+}
+M2MOK=$TMPD/v2-mok.manifest;  mkv2 "$M2MOK" mok_sm90
+M2DEEP=$TMPD/v2-deep.manifest; mkv2 "$M2DEEP" deepep_torch
 v2case() { # name base mutator want_rc reason-ERE
   local NAME=$1 BASE=$2 MUT=$3 WANT=$4 REASON=$5
   local MF=$TMPD/$NAME.manifest O R
@@ -266,15 +295,22 @@ v2case() { # name base mutator want_rc reason-ERE
   echo "  $NAME rc=$R want=$WANT($REASON)"
 }
 set +e
-O=$(bash "$VALM" "$M2MOK" 2>&1); R=$?
+O=$(bash "$VALM" "$M2MOK" --harness "$DIR/bench_sm90_fwd.py" --so-dir "$MOKF/mixture-of-kittens/mok" 2>&1); R=$?
 set -u
 [ "$R" -eq 0 ] && has1 "$O" '^MANIFEST_VALID:[0-9a-f]{64}$'; report S1_v2_mok_positive $?
-echo "  S1_v2_mok_positive rc=$R want=0(MANIFEST_VALID)"
+echo "  S1_v2_mok_positive rc=$R want=0(MANIFEST_VALID, incl. harness+SO drift)"
 set +e
-O=$(bash "$VALM" "$M2DEEP" 2>&1); R=$?
+O=$(bash "$VALM" "$M2DEEP" --harness "$DIR/bench_deepep_fwd.py" --so-dir "$MOKF/mixture-of-kittens/mok" 2>&1); R=$?
 set -u
 [ "$R" -eq 0 ] && has1 "$O" '^MANIFEST_VALID:[0-9a-f]{64}$'; report S2_v2_deepep_positive $?
-echo "  S2_v2_deepep_positive rc=$R want=0(MANIFEST_VALID)"
+echo "  S2_v2_deepep_positive rc=$R want=0(MANIFEST_VALID, incl. harness+SO drift)"
+# a DeepEP cell checked against the MoK harness must fail on drift - this is
+# the bug that shipped in 38bb4e1, where the verifier hardcoded the MoK file
+set +e
+O=$(bash "$VALM" "$M2DEEP" --harness "$DIR/bench_sm90_fwd.py" 2>&1); R=$?
+set -u
+[ "$R" -eq 13 ] && has1 "$O" "^HARNESS_DRIFT_FAIL expected=$DEEPH actual=$HSHA\$"; report S2b_wrong_harness_for_impl $?
+echo "  S2b_wrong_harness_for_impl rc=$R want=13(HARNESS_DRIFT_FAIL)"
 # the schema-1 contract that the tiny9 canary chain validated must keep
 # validating unchanged - adding schema 2 must not disturb it
 set +e
@@ -290,17 +326,31 @@ v2case S6_timing_mismatch "$M2MOK" 'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS
   '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS does not match IMPL mok_sm90 \(want build_schedule\+forward\.v2\)$'
 v2case S7_bad_shape_id "$M2MOK" 'sed "s/^SHAPE_ID=.*/SHAPE_ID=whatever/" "$BASEF"' 12 \
   '^MANIFEST_SCHEMA_FAIL:SHAPE_ID not in allowed set \{repo_micro,v4_layer,tiny_h20\}$'
-v2case S8_deepep_missing_pin "$M2DEEP" 'grep -v "^DEEPEP_FINGERPRINT_SHA256=" "$BASEF"' 12 \
-  '^MANIFEST_SCHEMA_FAIL:key DEEPEP_FINGERPRINT_SHA256 count=0 \(need exactly 1\)$'
+v2case S8_deepep_missing_py_pin "$M2DEEP" 'grep -v "^DEEPEP_PY_TREE_SHA256=" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:key DEEPEP_PY_TREE_SHA256 count=0 \(need exactly 1\)$'
+v2case S8b_deepep_missing_ext_pin "$M2DEEP" 'grep -v "^DEEPEP_EXT_SHA256=" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:key DEEPEP_EXT_SHA256 count=0 \(need exactly 1\)$'
 v2case S9_deepep_bad_compile "$M2DEEP" 'sed "s/^DEEPEP_TORCH_COMPILE=.*/DEEPEP_TORCH_COMPILE=maybe/" "$BASEF"' 12 \
   '^MANIFEST_SCHEMA_FAIL:DEEPEP_TORCH_COMPILE not in allowed set \{on,off\}$'
-v2case S10_deepep_bad_fingerprint "$M2DEEP" 'sed "s/^DEEPEP_FINGERPRINT_SHA256=.*/DEEPEP_FINGERPRINT_SHA256=nothex/" "$BASEF"' 12 \
-  '^MANIFEST_SCHEMA_FAIL:DEEPEP_FINGERPRINT_SHA256 not 64-hex$'
+v2case S10_deepep_bad_py_hash "$M2DEEP" 'sed "s/^DEEPEP_PY_TREE_SHA256=.*/DEEPEP_PY_TREE_SHA256=nothex/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:DEEPEP_PY_TREE_SHA256 not 64-hex$'
+v2case S10b_deepep_bad_ext_hash "$M2DEEP" 'sed "s/^DEEPEP_EXT_SHA256=.*/DEEPEP_EXT_SHA256=nothex/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:DEEPEP_EXT_SHA256 not 64-hex$'
 v2case S11_bad_schema_version "$M2MOK" 'sed "s/^MANIFEST_SCHEMA=2/MANIFEST_SCHEMA=3/" "$BASEF"' 12 \
   '^MANIFEST_SCHEMA_FAIL:bad or missing schema version$'
+# whatever cell manifests are committed must validate; the count is dynamic so
+# this holds both before they exist and after they are frozen
+NCELL=0; NBAD=0
+for CM in "$DIR"/manifests/matrix-*.manifest; do
+  [ -f "$CM" ] || continue
+  NCELL=$((NCELL+1))
+  bash "$VALM" "$CM" >/dev/null 2>&1 || NBAD=$((NBAD+1))
+done
+report S12_committed_cells_valid "$([ "$NBAD" -eq 0 ] && echo 0 || echo 1)" "invalid: $NBAD"
+echo "  S12_committed_cells_valid cells=$NCELL invalid=$NBAD"
 
 rm -rf "$TMPD"
-EXPECTED=59
+EXPECTED=63
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "STATIC_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "STATIC_NEGATIVES pass=$PASS fail=$FAIL"

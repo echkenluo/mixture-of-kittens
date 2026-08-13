@@ -20,7 +20,9 @@ phreport() { if [ "$2" -eq 0 ]; then echo "POSTHOC_$1_PASS"; PHPASS=$((PHPASS+1)
 has1() { [ "$(printf '%s\n' "$1" | grep -cE "$2" || true)" -eq 1 ]; }
 
 echo "P0SEQ_START:$(date -u +%F_%T)"
-sha256sum "$DIR/bench_sm90_fwd.py" "$MAN" "$RECEIPT"
+HMOD=$(grep '^HARNESS_MODULE=' "$MAN" | head -1 | cut -d= -f2- || true)
+[ -n "$HMOD" ] || HMOD=benchmarks.bench_sm90_fwd
+sha256sum "$DIR/$(basename "$(echo "$HMOD" | tr '.' '/')").py" "$MAN" "$RECEIPT"
 echo "EXPECTED_RECEIPT_SHA256:$EXPR_SHA"
 
 bash "$DIR/test_runner_negatives.sh" "$CT" "$MOKDIR" "$RECEIPT"

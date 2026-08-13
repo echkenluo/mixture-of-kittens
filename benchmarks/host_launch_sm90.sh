@@ -175,7 +175,7 @@ ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
          -e BF16_FWD_COMM_SMS="$(mget comm_sms)" -e HARNESS_MODULE="$HARNESS_MODULE")
 # comparator stack pins: passed only when the manifest declares them, so the
 # comparator's own gate fails closed rather than defaulting to something
-for K in TORCH_VERSION_PIN DEEPEP_FINGERPRINT_SHA256 DEEPEP_TORCH_COMPILE; do
+for K in TORCH_VERSION_PIN DEEPEP_PY_TREE_SHA256 DEEPEP_EXT_SHA256 DEEPEP_TORCH_COMPILE; do
   V=$(mget "$K"); [ -n "$V" ] && ENVARGS+=(-e "$K=$V")
 done
 [ -n "${PREFLIGHT_TRIES:-}" ] && ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES")
@@ -194,7 +194,7 @@ RUUIDS=$(grep '^TARGET_GPU_UUIDS:' "$LOG" | head -1 | grep -o 'GPU-[0-9a-f-]*' |
 WOK=0
 NTIMEOUT=0; NPARENT=0; NWORK=0
 for i in $(seq 1 12); do
-  PSOUT=$(docker exec "$CT" ps -eo pid,args 2>/dev/null | grep "benchmarks.bench_sm90_fwd" | grep -v grep || true)
+  PSOUT=$(docker exec "$CT" ps -eo pid,args 2>/dev/null | grep -F "$HARNESS_MODULE" | grep -v grep || true)
   NTIMEOUT=$(printf '%s\n' "$PSOUT" | awk '$2=="timeout"' | wc -l)
   NPARENT=$(printf '%s\n' "$PSOUT" | grep "torch.distributed.run" | awk '$2!="timeout"' | wc -l)
   NWORK=$(printf '%s\n' "$PSOUT" | grep -v "torch.distributed.run" | grep -v '^\s*$' | wc -l)
@@ -206,7 +206,7 @@ side "PROC_SHAPE:timeout=$NTIMEOUT parent=$NPARENT workers=$NWORK"
 docker exec "$CT" sh -c "flock -n /mok/build.lock true" 2>/dev/null && fail "build lock not held" 6
 grep -q "RUN_START" "$LOG" || fail "no RUN_START in run log" 6
 side "HOST_TOP_CAPTURE:$(date -u +%F_%T)"
-TOPOUT=$(docker top "$CT" -eo pid,args 2>/dev/null | grep "benchmarks.bench_sm90_fwd" | grep -v "torch.distributed.run" | awk '$2!="timeout"' || true)
+TOPOUT=$(docker top "$CT" -eo pid,args 2>/dev/null | grep -F "$HARNESS_MODULE" | grep -v "torch.distributed.run" | awk '$2!="timeout"' || true)
 WPIDS=$(printf '%s\n' "$TOPOUT" | awk '{print $1}' | sort -n | uniq)
 NW=$(echo $WPIDS | wc -w)
 side "TOP_WORKER_HOST_PIDS:$(echo $WPIDS | tr ' ' ',') (n=$NW)"

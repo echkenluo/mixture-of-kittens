@@ -42,7 +42,15 @@ MSHA=$(sha256sum "$MREL" | cut -d' ' -f1)
 BLOB=$(git rev-parse "HEAD:$MREL")
 CSHA=$(git cat-file blob "$BLOB" | sha256sum | cut -d' ' -f1)
 [ "$MSHA" = "$CSHA" ] || { echo "RECEIPT_FAIL:manifest worktree bytes != committed blob"; exit 2; }
-HSHA=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
+# the harness this manifest actually selects (schema 1 is MoK-only)
+# || true is required: this script runs under set -e, and a schema-1 manifest
+# legitimately has no HARNESS_MODULE line, so a bare grep would abort the
+# generator for exactly the contract the tiny9 chain uses
+HMOD=$(grep '^HARNESS_MODULE=' "$MREL" | head -1 | cut -d= -f2- || true)
+[ -n "$HMOD" ] || HMOD=benchmarks.bench_sm90_fwd
+HFILE=$(echo "$HMOD" | tr '.' '/').py
+[ -f "$HFILE" ] || { echo "RECEIPT_FAIL:harness file $HFILE for $HMOD missing"; exit 2; }
+HSHA=$(sha256sum "$HFILE" | cut -d' ' -f1)
 grep -q "^EXPECTED_HARNESS_SHA256=$HSHA$" "$MREL" || { echo "RECEIPT_FAIL:tree harness sha != manifest EXPECTED_HARNESS_SHA256"; exit 2; }
 SOSHA=$(grep '^EXPECTED_SO_SHA256=' "$MREL" | head -1 | cut -d= -f2)
 OUTDIR=$(dirname "$OUT")

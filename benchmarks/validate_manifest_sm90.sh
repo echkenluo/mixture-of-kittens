@@ -32,7 +32,7 @@ case "$SCHEMA" in
   *) echo "MANIFEST_SCHEMA_FAIL:bad or missing schema version"; exit 12 ;;
 esac
 if [ "$SCHEMA" = "2" ] && grep -q '^IMPL=deepep_torch$' "$MAN"; then
-  REQ_KEYS="$REQ_KEYS TORCH_VERSION_PIN DEEPEP_FINGERPRINT_SHA256 DEEPEP_TORCH_COMPILE"
+  REQ_KEYS="$REQ_KEYS TORCH_VERSION_PIN DEEPEP_PY_TREE_SHA256 DEEPEP_EXT_SHA256 DEEPEP_TORCH_COMPILE"
 fi
 for K in $REQ_KEYS; do
   N=$(grep -c "^$K=" "$MAN" || true)
@@ -75,8 +75,10 @@ else
   [ "$(mget TIMING_SEMANTICS)" = "$WANT_TIMING" ] \
     || { echo "MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS does not match IMPL $IMPL (want $WANT_TIMING)"; exit 12; }
   if [ "$IMPL" = "deepep_torch" ]; then
-    mget DEEPEP_FINGERPRINT_SHA256 | grep -qE '^[0-9a-f]{64}$' \
-      || { echo "MANIFEST_SCHEMA_FAIL:DEEPEP_FINGERPRINT_SHA256 not 64-hex"; exit 12; }
+    for K in DEEPEP_PY_TREE_SHA256 DEEPEP_EXT_SHA256; do
+      mget "$K" | grep -qE '^[0-9a-f]{64}$' \
+        || { echo "MANIFEST_SCHEMA_FAIL:$K not 64-hex"; exit 12; }
+    done
     case "$(mget DEEPEP_TORCH_COMPILE)" in
       on|off) : ;;
       *) echo "MANIFEST_SCHEMA_FAIL:DEEPEP_TORCH_COMPILE not in allowed set {on,off}"; exit 12 ;;

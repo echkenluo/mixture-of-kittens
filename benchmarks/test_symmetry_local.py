@@ -118,7 +118,8 @@ report("A_identical_reference_truth", mok_ref is not None and mok_ref == deep_re
        "correctness reference construction differs")
 
 mok_keys, deep_keys = record_meta_keys(MOK_SRC, MOK_AST), record_meta_keys(DEEP_SRC, DEEP_AST)
-COMPARATOR_ONLY = {"environment_pins", "torch_compile", "permute_implementation"}
+COMPARATOR_ONLY = {"environment_pins", "torch_compile", "permute_implementation",
+                   "recv_contract"}
 report("A_meta_keys_superset", mok_keys and mok_keys <= deep_keys,
        f"missing on comparator: {sorted(mok_keys - deep_keys)}")
 report("A_meta_keys_no_extras", (deep_keys - mok_keys) <= COMPARATOR_ONLY,
@@ -154,17 +155,32 @@ report("A_no_unsupported_paths", not hits, f"present in code: {hits}")
 ns = {"os": os, "hashlib": hashlib}
 exec(compile(ast.Module(body=[n for n in DEEP_AST.body
                               if isinstance(n, (ast.ClassDef, ast.FunctionDef))
-                              and n.name in ("UnsupportedEnvironment", "deepep_fingerprint",
-                                             "assert_environment")],
+                              and n.name in ("UnsupportedEnvironment", "deepep_py_tree_sha256",
+                                             "deepep_ext_sha256", "assert_environment")],
                         type_ignores=[]), DEEPEP, "exec"), ns)
 Unsupported = ns["UnsupportedEnvironment"]
 assert_environment = ns["assert_environment"]
-fingerprint = ns["deepep_fingerprint"]
+py_tree_sha = ns["deepep_py_tree_sha256"]
+ext_sha = ns["deepep_ext_sha256"]
 
-PKG = tempfile.mkdtemp()
+SITE = tempfile.mkdtemp()
+PKG = os.path.join(SITE, "deep_ep")
+os.makedirs(PKG)
 with open(os.path.join(PKG, "__init__.py"), "w") as f:
     f.write("# stub deep_ep package for gate tests\n")
-GOOD_FP = fingerprint(PKG)
+# the real extension sits BESIDE the package in site-packages, not inside it -
+# the stub mirrors that, which is what makes the last two checks meaningful
+EXT_PATH = os.path.join(SITE, "deep_ep_cpp.stub.so")
+with open(EXT_PATH, "wb") as f:
+    f.write(b"stub extension bytes")
+GOOD_PY = py_tree_sha(PKG)
+
+
+class _Ext:
+    __file__ = EXT_PATH
+
+
+GOOD_EXT = ext_sha(_Ext)[0]
 
 
 class _F:
@@ -195,12 +211,13 @@ def make_deepep(methods=("get_dispatch_layout", "dispatch", "combine", "set_num_
     return m
 
 
-GOOD_ENV = {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_FINGERPRINT_SHA256": GOOD_FP}
+GOOD_ENV = {"TORCH_VERSION_PIN": "2.11.0+cu130",
+            "DEEPEP_PY_TREE_SHA256": GOOD_PY, "DEEPEP_EXT_SHA256": GOOD_EXT}
 
 
-def gate_case(name, deepep, torch_mod, env, expect):
+def gate_case(name, deepep, torch_mod, env, expect, ext=_Ext):
     try:
-        assert_environment(deepep, torch_mod, env)
+        assert_environment(deepep, ext, torch_mod, env)
         report(name, expect is None, "expected rejection, got acceptance")
     except Unsupported as e:
         report(name, expect is not None and str(e) == expect,
@@ -220,24 +237,41 @@ gate_case("B_not_sm90_build", make_deepep(sm90=False), make_torch(), GOOD_ENV,
 gate_case("B_no_grouped_mm", make_deepep(), make_torch(grouped=False), GOOD_ENV,
           "torch.nn.functional.grouped_mm missing")
 gate_case("B_missing_torch_pin", make_deepep(), make_torch(),
-          {"DEEPEP_FINGERPRINT_SHA256": GOOD_FP},
+          {"DEEPEP_PY_TREE_SHA256": GOOD_PY, "DEEPEP_EXT_SHA256": GOOD_EXT},
           "TORCH_VERSION_PIN not provided by the manifest")
 gate_case("B_torch_pin_mismatch", make_deepep(), make_torch(version="2.13.0+cu130"), GOOD_ENV,
           "torch 2.13.0+cu130 != pinned 2.11.0+cu130")
-gate_case("B_missing_fingerprint_pin", make_deepep(), make_torch(),
-          {"TORCH_VERSION_PIN": "2.11.0+cu130"},
-          "DEEPEP_FINGERPRINT_SHA256 not provided by the manifest")
-gate_case("B_fingerprint_mismatch", make_deepep(), make_torch(),
-          {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_FINGERPRINT_SHA256": "0" * 64},
-          f"deep_ep fingerprint {GOOD_FP} != pinned {'0' * 64}")
+gate_case("B_missing_py_pin", make_deepep(), make_torch(),
+          {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_EXT_SHA256": GOOD_EXT},
+          "DEEPEP_PY_TREE_SHA256 not provided by the manifest")
+gate_case("B_missing_ext_pin", make_deepep(), make_torch(),
+          {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_PY_TREE_SHA256": GOOD_PY},
+          "DEEPEP_EXT_SHA256 not provided by the manifest")
+gate_case("B_py_tree_mismatch", make_deepep(), make_torch(),
+          {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_PY_TREE_SHA256": "0" * 64,
+           "DEEPEP_EXT_SHA256": GOOD_EXT},
+          f"deep_ep python tree {GOOD_PY} != pinned {'0' * 64}")
+gate_case("B_ext_mismatch", make_deepep(), make_torch(),
+          {"TORCH_VERSION_PIN": "2.11.0+cu130", "DEEPEP_PY_TREE_SHA256": GOOD_PY,
+           "DEEPEP_EXT_SHA256": "0" * 64},
+          f"deep_ep extension {GOOD_EXT} != pinned {'0' * 64}")
 
-# fingerprint must actually depend on content, or the pin is decorative
+# The python tree is a thin wrapper; the kernels live in the extension. If a
+# swapped extension did not move any pinned hash, the pin would be decorative -
+# which is exactly the hole the first version of this gate had.
+with open(EXT_PATH, "wb") as f:
+    f.write(b"a DIFFERENT extension binary")
+report("B_ext_swap_changes_ext_hash", ext_sha(_Ext)[0] != GOOD_EXT,
+       "extension hash unchanged after swapping the binary")
+report("B_ext_swap_invisible_to_py_tree_hash",
+       py_tree_sha(PKG) == GOOD_PY,
+       "python-tree hash moved when only the extension changed (stub layout is wrong)")
 with open(os.path.join(PKG, "extra.py"), "w") as f:
     f.write("x = 1\n")
-report("B_fingerprint_is_content_sensitive", fingerprint(PKG) != GOOD_FP,
-       "fingerprint unchanged after adding a file")
+report("B_py_tree_is_content_sensitive", py_tree_sha(PKG) != GOOD_PY,
+       "python-tree hash unchanged after adding a file")
 
-EXPECTED = 23
+EXPECTED = 27
 TOTAL = PASS + FAIL
 if TOTAL != EXPECTED:
     print(f"SYM_COUNT_FAIL:ran {TOTAL} checks, expected {EXPECTED}")

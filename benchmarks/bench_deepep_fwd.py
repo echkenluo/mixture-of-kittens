@@ -31,14 +31,27 @@ That overhead is inside the timed region and is NOT present in the vendor's
 own DeepEP benchmark. Any comparison made with this file understates DeepEP by
 that amount, and it must never be reported as the vendor-optimal baseline.
 
+RECV CONTRACT (established, not assumed): classic dispatch returns recv_x as
+the UNIQUE token rows this rank received, and recv_topk_idx as, per row, the
+local expert id for each of its topk slots or -1 where the slot routes
+elsewhere. One row can therefore feed SEVERAL local experts, so the number of
+(row, expert) routes is >= the number of recv_x rows, and per-expert route
+counts must equal recv_num_tokens_per_expert_list. Source: DeepEP's own
+classic-API test, tests/legacy/test_intranode.py in deepseek-ai/DeepEP, which
+asserts exactly that per-expert equality. assert_recv_contract() re-checks it
+at runtime, once, before the timed region, and fails closed.
+
+Consequence for the permutation: index_select on recv_x is a ROUTE EXPANSION
+(one row replicated per expert it feeds), not a reordering of already-grouped
+rows. It cannot be removed as "overhead" even if recv_x happened to arrive in
+expert order - deleting it would silently drop every token routed to more than
+one local expert. This note exists to stop a future optimization from doing
+exactly that.
+
 UNVERIFIED AT AUTHORING TIME (no GPU run was permitted; each needs a bounded
 probe before any matrix launch):
-  U1 recv_x layout after classic dispatch - whether it is already expert-major.
-     The permutation below is correct either way, but if the layout is already
-     grouped the gather is pure overhead and should be dropped.
-  U2 recv_topk_idx semantics (local expert ids with -1 for invalid) is taken
-     from bench_deepep_torch.py in this repo, which targets the ElasticBuffer
-     API, not the classic one.
+  U1 whether the permutation as written is the cheapest correct expansion for
+     this shape (a fused kernel would be cheaper, but none is available here).
   U3 NVL buffer sizing hints for this DeepEP build.
   U4 whether torch.compile helps or hurts here on SM90.
 """
@@ -75,9 +88,10 @@ class UnsupportedEnvironment(RuntimeError):
     a comparator that silently falls back measures something else."""
 
 
-def deepep_fingerprint(pkg_dir):
-    """Content fingerprint of the installed deep_ep package. The build in this
-    image exposes no __version__, so bytes are the only honest pin."""
+def deepep_py_tree_sha256(pkg_dir):
+    """Content hash of the deep_ep PYTHON tree only. That tree is a thin
+    wrapper (3 files); it is NOT the thing that executes the kernels, so this
+    hash alone must never be treated as the identity of the DeepEP build."""
     import hashlib
     h = hashlib.sha256()
     files = []
@@ -93,10 +107,43 @@ def deepep_fingerprint(pkg_dir):
     return h.hexdigest()
 
 
-def assert_environment(deep_ep_mod, torch_mod, env):
+def deepep_ext_sha256(ext_mod):
+    """Content hash of the compiled extension that actually runs the kernels
+    (deep_ep_cpp*.so, ~40 MB). Paired with the python-tree hash this is a
+    complete content freeze; either one alone is not."""
+    import hashlib
+    path = os.path.abspath(ext_mod.__file__)
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest(), path
+
+
+def assert_recv_contract(recv_idx, num_recv_per_expert, num_local_experts):
+    """One-shot runtime check of the recv contract (see module docstring),
+    run before the timed region and never inside it. Fails closed: if the
+    layout this comparator assumes is not what DeepEP produced, the number is
+    meaningless and must not be produced at all."""
+    import torch as _t
+    lo = int(recv_idx.min().item())
+    hi = int(recv_idx.max().item())
+    if lo < -1 or hi >= num_local_experts:
+        raise UnsupportedEnvironment(
+            f"recv_topk_idx out of contract: range [{lo},{hi}] not within [-1,{num_local_experts - 1}]")
+    valid = recv_idx >= 0
+    counts = _t.bincount(recv_idx[valid].reshape(-1).to(_t.int64),
+                         minlength=num_local_experts)[:num_local_experts].tolist()
+    expected = [int(v) for v in num_recv_per_expert]
+    if counts != expected:
+        raise UnsupportedEnvironment(
+            f"recv route counts {counts} != num_recv_tokens_per_expert_list {expected}")
+    return {"routes_total": int(valid.sum().item()), "recv_rows": int(recv_idx.shape[0]),
+            "per_expert_counts_match": True}
+
+
+def assert_environment(deep_ep_mod, deep_ep_cpp_mod, torch_mod, env):
     """Pure gate: every supported-ness decision is made here so it can be
     tested without deep_ep, without CUDA and without a GPU. Returns the
-    environment fingerprint dict recorded in JSON provenance."""
+    environment pin dict recorded in JSON provenance. Identity is the pair of
+    content hashes; paths are recorded for humans and are never compared."""
     buffer_cls = getattr(deep_ep_mod, "Buffer", None)
     if buffer_cls is None:
         raise UnsupportedEnvironment("deep_ep.Buffer missing (this comparator targets the classic Buffer API)")
@@ -117,14 +164,23 @@ def assert_environment(deep_ep_mod, torch_mod, env):
     if torch_mod.__version__ != pin_torch:
         raise UnsupportedEnvironment(f"torch {torch_mod.__version__} != pinned {pin_torch}")
 
-    pin_fp = env.get("DEEPEP_FINGERPRINT_SHA256")
-    if not pin_fp:
-        raise UnsupportedEnvironment("DEEPEP_FINGERPRINT_SHA256 not provided by the manifest")
-    actual_fp = deepep_fingerprint(os.path.dirname(os.path.abspath(deep_ep_mod.__file__)))
-    if actual_fp != pin_fp:
-        raise UnsupportedEnvironment(f"deep_ep fingerprint {actual_fp} != pinned {pin_fp}")
-    return {"torch": torch_mod.__version__, "deepep_fingerprint_sha256": actual_fp,
-            "deepep_path": os.path.dirname(os.path.abspath(deep_ep_mod.__file__)),
+    pin_py = env.get("DEEPEP_PY_TREE_SHA256")
+    if not pin_py:
+        raise UnsupportedEnvironment("DEEPEP_PY_TREE_SHA256 not provided by the manifest")
+    pin_ext = env.get("DEEPEP_EXT_SHA256")
+    if not pin_ext:
+        raise UnsupportedEnvironment("DEEPEP_EXT_SHA256 not provided by the manifest")
+    py_dir = os.path.dirname(os.path.abspath(deep_ep_mod.__file__))
+    actual_py = deepep_py_tree_sha256(py_dir)
+    if actual_py != pin_py:
+        raise UnsupportedEnvironment(f"deep_ep python tree {actual_py} != pinned {pin_py}")
+    actual_ext, ext_path = deepep_ext_sha256(deep_ep_cpp_mod)
+    if actual_ext != pin_ext:
+        raise UnsupportedEnvironment(f"deep_ep extension {actual_ext} != pinned {pin_ext}")
+    return {"torch": torch_mod.__version__,
+            "deepep_py_tree_sha256": actual_py, "deepep_ext_sha256": actual_ext,
+            "deepep_py_dir_informational": py_dir,
+            "deepep_ext_path_informational": ext_path,
             "sm90_compiled": True}
 
 
@@ -214,6 +270,10 @@ class DeepEpBf16Forward:
         self.w_shared_gate = w_shared_gate.detach()
         self.w_shared_up = w_shared_up.detach()
         self.w_shared_down = w_shared_down.detach()
+        # checked once, on the correctness-gate call, then never again so the
+        # timed region carries no extra work
+        self.recv_contract_pending = True
+        self.recv_contract = None
 
     @torch.no_grad()
     def run_fwd(self):
@@ -226,13 +286,20 @@ class DeepEpBf16Forward:
             topk_idx=self.topk_experts, topk_weights=self.router_weights,
             expert_alignment=1)
 
+        if self.recv_contract_pending:
+            self.recv_contract = assert_recv_contract(recv_idx, num_recv_per_expert,
+                                                      self.num_local_experts)
+            self.recv_contract_pending = False
+
         gate_shared = self.x @ self.w_shared_gate.T
         up_shared = self.x @ self.w_shared_up.T
         shared_output = (F.silu(gate_shared) * up_shared) @ self.w_shared_down.T
 
-        # expert-major permutation in plain torch (no transformer_engine in
-        # this image - see DISCLOSED HANDICAP above). Correct whether or not
-        # recv_x already arrives grouped (U1).
+        # route expansion + expert-major ordering, in plain torch (no
+        # transformer_engine in this image - see DISCLOSED HANDICAP above).
+        # This is NOT a reordering of already-grouped rows: one recv row can
+        # feed several local experts, so it is replicated once per route. See
+        # the RECV CONTRACT note - removing this gather would drop tokens.
         valid = recv_idx >= 0
         safe_idx = recv_idx.clamp_min(0)
         flat_expert = torch.where(valid, safe_idx, torch.full_like(safe_idx, self.num_local_experts))
@@ -268,7 +335,8 @@ def main() -> None:
     input_seed = 1234 + rank  # fixed inside generate_inputs, same as the MoK side
 
     import deep_ep
-    env_fp = assert_environment(deep_ep, torch, os.environ)
+    import deep_ep_cpp
+    env_fp = assert_environment(deep_ep, deep_ep_cpp, torch, os.environ)
 
     num_local_experts = get_num_local_experts(NUM_EXPERTS, world_size)
     inputs = generate_inputs(rank, device, NUM_EXPERTS, num_local_experts, TOPK,
@@ -373,6 +441,7 @@ def main() -> None:
                                      "tolerance_abs_rel": list(BF16_TOLERANCE)},
                 "provenance": _provenance(),
                 "environment_pins": env_fp,
+                "recv_contract": impl.recv_contract,
                 "torch_compile": TORCH_COMPILE,
                 "permute_implementation": "torch gather/scatter (no transformer_engine "
                                           "in this image); inside the timed region and "
