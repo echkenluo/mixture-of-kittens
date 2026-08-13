@@ -67,3 +67,14 @@ expect_bytes(sizeof(handle)) tx-count on ALL cluster CTAs' semaphores or the
 wait deadlocks: use mbarrier complete_tx w/ cluster multicast (find TK helper:
 grep complete_tx / cluster arrive in include/ops/*/util). Then delete-or-keep
 the drain pipeline accordingly (drain stages also expect_bytes handle-sized).
+
+## P1-B v1 structural decision (r5 prep)
+mma2 splits A and B per-CTA and joins via tmem across the cluster. SM90 wgmma
+cannot read peer-CTA smem operands, so v1: each CTA loads the FULL N of B
+(drop B's cluster multicast split; A stays M-half per CTA), computes
+M-half x full-N into rt_fl register accumulator (per-warp height (Mb/2)/4/16
+tiles x N). Smem cost: B width Nb/2 -> Nb per K-stage; if over budget cut
+MLP_LOAD_PIPE_DEPTH 6 -> 3 for SM90 config. Epilogue: drain rt directly to
+d smem tiles per EPI stage (replaces tmem load_async + tcgen05.ld).
+tensor_load_wait -> warpgroup::mma_async_wait; tensor_*_thread_sync -> no-op;
+tcgen05::commit -> plain semaphore arrive after mma_async_wait.
