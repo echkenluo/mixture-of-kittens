@@ -1522,8 +1522,21 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 if (row_idx < previous_macrobatch_tokens)
                     barrier_wait(*output_row_ready, (previous_macrobatch_offset + row_idx) / (config::MLP_Mb / config::CLUSTER_SIZE), required_count);
             }
+#if defined(KITTENS_SM90)
+            constexpr int MOK_H = 2;   // both M-halves stored by the single CTA
+#else
+            constexpr int MOK_H = 1;
+#endif
+            #pragma unroll
+            for (int h = 0; h < MOK_H; ++h)
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+#if defined(KITTENS_SM90)
+                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
+                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{h, i});
+                    warpgroup::load(d_reg[i], stg);
+                }
+#endif
                 warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
                 warpgroup::sync(1);
                 warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
@@ -1535,7 +1548,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         // Macrobatches are serialized by routed_buffers_done, so additions occur in a fixed order, preserving determinism
                         warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
                 } else {
+#if defined(KITTENS_SM90)
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + h, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+#else
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+#endif
                 }
             }
             warpgroup::tma::store_async_read_wait();
