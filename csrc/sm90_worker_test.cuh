@@ -42,9 +42,9 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B) {
     TORCH_CHECK(A.size(1) % 64 == 0);
     auto D = at::empty({128, 128}, A.options());
     globals g{
-        a_gl{reinterpret_cast<bf16*>(A.data_ptr()), 1, 1, (int)A.size(0), (int)A.size(1)},
-        b_gl{reinterpret_cast<bf16*>(B.data_ptr()), 1, 1, (int)B.size(0), (int)B.size(1)},
-        d_gl{reinterpret_cast<bf16*>(D.data_ptr()), 1, 1, 128, 128},
+        a_gl{reinterpret_cast<kittens::bf16*>(A.data_ptr()), nullptr, nullptr, (int)A.size(0), (int)A.size(1)},
+        b_gl{reinterpret_cast<kittens::bf16*>(B.data_ptr()), nullptr, nullptr, (int)B.size(0), (int)B.size(1)},
+        d_gl{reinterpret_cast<kittens::bf16*>(D.data_ptr()), nullptr, nullptr, 128, 128},
         (int)(A.size(1) / 64)};
     constexpr int SMEM = sizeof(a_st) + sizeof(b_st) + sizeof(d_st) + 1024;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
