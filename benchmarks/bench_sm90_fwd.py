@@ -53,6 +53,7 @@ def _provenance():
     import hashlib
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     prov = {"frozen_commit_env": os.environ.get("MOK_FROZEN_COMMIT", "unset"),
+            "manifest_sha256_env": os.environ.get("MANIFEST_SHA256", "unset (metadata_invalid)"),
             "frozen_commit_provenance": "external env (host git); unset if launcher omitted it"}
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
@@ -86,6 +87,8 @@ def gpu_snapshot():
 
 
 def _loadavg():
+    # NOTE: read from inside the container; loadavg is not namespaced so it
+    # mirrors the host kernel, but naming stays honest about the source.
     with open("/proc/loadavg") as f:
         return f.read().strip()
 
@@ -211,8 +214,8 @@ def main() -> None:
                     "timed_region": round(t_timed_end - t_warmup_end, 1),
                     "total": round(t_timed_end - wall0, 1),
                 },
-                "host_loadavg_start": load_start,
-                "host_loadavg_end": _loadavg(),
+                "container_read_loadavg_start": load_start,
+                "container_read_loadavg_end": _loadavg(),
                 "correctness_gate": {"abs_mean": abs_mean, "abs_max": abs_max,
                                      "relative": relative,
                                      "tolerance_abs_rel": list(BF16_TOLERANCE)},

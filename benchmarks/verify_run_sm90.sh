@@ -14,11 +14,25 @@ vf() { echo "VERIFY_FAIL:$1"; exit 1; }
 [ -f "$LOG" ] || vf "no log $LOG"
 [ -f "$JSON" ] || vf "no json $JSON"
 [ -f "$SIDE" ] || vf "no sidecar $SIDE"
+# independent full schema recheck (never trust the launcher's pass)
+REQ_KEYS="MANIFEST_SCHEMA FROZEN_COMMIT EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256 BENCH_GPUS TIMING_SEMANTICS tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
+head -1 "$MAN" | grep -q '^MANIFEST_SCHEMA=1$' || vf "manifest schema version"
+for K in $REQ_KEYS; do
+  [ "$(grep -c "^$K=" "$MAN" || true)" -eq 1 ] || vf "manifest key $K count != 1"
+  [ -n "$(grep "^$K=" "$MAN" | cut -d= -f2-)" ] || vf "manifest key $K empty"
+done
+while IFS= read -r LINE; do
+  [ -z "$LINE" ] && continue
+  K=${LINE%%=*}
+  echo " $REQ_KEYS " | grep -q " $K " || vf "manifest unknown key $K"
+done < "$MAN"
 MS_GIVEN=$(sha256sum "$MAN" | cut -d' ' -f1)
 MS_COPY=$(sha256sum "$MCOPY" | cut -d' ' -f1)
 MS_SIDE=$(grep '^MANIFEST_SHA256:' "$SIDE" | head -1 | cut -d: -f2)
+MS_LOG=$(grep '^MANIFEST_SHA256:' "$LOG" | head -1 | cut -d: -f2)
 [ "$MS_GIVEN" = "$MS_COPY" ] || vf "manifest copy tampered (given $MS_GIVEN != copy $MS_COPY)"
 [ "$MS_SIDE" = "$MS_COPY" ] || vf "sidecar pre-start manifest hash != copy"
+[ "$MS_LOG" = "$MS_COPY" ] || vf "runner log manifest hash != copy"
 mget() { grep "^$1=" "$MAN" | head -1 | cut -d= -f2-; }
 SHA=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256); FC=$(mget FROZEN_COMMIT)
 grep -q "^RUN_ID:$R$" "$LOG" || vf "log run_id mismatch"
@@ -46,6 +60,7 @@ checks = [
     (p["harness_sha256"] == sys.argv[2], "json harness sha != manifest"),
     (p["frozen_commit_env"] == sys.argv[3], "json frozen commit != manifest"),
     (p.get("so_sha256") == sys.argv[6], "json so sha256 != manifest"),
+    (p.get("manifest_sha256_env") not in (None, "unset (metadata_invalid)"), "json missing manifest sha"),
     (m.get("run_id") == sys.argv[4], "json run_id mismatch"),
     (len(d["samples_ms"]) == m["timed_iters"], "sample count mismatch"),
     (all(math.isfinite(x) and x > 0 for x in d["samples_ms"]), "samples not all finite>0"),

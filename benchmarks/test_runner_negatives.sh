@@ -18,7 +18,9 @@ wait_lock_free() {
   echo "SUITE_SETUP_FAIL:lock never freed"; exit 3
 }
 REALSHA=$(sha256sum "$MOKDIR/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" | cut -d' ' -f1)
-REALSO=$(sha256sum "$MOKDIR"/mixture-of-kittens/mok/_C*.so | head -1 | cut -d' ' -f1)
+SOARR=("$MOKDIR"/mixture-of-kittens/mok/_C*.so)
+{ [ "${#SOARR[@]}" -eq 1 ] && [ -f "${SOARR[0]}" ]; } || { echo "SUITE_SETUP_FAIL:need exactly one .so"; exit 3; }
+REALSO=$(sha256sum "${SOARR[0]}" | cut -d' ' -f1)
 runner_case() { # CID harness_sha so_sha extra_env... -> sets RC and L
   local CID=$1 SHAX=$2 SOX=$3; shift 3
   docker exec "$@" -e BENCH_TAG="$CID" -e RUN_ID="$CID" \
@@ -88,7 +90,9 @@ echo "  n6 rc=$RC want=10(SO_GATE_FAIL after hash+preflight pass)"
 # --- N5 unwritable host-runs: rc=4 + exact message + NO runner artifacts created
 CID=n5-$SUITE
 RO=$MOKDIR/negro-$SUITE
-mkdir -p "$RO/host-runs"; chmod 555 "$RO/host-runs"
+mkdir -p "$RO/host-runs"
+ln -s "$MOKDIR/mixture-of-kittens" "$RO/mixture-of-kittens"
+chmod 555 "$RO/host-runs"
 set +e
 OUT=$(BENCH_TAG="$CID" bash "$DIR/host_launch_sm90.sh" "$CT" "$RO" "$DIR/manifests/tiny-h20-v1.manifest" 2>&1)
 RC=$?
@@ -107,7 +111,7 @@ mcase() { # name mutator want_rc
   local MF=$TMPD/$NAME.manifest
   eval "$MUT" > "$MF"
   set +e
-  BENCH_TAG=$NAME bash "$DIR/host_launch_sm90.sh" "$CT" "$MOKDIR" "$MF" >/dev/null 2>&1
+  BENCH_TAG=$NAME NEG_ALLOW_UNTRUSTED=1 bash "$DIR/host_launch_sm90.sh" "$CT" "$MOKDIR" "$MF" >/dev/null 2>&1
   local RCX=$?
   set -u
   [ "$RCX" -eq "$WANT" ]; report "$NAME" $?
@@ -125,5 +129,11 @@ mcase 11_duplicate_key 'cat "$MANI"; echo "topk=1"' 12
 mcase 13_harness_drift 'sed "s/^EXPECTED_HARNESS_SHA256=.*/EXPECTED_HARNESS_SHA256=deadbeef/" "$MANI"' 13
 rm -rf "$TMPD"
 
+# --- N14 SO-drift at host gate: valid schema manifest, wrong SO sha -> rc13
+mcase 14_so_drift 'sed "s/^EXPECTED_SO_SHA256=.*/EXPECTED_SO_SHA256=$(printf a%.0s {1..64})/" "$MANI"' 13
+
+EXPECTED_CASES=12
+TOTAL=$((PASS+FAIL))
+[ "$TOTAL" -eq "$EXPECTED_CASES" ] || { echo "SUITE_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED_CASES"; FAIL=$((FAIL+1)); }
 echo "NEGATIVES suite=$SUITE pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

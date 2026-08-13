@@ -19,7 +19,19 @@ MANIFEST=${3:?manifest path (committed, read-only)}
 TAG=${BENCH_TAG:?BENCH_TAG required}
 
 REQ_KEYS="MANIFEST_SCHEMA FROZEN_COMMIT EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256 BENCH_GPUS TIMING_SEMANTICS tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
+INT_KEYS="tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
 [ -f "$MANIFEST" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MANIFEST"; exit 12; }
+# trust gate: manifest must live in the repo's manifests dir, be git-tracked,
+# and carry no write bits (unless NEG_ALLOW_UNTRUSTED=1 for controlled
+# negative-suite mutations, which must never become positive priors)
+if [ "${NEG_ALLOW_UNTRUSTED:-0}" != "1" ]; then
+  MREAL=$(readlink -f "$MANIFEST")
+  MDIR=$(readlink -f "$MOKDIR/mixture-of-kittens/benchmarks/manifests")
+  case "$MREAL" in "$MDIR"/*) : ;; *) echo "MANIFEST_TRUST_FAIL:not in trusted manifests dir"; exit 14 ;; esac
+  git -C "$MOKDIR/mixture-of-kittens" ls-files --error-unmatch "benchmarks/manifests/$(basename "$MREAL")" >/dev/null 2>&1     || { echo "MANIFEST_TRUST_FAIL:not git-tracked"; exit 14; }
+  MODE=$(stat -c %a "$MREAL")
+  case "$MODE" in *[2367]*) echo "MANIFEST_TRUST_FAIL:write bits set ($MODE)"; exit 14 ;; esac
+fi
 head -1 "$MANIFEST" | grep -q '^MANIFEST_SCHEMA=1$' || { echo "MANIFEST_SCHEMA_FAIL:bad or missing schema version"; exit 12; }
 for K in $REQ_KEYS; do
   N=$(grep -c "^$K=" "$MANIFEST" || true)
@@ -31,6 +43,21 @@ while IFS= read -r LINE; do
   echo " $REQ_KEYS " | grep -q " $K " || { echo "MANIFEST_SCHEMA_FAIL:unknown key $K"; exit 12; }
 done < "$MANIFEST"
 mget() { grep "^$1=" "$MANIFEST" | head -1 | cut -d= -f2-; }
+for K in $REQ_KEYS; do
+  V=$(mget "$K")
+  [ -n "$V" ] || { echo "MANIFEST_SCHEMA_FAIL:key $K empty"; exit 12; }
+done
+for K in EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256; do
+  V=$(mget "$K")
+  echo "$V" | grep -qE '^[0-9a-f]{64}$' || { echo "MANIFEST_SCHEMA_FAIL:$K not 64-hex"; exit 12; }
+done
+for K in $INT_KEYS; do
+  V=$(mget "$K")
+  echo "$V" | grep -qE '^[0-9]+$' && [ "$V" -gt 0 ] || { echo "MANIFEST_SCHEMA_FAIL:$K not positive int"; exit 12; }
+done
+[ "$(mget world_size)" = "4" ] || { echo "MANIFEST_SCHEMA_FAIL:world_size must be 4"; exit 12; }
+NGID=$(mget BENCH_GPUS | tr ',' '\n' | grep -cE '^[0-9]+$' || true)
+[ "$NGID" -eq 4 ] || { echo "MANIFEST_SCHEMA_FAIL:BENCH_GPUS needs exactly 4 ids"; exit 12; }
 EXPECTED=$(mget EXPECTED_HARNESS_SHA256)
 EXPSO=$(mget EXPECTED_SO_SHA256)
 FROZEN=$(mget FROZEN_COMMIT)
@@ -52,15 +79,18 @@ touch "$SIDE" 2>/dev/null
 [ -w "$SIDE" ] || { echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4; }
 side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
+IMGID=$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)
+IMGRD=$(docker inspect --format '{{index .Config.Image}}' "$CT" 2>/dev/null)
+[ -n "$IMGID" ] || { echo "LAUNCH_VERIFY_FAIL:image id inspect failed"; exit 4; }
 cp "$MANIFEST" "$MCOPY" || { echo "LAUNCH_VERIFY_FAIL:manifest copy failed"; exit 4; }
 MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
 { echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
   echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
-  echo "IMAGE_DIGEST:$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)"; } > "$SIDE"
+  echo "IMAGE_ID:$IMGID"; echo "IMAGE_REPO_DIGESTS:$IMGRD"; } > "$SIDE"
 
 ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
          -e EXPECTED_HARNESS_SHA256="$EXPECTED" -e EXPECTED_SO_SHA256="$EXPSO"
-         -e MOK_FROZEN_COMMIT="$FROZEN" -e MOK_SM90_EXPERIMENTAL=1
+         -e MOK_FROZEN_COMMIT="$FROZEN" -e MANIFEST_SHA256="$MSHA" -e MOK_SM90_EXPERIMENTAL=1
          -e BENCH_GPUS="$BGPUS"
          -e NUM_LOCAL_TOKENS="$(mget tokens_per_rank)" -e HIDDEN_DIM="$(mget hidden)"
          -e INTERMEDIATE_DIM="$(mget intermediate)" -e NUM_EXPERTS="$(mget experts)"
@@ -105,6 +135,9 @@ side "PROC_SHAPE:timeout=$NTIMEOUT parent=$NPARENT workers=$NWORK"
 [ "$WOK" -eq 1 ] || fail "process shape wrong: parent=$NPARENT workers=$NWORK (want 1/4)" 6
 docker exec "$CT" sh -c "flock -n /mok/build.lock true" 2>/dev/null && fail "build lock not held" 6
 grep -q "RUN_START" "$LOG" || fail "no RUN_START in run log" 6
+side "HOST_LOADAVG_START:$(cat /proc/loadavg)"
+side "HOST_VMSTAT_START:$(vmstat 1 2 2>/dev/null | tail -1 | tr -s ' ')"
+side "HOST_GPU_CLOCKS_START:$(nvidia-smi --query-gpu=index,clocks.sm,power.draw --format=csv,noheader 2>/dev/null | tr '\n' ';')"
 side "HOST_TOP_CAPTURE:$(date -u +%F_%T)"
 TOPOUT=$(docker top "$CT" -eo pid,args 2>/dev/null | grep "benchmarks.bench_sm90_fwd" | grep -v "torch.distributed.run" | awk '$2!="timeout"' || true)
 WPIDS=$(printf '%s\n' "$TOPOUT" | awk '{print $1}' | sort -n | uniq)
@@ -128,4 +161,6 @@ done
 side "PID_ATTRIBUTION_$ATTR"
 side "NVML_UUID_PID_PAIRS:$(printf '%s' "$PAIRS" | grep -f <(echo $TUUIDS | tr ' ' '\n') | tr '\n' ';')"
 [ "$ATTR" = PASS ] || fail "per-GPU worker attribution failed" 5
+side "HOST_LOADAVG_LAUNCHED:$(cat /proc/loadavg)"
+side "HOST_GPU_CLOCKS_LAUNCHED:$(nvidia-smi --query-gpu=index,clocks.sm,power.draw --format=csv,noheader 2>/dev/null | tr '\n' ';')"
 echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE manifest_sha=$MSHA pid_attribution=PASS"
