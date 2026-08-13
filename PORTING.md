@@ -57,3 +57,13 @@ launched task-id space; MUST mirror TK's SM100 clc header semantics for the
 id space bound + per-launch counter reset (read
 third_party/ThunderKittens/include/ops/.../clc* next round; do NOT guess).
 Both fwd (1600-1849) and bwd (2177-2530) use identical patterns.
+
+## P1-C v1 shim design (from TK util.cuh:237-289)
+CLC = clusterlaunchcontrol.try_cancel: steals UNLAUNCHED grid CTA ids.
+SM90 v1: disable stealing - query() always {success=0}; every grid block
+launches normally and runs only its initial task (correct; persistence is a
+later perf step). schedule(h, sem) must COMPLETE the caller's
+expect_bytes(sizeof(handle)) tx-count on ALL cluster CTAs' semaphores or the
+wait deadlocks: use mbarrier complete_tx w/ cluster multicast (find TK helper:
+grep complete_tx / cluster arrive in include/ops/*/util). Then delete-or-keep
+the drain pipeline accordingly (drain stages also expect_bytes handle-sized).
