@@ -20,7 +20,12 @@ struct wgmma_acc {
     __device__ inline void step(const AST &a, const BST &b, bool first) {
         #pragma unroll
         for (int m = 0; m < MCH; ++m) {
-            auto a_sub = const_cast<AST &>(a).template subtile<64, AST::cols>(int2{m, 0});
+            // NOTE: wgmma smem descriptors ignore st_subtile offsets (verified
+            // by the unit test: both M-chunks read chunk 0). Reinterpret the
+            // M-halves as independent stacked tiles instead.
+            using a_half_t = st_bf<64, AST::cols>;
+            auto &a_sub = *reinterpret_cast<a_half_t *>(
+                reinterpret_cast<char *>(const_cast<AST *>(&a)) + m * sizeof(a_half_t));
             if constexpr (BST::rows == AST::cols) { // B [K,N] -> AB
                 if (first) warpgroup::mm_AB (acc[m], a_sub, b);
                 else       warpgroup::mma_AB(acc[m], a_sub, b);
