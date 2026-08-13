@@ -18,8 +18,12 @@
 #       -> a receipt naming a commit the build never used
 #   4 receipt.SO_SHA256                        == record.SO_SHA256
 #       -> a receipt describing a different binary than the one built
-#   5 manifest.EXPECTED_SO_SHA256              == record.SO_SHA256
-#       -> a measurement contract frozen against a different binary
+#   5 manifest bytes == receipt.MANIFEST_SHA256, receipt.HARNESS_SHA256 ==
+#     manifest.EXPECTED_HARNESS_SHA256, manifest.EXPECTED_SO_SHA256 ==
+#     record.SO_SHA256
+#       -> a measurement contract frozen against a different binary, AND a
+#          different manifest (other shape/iters/harness) presented in place of
+#          the one the anchored receipt names
 #   6 deployed .so bytes                       == record.SO_SHA256
 #       -> the binary on the target not being the one that was built
 #
@@ -50,6 +54,22 @@ echo "$EXPR_RCPT" | grep -qE '^[0-9a-f]{64}$' \
 [ -f "$RCPT" ] || fb "receipt $RCPT missing"
 [ -f "$REC" ] || fb "build record $REC missing"
 [ -f "$MAN" ] || fb "manifest $MAN missing"
+# Snapshot first, then verify, then use. Hashing a caller path and afterwards
+# re-reading that same path for every field lets the file change in between:
+# the launcher had exactly that defect and it was demonstrable. Each artifact
+# is copied ONCE into a private 0700 directory, and everything downstream -
+# hashes, validators, field reads - happens on the snapshot. Read-only bits on
+# the caller's copies are therefore not relied on at all.
+SNAP=$(mktemp -d) || fb "cannot create a private snapshot directory"
+trap 'rm -rf "$SNAP"' EXIT
+set -o noclobber
+{ cat < "$RCPT" > "$SNAP/receipt"; } 2>/dev/null || fb "cannot snapshot the receipt"
+{ cat < "$REC"  > "$SNAP/record";  } 2>/dev/null || fb "cannot snapshot the build record"
+{ cat < "$MAN"  > "$SNAP/manifest";} 2>/dev/null || fb "cannot snapshot the manifest"
+set +o noclobber
+chmod 444 "$SNAP/receipt" "$SNAP/record" "$SNAP/manifest"
+MANNAME=$(basename "$MAN")
+RCPT=$SNAP/receipt; REC=$SNAP/record; MAN=$SNAP/manifest
 RCPTSHA=$(sha256sum "$RCPT" | cut -d' ' -f1)
 [ "$RCPTSHA" = "$EXPR_RCPT" ] || fb "receipt sha $RCPTSHA != EXPECTED_RECEIPT_SHA256 $EXPR_RCPT"
 bash "$DIR/validate_receipt_sm90.sh" "$RCPT" --check-mode >/dev/null \
@@ -84,6 +104,18 @@ mnget() { grep "^$1=" "$MAN"  | head -1 | cut -d= -f2- || true; }
   || fb "receipt BINARY_BUILD_COMMIT $(rcget BINARY_BUILD_COMMIT) != record SOURCE_COMMIT $(brget SOURCE_COMMIT)"
 [ "$(rcget SO_SHA256)" = "$(brget SO_SHA256)" ] \
   || fb "receipt SO_SHA256 != record SO_SHA256"
+# The manifest handed to this checker must be THE manifest the anchored receipt
+# describes. Comparing only EXPECTED_SO_SHA256 (as the previous version did)
+# accepts any manifest built against the same binary: a different shape, a
+# different iteration count, a different harness. That leaves the measurement
+# contract unbound while every other link looks consistent.
+MANSHA=$(sha256sum "$MAN" | cut -d' ' -f1)
+[ "$MANSHA" = "$(rcget MANIFEST_SHA256)" ] \
+  || fb "manifest sha $MANSHA != receipt MANIFEST_SHA256 $(rcget MANIFEST_SHA256); this is not the manifest the receipt describes"
+[ "$MANNAME" = "$(rcget MANIFEST_FILE)" ] \
+  || fb "manifest basename $MANNAME != receipt MANIFEST_FILE $(rcget MANIFEST_FILE)"
+[ "$(rcget HARNESS_SHA256)" = "$(mnget EXPECTED_HARNESS_SHA256)" ] \
+  || fb "receipt HARNESS_SHA256 != manifest EXPECTED_HARNESS_SHA256"
 [ "$(mnget EXPECTED_SO_SHA256)" = "$(brget SO_SHA256)" ] \
   || fb "manifest EXPECTED_SO_SHA256 != record SO_SHA256"
 # an unmatched glob expands to the literal pattern, so count real files -

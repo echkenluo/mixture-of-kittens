@@ -105,7 +105,30 @@ check N1_runner_module_derived "$RUNNER" \
   '-m "$HARNESS_MODULE"' \
   '-m benchmarks.bench_sm90_fwd '
 
-EXPECTED=6
+# 7-9: three launcher properties that no local test can execute, because the
+# hardened launcher pins PATH and the mock docker/nvidia-smi no longer resolve.
+# 7: every manifest field must come from the verified per-run snapshot. Reading
+# the caller's live path again is what let a flipped manifest supply BENCH_GPUS
+# the anchor never covered while all hashes still matched.
+check L4_manifest_fields_from_snapshot "$LAUNCH" \
+  'mget\(\) \{ grep "\^\$1=" "\$MCOPY" ' \
+  'mget\(\) \{ grep "\^\$1=" "\$MANIFEST" ' \
+  'mget() { grep "^$1=" "$MCOPY" ' \
+  'mget() { grep "^$1=" "$MANIFEST" '
+# 8: same for the receipt
+check L5_receipt_fields_from_snapshot "$LAUNCH" \
+  'rget\(\) \{ grep "\^\$1=" "\$RCOPY" ' \
+  'rget\(\) \{ grep "\^\$1=" "\$RECEIPT" ' \
+  'rget() { grep "^$1=" "$RCOPY" ' \
+  'rget() { grep "^$1=" "$RECEIPT" '
+# 9: a failed docker image inspect must not be read as "local-only image"
+check L6_inspect_failure_is_not_none "$LAUNCH" \
+  '\[ "\$IRC" -eq 0 \] \|\| \{ echo "IMAGE_TRUST_FAIL:docker image inspect failed' \
+  '-' \
+  '[ "$IRC" -eq 0 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed' \
+  '[ "$IRC" -eq 99 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed'
+
+EXPECTED=9
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "GUARD_COUNT_FAIL:ran $TOTAL guards, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "SOURCE_GUARDS pass=$PASS fail=$FAIL"

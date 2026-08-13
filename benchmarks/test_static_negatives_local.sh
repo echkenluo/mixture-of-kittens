@@ -98,7 +98,7 @@ lcase L1_expected_env_missing __UNSET__ canary 14 \
 lcase L2_expected_not_hex "notahash" canary 14 \
   '^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 env missing or not 64-hex$' -- no-ct "$MOKF" "$MANF" "$RECF"
 lcase L3_expected_mismatch "$(H64 a)" canary 14 \
-  "^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch \(actual $RSHA expected $(H64 a)\)\$" -- no-ct "$MOKF" "$MANF" "$RECF"
+  "^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch \(snapshot $RSHA expected $(H64 a)\)\$" -- no-ct "$MOKF" "$MANF" "$RECF"
 # collusion: manifest AND receipt rewritten self-consistently, both read-only
 # and schema-valid; the out-of-band prior must still reject them
 sed 's/^tokens_per_rank=.*/tokens_per_rank=513/' "$MANF" > "$TMPD/collude.manifest"
@@ -107,11 +107,11 @@ CMSHA=$(sha256sum "$TMPD/collude.manifest" | cut -d' ' -f1)
 mkreceipt "$TMPD/collude.receipt" "$CMSHA"
 CRSHA=$(sha256sum "$TMPD/collude.receipt" | cut -d' ' -f1)
 lcase L4_collusion "$RSHA" canary 14 \
-  "^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch \(actual $CRSHA expected $RSHA\)\$" \
+  "^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch \(snapshot $CRSHA expected $RSHA\)\$" \
   -- no-ct "$MOKF" "$TMPD/collude.manifest" "$TMPD/collude.receipt"
 cp "$RECF" "$TMPD/writable.receipt"; chmod 644 "$TMPD/writable.receipt"
 lcase L5_receipt_writable "$(sha256sum "$TMPD/writable.receipt" | cut -d' ' -f1)" canary 14 \
-  '^RECEIPT_TRUST_FAIL:write bits set \(644\)$' -- no-ct "$MOKF" "$MANF" "$TMPD/writable.receipt"
+  '^RECEIPT_TRUST_FAIL:staged artifact .* is writable \(644\)$' -- no-ct "$MOKF" "$MANF" "$TMPD/writable.receipt"
 grep -v '^SO_SHA256=' "$RECF" > "$TMPD/misskey.receipt"; chmod 444 "$TMPD/misskey.receipt"
 lcase L6_receipt_missing_key "$(sha256sum "$TMPD/misskey.receipt" | cut -d' ' -f1)" canary 14 \
   '^RECEIPT_TRUST_FAIL:key SO_SHA256 count=0 \(need exactly 1\)$' -- no-ct "$MOKF" "$MANF" "$TMPD/misskey.receipt"
@@ -133,12 +133,12 @@ lcase L11_manifest_missing "$RSHA" canary 12 \
   "^MANIFEST_SCHEMA_FAIL:missing $TMPD/nonexistent\.manifest\$" -- no-ct "$MOKF" "$TMPD/nonexistent.manifest" "$RECF"
 sed 's/^tokens_per_rank=.*/tokens_per_rank=513/' "$MANF" > "$TMPD/mut.manifest"; chmod 444 "$TMPD/mut.manifest"
 lcase L12_manifest_mutated "$RSHA" canary 14 \
-  "^MANIFEST_TRUST_FAIL:manifest sha != receipt \(actual $(sha256sum "$TMPD/mut.manifest" | cut -d' ' -f1) receipt $MSHA\)\$" \
+  "^MANIFEST_TRUST_FAIL:manifest snapshot sha $(sha256sum "$TMPD/mut.manifest" | cut -d' ' -f1) != receipt $MSHA\$" \
   -- no-ct "$MOKF" "$TMPD/mut.manifest" "$RECF"
 cp "$MANF" "$TMPD/wmanifest.manifest"; chmod 644 "$TMPD/wmanifest.manifest"
 mkreceipt "$TMPD/wman.receipt" "$(sha256sum "$TMPD/wmanifest.manifest" | cut -d' ' -f1)"
 lcase L13_manifest_writable "$(sha256sum "$TMPD/wman.receipt" | cut -d' ' -f1)" canary 14 \
-  '^MANIFEST_TRUST_FAIL:write bits set \(644\)$' -- no-ct "$MOKF" "$TMPD/wmanifest.manifest" "$TMPD/wman.receipt"
+  '^RECEIPT_TRUST_FAIL:staged artifact .* is writable \(644\)$' -- no-ct "$MOKF" "$TMPD/wmanifest.manifest" "$TMPD/wman.receipt"
 sed "s|^HARNESS_SHA256=.*|HARNESS_SHA256=$(H64 f)|" "$RECF" > "$TMPD/hmis.receipt"; chmod 444 "$TMPD/hmis.receipt"
 lcase L14_receipt_harness_mismatch "$(sha256sum "$TMPD/hmis.receipt" | cut -d' ' -f1)" canary 14 \
   '^RECEIPT_TRUST_FAIL:harness sha receipt != manifest$' -- no-ct "$MOKF" "$MANF" "$TMPD/hmis.receipt"

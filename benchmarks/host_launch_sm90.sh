@@ -37,21 +37,51 @@
 # Usage: BENCH_TAG=... EXPECTED_RECEIPT_SHA256=... [BENCH_MODE=formal|canary] \
 #          bash host_launch_sm90.sh <container> <host_mok_dir> <manifest> <receipt>
 set -uo pipefail
+# ---------------------------------------------------------------- entrypoint
+# Misuse protection ONLY, and it must be said plainly: every gate below is a
+# shell-out (sha256sum, stat, grep, cp, docker) resolved through PATH, so a
+# caller who controls the environment controls the verdict. A hostile
+# sha256sum was shown to make a forged receipt pass the anchor gate while the
+# sidecar recorded the anchored hash. Fixing PATH and refusing inherited
+# BASH_ENV/exported functions raises the bar; it does NOT make the verified end
+# trustworthy. Binding this gate code to the receipt is NOT implemented, so the
+# deployment-tooling boundary stays UNVERIFIED (see the contract doc).
+# Reserved words and absolute paths only - a function cannot shadow either.
+[[ -x /usr/bin/env && -x /usr/bin/grep ]] \
+  || { echo "LAUNCH_VERIFY_FAIL:/usr/bin/env or /usr/bin/grep missing; the entrypoint cannot be inspected"; exit 4; }
+[[ "${BASH_SOURCE[0]}" == "$0" ]] \
+  || { echo "LAUNCH_VERIFY_FAIL:this launcher must be executed, not sourced"; exit 4; }
+BAD_ENTRY=$(/usr/bin/env | /usr/bin/grep -m1 -oE '^(BASH_FUNC_[^=%(]*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=?' || true)
+BAD_ENTRY=${BAD_ENTRY%=}
+if [[ -n $BAD_ENTRY ]]; then
+  case $BAD_ENTRY in
+    BASH_FUNC_*) echo "LAUNCH_VERIFY_FAIL:exported shell function ${BAD_ENTRY#BASH_FUNC_} is present; a function shadows PATH lookups" ;;
+    *) echo "LAUNCH_VERIFY_FAIL:$BAD_ENTRY is set; this launcher must be started from a clean entrypoint" ;;
+  esac
+  exit 4
+fi
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CT=${1:?container name}
 MOKDIR=${2:?host mok dir}
 MANIFEST=${3:?manifest path (committed, read-only)}
 RECEIPT=${4:?deployment receipt path (packaging-generated, read-only)}
 TAG=${BENCH_TAG:?BENCH_TAG required}
 DIR=$(cd "$(dirname "$0")" && pwd)
-
-EXPR_SHA=${EXPECTED_RECEIPT_SHA256:-}
-echo "$EXPR_SHA" | grep -qE '^[0-9a-f]{64}$' \
-  || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 env missing or not 64-hex"; exit 14; }
-[ -f "$RECEIPT" ] || { echo "RECEIPT_TRUST_FAIL:missing receipt $RECEIPT"; exit 14; }
-RSHA=$(sha256sum "$RECEIPT" | cut -d' ' -f1)
-[ "$RSHA" = "$EXPR_SHA" ] || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch (actual $RSHA expected $EXPR_SHA)"; exit 14; }
-bash "$DIR/validate_receipt_sm90.sh" "$RECEIPT" --check-mode || exit 14
-rget() { grep "^$1=" "$RECEIPT" | head -1 | cut -d= -f2-; }
+# BENCH_TAG becomes a filename component for the log, the JSON, the sidecar and
+# both per-run copies. Unvalidated, `../evil` put all of them outside
+# host-runs/. Validate BEFORE anything is created.
+printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' \
+  || { echo "LAUNCH_VERIFY_FAIL:BENCH_TAG must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\$ (it becomes a filename); got [$TAG]"; exit 4; }
+# Measurement thresholds are part of the contract, not caller preference: with
+# these as env overrides the same machine state passed or failed purely by what
+# the caller asked for, and the sidecar recorded the caller's number as if it
+# were the contract. Operational knobs (PREFLIGHT_TRIES, BENCH_TIMEOUT,
+# BENCH_WAIT_SECS) stay callable - they can only make a run fail sooner.
+for V in LOAD1_MAX_PRELAUNCH LOAD1_DELTA_MAX CLK_RUN_MIN_MHZ; do
+  [ -z "$(printenv "$V" || true)" ] \
+    || { echo "TELEMETRY_GATE_FAIL:$V is a tracked measurement threshold and cannot be set by the caller"; exit 15; }
+done
+LOAD1_MAX_PRELAUNCH=64; LOAD1_DELTA_MAX=16; CLK_RUN_MIN_MHZ=500
 
 BMODE=${BENCH_MODE:-canary}
 case "$BMODE" in formal|canary) : ;; *) echo "MODE_FAIL:BENCH_MODE must be formal or canary (got $BMODE)"; exit 14 ;; esac
@@ -66,19 +96,66 @@ if [ "$BMODE" = "formal" ]; then
 fi
 FORMAL_VALIDITY=INVALID_FOR_FORMAL
 
+EXPR_SHA=${EXPECTED_RECEIPT_SHA256:-}
+echo "$EXPR_SHA" | grep -qE '^[0-9a-f]{64}$' \
+  || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 env missing or not 64-hex"; exit 14; }
+[ -f "$RECEIPT" ] || { echo "RECEIPT_TRUST_FAIL:missing receipt $RECEIPT"; exit 14; }
 [ -f "$MANIFEST" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MANIFEST"; exit 12; }
-MSHA_ACT=$(sha256sum "$MANIFEST" | cut -d' ' -f1)
-[ "$MSHA_ACT" = "$(rget MANIFEST_SHA256)" ] || { echo "MANIFEST_TRUST_FAIL:manifest sha != receipt (actual $MSHA_ACT receipt $(rget MANIFEST_SHA256))"; exit 14; }
-MMODE=$(stat -c %a "$MANIFEST")
-case "$MMODE" in *[2367]*) echo "MANIFEST_TRUST_FAIL:write bits set ($MMODE)"; exit 14 ;; esac
+# staging hygiene, not a security property (the snapshot below is): the
+# operator is expected to stage read-only artifacts
+for F in "$RECEIPT" "$MANIFEST"; do
+  case "$(stat -c %a "$F")" in *[2367]*) echo "RECEIPT_TRUST_FAIL:staged artifact $F is writable ($(stat -c %a "$F"))"; exit 14 ;; esac
+done
 
-mget() { grep "^$1=" "$MANIFEST" | head -1 | cut -d= -f2-; }
+# ------------------------------------------------- snapshot, verify, then use
+# The previous version hashed the live files and then kept re-reading them:
+# field reads, the validators, ENVARGS and the copy all went back to the
+# caller's path. Flipping the manifest between the hash check and the copy made
+# the launcher run with BENCH_GPUS the anchor never covered while every hash
+# still matched. Each artifact is now read ONCE into a per-run snapshot, the
+# snapshot is what gets verified, and every later read comes from the snapshot.
+RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
+LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
+JSONF=$MOKDIR/runs/$TAG-$RUN_ID.json
+SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host
+MCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.manifest
+RCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.receipt
+mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
+# O_EXCL for every per-run file: an existing path (or a symlink planted at it)
+# is refused rather than followed or overwritten
+set -o noclobber
+if ! { : > "$SIDE"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:sidecar $SIDE already exists"; exit 4; fi
+if ! { cat < "$RECEIPT" > "$RCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:receipt snapshot $RCOPY already exists or is unreadable"; exit 4; fi
+if ! { cat < "$MANIFEST" > "$MCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:manifest snapshot $MCOPY already exists or is unreadable"; exit 4; fi
+set +o noclobber
+chmod 444 "$MCOPY" "$RCOPY" 2>/dev/null || true
+side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
+fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
+RSHA=$(sha256sum "$RCOPY" | cut -d' ' -f1)
+[ "$RSHA" = "$EXPR_SHA" ] || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch (snapshot $RSHA expected $EXPR_SHA)"; exit 14; }
+bash "$DIR/validate_receipt_sm90.sh" "$RCOPY" --check-mode || exit 14
+rget() { grep "^$1=" "$RCOPY" | head -1 | cut -d= -f2-; }
+# schema 2 asserts a build-record binding this launcher is given no record to
+# check, so accepting it would run under provenance nothing here verified
+[ "$(rget RECEIPT_SCHEMA)" = "1" ] \
+  || { echo "RECEIPT_TRUST_FAIL:receipt schema $(rget RECEIPT_SCHEMA) claims a build-record binding, and no record is supplied to this launcher"; exit 14; }
+
+
+MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
+[ "$MSHA" = "$(rget MANIFEST_SHA256)" ] \
+  || { echo "MANIFEST_TRUST_FAIL:manifest snapshot sha $MSHA != receipt $(rget MANIFEST_SHA256)"; exit 14; }
+# the receipt names the manifest it describes; the generator writes a bare
+# filename, so a name that disagrees means the wrong artifact was staged
+[ "$(basename "$MANIFEST")" = "$(rget MANIFEST_FILE)" ] \
+  || { echo "MANIFEST_TRUST_FAIL:manifest basename $(basename "$MANIFEST") != receipt MANIFEST_FILE $(rget MANIFEST_FILE)"; exit 14; }
+
+mget() { grep "^$1=" "$MCOPY" | head -1 | cut -d= -f2-; }
 # schema 2 selects the implementation; schema 1 is MoK-only by definition
 HARNESS_MODULE=$(mget HARNESS_MODULE)
 [ -n "$HARNESS_MODULE" ] || HARNESS_MODULE=benchmarks.bench_sm90_fwd
 HARNESS_FILE=$MOKDIR/mixture-of-kittens/$(echo "$HARNESS_MODULE" | tr '.' '/').py
 [ -f "$HARNESS_FILE" ] || { echo "MANIFEST_SCHEMA_FAIL:harness file for $HARNESS_MODULE missing"; exit 12; }
-bash "$DIR/validate_manifest_sm90.sh" "$MANIFEST" \
+bash "$DIR/validate_manifest_sm90.sh" "$MCOPY" \
   --harness "$HARNESS_FILE" \
   --so-dir "$MOKDIR/mixture-of-kittens/mok"
 VRC=$?
@@ -92,32 +169,24 @@ IMGID=$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)
 [ -n "$IMGID" ] || { echo "IMAGE_TRUST_FAIL:container inspect failed for $CT"; exit 14; }
 IMGREF=$(docker inspect --format '{{.Config.Image}}' "$CT" 2>/dev/null)
 [ -n "$IMGREF" ] || { echo "IMAGE_TRUST_FAIL:image ref empty"; exit 14; }
-IMGRD=$(docker image inspect --format '{{join .RepoDigests ","}}' "$IMGID" 2>/dev/null)
+# a failed inspect is NOT a local-only image: treating both as NONE let a
+# docker daemon error satisfy a receipt that says NONE, so a tool failure was
+# laundered into a provenance statement
+IMGRD=$(docker image inspect --format '{{join .RepoDigests ","}}' "$IMGID" 2>/dev/null); IRC=$?
+[ "$IRC" -eq 0 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed (rc=$IRC) for $IMGID; a tool failure cannot stand in for NONE"; exit 14; }
 [ -n "$IMGRD" ] || IMGRD=NONE
 [ "$IMGID" = "$(rget IMAGE_ID)" ] || { echo "IMAGE_TRUST_FAIL:image id live $IMGID != receipt $(rget IMAGE_ID)"; exit 14; }
 [ "$IMGREF" = "$(rget IMAGE_REF)" ] || { echo "IMAGE_TRUST_FAIL:image ref live $IMGREF != receipt $(rget IMAGE_REF)"; exit 14; }
 [ "$IMGRD" = "$(rget IMAGE_REPO_DIGESTS)" ] || { echo "IMAGE_TRUST_FAIL:repo digests live $IMGRD != receipt $(rget IMAGE_REPO_DIGESTS)"; exit 14; }
 
-RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
-LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
-JSONF=$MOKDIR/runs/$TAG-$RUN_ID.json
-SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host
-MCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.manifest
-RCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.receipt
-mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
-touch "$SIDE" 2>/dev/null
-[ -w "$SIDE" ] || { echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4; }
-side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
-fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
-cp "$MANIFEST" "$MCOPY" || { echo "LAUNCH_VERIFY_FAIL:manifest copy failed"; exit 4; }
-cp "$RECEIPT" "$RCOPY" || { echo "LAUNCH_VERIFY_FAIL:receipt copy failed"; exit 4; }
-MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
 HTMP=$SIDE.hdr.$$
 if ! { echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
        echo "BENCH_MODE:$BMODE"; echo "FORMAL_VALIDITY:$FORMAL_VALIDITY"
        echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
        echo "RECEIPT_FILE:$(basename "$RECEIPT")"; echo "RECEIPT_SHA256:$RSHA"
        echo "RECEIPT_COPY:$(basename "$RCOPY")"
+       echo "RECEIPT_SCHEMA:$(rget RECEIPT_SCHEMA)"
+       echo "MEASUREMENT_THRESHOLDS:load1_max=$LOAD1_MAX_PRELAUNCH load1_delta_max=$LOAD1_DELTA_MAX clk_run_min_mhz=$CLK_RUN_MIN_MHZ (tracked, not caller-set)"
        echo "IMAGE_ID:$IMGID"; echo "IMAGE_REF:$IMGREF"; echo "IMAGE_REPO_DIGESTS:$IMGRD"; } > "$HTMP"; then
   echo "LAUNCH_VERIFY_FAIL:sidecar header write failed"; exit 4
 fi
@@ -155,7 +224,6 @@ side "PRELAUNCH_OCCUPANCY:$OCC"
 LOAD_START=$(cat /proc/loadavg)
 side "HOST_LOADAVG_PRELAUNCH:$LOAD_START"
 L1P=${LOAD_START%% *}
-LOAD1_MAX_PRELAUNCH=${LOAD1_MAX_PRELAUNCH:-64}
 PLOK=$(python3 -c "print(1 if float('$L1P') <= float('$LOAD1_MAX_PRELAUNCH') else 0)" 2>/dev/null)
 side "PRELAUNCH_LOAD1_GATE:load1=$L1P max=$LOAD1_MAX_PRELAUNCH ok=${PLOK:-0}"
 [ "${PLOK:-0}" = "1" ] || fail "TELEMETRY_GATE_FAIL:prelaunch load1 $L1P above $LOAD1_MAX_PRELAUNCH" 15
@@ -234,7 +302,6 @@ side "NVML_UUID_PID_PAIRS:$(printf '%s' "$PAIRS" | grep -f <(echo $TUUIDS | tr '
 # stability gate and must never be described as one
 RUNCLK=$(gpuq)
 side "HOST_GPU_CLOCKS_RUNNING:$RUNCLK"
-CLK_RUN_MIN_MHZ=${CLK_RUN_MIN_MHZ:-500}
 LOWCLK=0
 for C in $(printf '%s' "$RUNCLK" | tr ';' '\n' | cut -d, -f2 | grep -oE '^[0-9]+'); do
   [ "$C" -lt "$CLK_RUN_MIN_MHZ" ] && LOWCLK=1
@@ -275,7 +342,6 @@ side "HOST_LOADAVG_END:$LOAD_END"
 side "HOST_VMSTAT_END:$(vmstat 1 2 2>/dev/null | tail -1 | tr -s ' ')"
 side "HOST_GPU_CLOCKS_END:$(gpuq)"
 L1S=${LOAD_START%% *}; L1E=${LOAD_END%% *}
-LOAD1_DELTA_MAX=${LOAD1_DELTA_MAX:-16}
 DELTA_OK=$(python3 -c "print(1 if float('$L1E')-float('$L1S') <= float('$LOAD1_DELTA_MAX') else 0)" 2>/dev/null)
 side "LOAD1_DELTA_GATE:start=$L1S end=$L1E max=+$LOAD1_DELTA_MAX ok=${DELTA_OK:-0}"
 [ "${DELTA_OK:-0}" = "1" ] || fail "TELEMETRY_GATE_FAIL:load1 rose $L1S -> $L1E (> +$LOAD1_DELTA_MAX)" 15

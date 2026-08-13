@@ -5,6 +5,9 @@
 # establishes only well-formedness; TRUST is established solely by the
 # EXPECTED_RECEIPT_SHA256 comparison in the caller (an attacker who rewrites
 # manifest+receipt self-consistently still fails the expected-hash gate).
+# MANIFEST_GIT_BLOB is ANCHORED METADATA, not a binding: the verified end has
+# no git, so nothing recomputes it. It is covered by the receipt hash and is
+# useful for auditing on the packaging host only.
 #   any violation -> exit 14 RECEIPT_TRUST_FAIL:<why>
 #   valid         -> exit 0, prints RECEIPT_VALID:<sha256>
 # Usage: validate_receipt_sm90.sh <receipt> [--check-mode]
@@ -33,10 +36,14 @@ for K in $RREQ; do
   N=$(grep -c "^$K=" "$REC" || true)
   [ "$N" -eq 1 ] || { echo "RECEIPT_TRUST_FAIL:key $K count=$N (need exactly 1)"; exit 14; }
 done
+# exact string comparison, not a grep: the key comes from the receipt, so used
+# as a regex a smuggled key like SO_SHA25. matches SO_SHA256 in the allow-list
+# and passes as known (the same defect the build-record validator had)
+known_key() { local N; for N in $RREQ; do [ "$N" = "$1" ] && return 0; done; return 1; }
 while IFS= read -r LINE; do
   [ -z "$LINE" ] && continue
   K=${LINE%%=*}
-  echo " $RREQ " | grep -q " $K " || { echo "RECEIPT_TRUST_FAIL:unknown key $K"; exit 14; }
+  known_key "$K" || { echo "RECEIPT_TRUST_FAIL:unknown key $K"; exit 14; }
 done < "$REC"
 rget() { grep "^$1=" "$REC" | head -1 | cut -d= -f2-; }
 for K in $RREQ; do
@@ -48,6 +55,15 @@ done
 for K in SOURCE_TREE_COMMIT HARNESS_COMMIT MANIFEST_GIT_BLOB; do
   rget "$K" | grep -qE '^[0-9a-f]{40}$' || { echo "RECEIPT_TRUST_FAIL:$K not 40-hex"; exit 14; }
 done
+# the generator packages ONE tree, so these are the same HEAD by construction;
+# allowing them to differ left a field that looks like a binding and is not
+[ "$(rget SOURCE_TREE_COMMIT)" = "$(rget HARNESS_COMMIT)" ] \
+  || { echo "RECEIPT_TRUST_FAIL:SOURCE_TREE_COMMIT != HARNESS_COMMIT (one packaged tree has one HEAD)"; exit 14; }
+# MANIFEST_FILE is a bare filename by generator contract (basename of the
+# packaged manifest); a path here would be a second, unanchored locator
+case "$(rget MANIFEST_FILE)" in
+  */*|..|.) echo "RECEIPT_TRUST_FAIL:MANIFEST_FILE must be a bare filename, got $(rget MANIFEST_FILE)"; exit 14 ;;
+esac
 BB=$(rget BINARY_BUILD_COMMIT)
 { echo "$BB" | grep -qE '^[0-9a-f]{40}$' || [ "$BB" = "UNKNOWN" ]; } \
   || { echo "RECEIPT_TRUST_FAIL:BINARY_BUILD_COMMIT not 40-hex or UNKNOWN"; exit 14; }

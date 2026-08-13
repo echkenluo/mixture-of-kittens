@@ -38,10 +38,13 @@ for K in $REQ_KEYS; do
   N=$(grep -c "^$K=" "$MAN" || true)
   [ "$N" -eq 1 ] || { echo "MANIFEST_SCHEMA_FAIL:key $K count=$N (need exactly 1)"; exit 12; }
 done
+# exact string comparison, not a grep: as a regex a key like hidde. matches
+# hidden in the allow-list and a smuggled key passes as known
+known_key() { local N; for N in $REQ_KEYS; do [ "$N" = "$1" ] && return 0; done; return 1; }
 while IFS= read -r LINE; do
   [ -z "$LINE" ] && continue
   K=${LINE%%=*}
-  echo " $REQ_KEYS " | grep -q " $K " || { echo "MANIFEST_SCHEMA_FAIL:unknown key $K"; exit 12; }
+  known_key "$K" || { echo "MANIFEST_SCHEMA_FAIL:unknown key $K"; exit 12; }
 done < "$MAN"
 mget() { grep "^$1=" "$MAN" | head -1 | cut -d= -f2-; }
 for K in $REQ_KEYS; do

@@ -16,11 +16,33 @@
 #     (the packaging host has no .so binary; the remote gate measures bytes)
 #   - IMAGE_ID / IMAGE_REF / IMAGE_REPO_DIGESTS of the target container image
 #     (IMAGE_REPO_DIGESTS=NONE marks a local-only image: canary-only)
-# Output is written atomically (same-dir temp + rename) and self-validated
-# with validate_receipt_sm90.sh before the expected hash is printed.
+# Output is written to a same-dir temp, self-validated with
+# validate_receipt_sm90.sh, and published with a hard link that FAILS if the
+# target exists - a receipt is evidence and is never overwritten.
 # Usage: make_deploy_receipt.sh <repo_dir> <manifest_relpath> <out_receipt>
 # Required env: IMAGE_ID IMAGE_REF IMAGE_REPO_DIGESTS BINARY_BUILD_COMMIT
 set -euo pipefail
+# Entrypoint: misuse protection only, in the same terms as the build wrapper.
+# Every gate here shells out (git, sha256sum, ln) through PATH, and a hostile
+# sha256sum forges any hash comparison, so this raises the bar and does not
+# establish trust. Reserved words and absolute paths cannot be shadowed.
+[[ -x /usr/bin/env && -x /usr/bin/grep ]] \
+  || { echo "RECEIPT_FAIL:/usr/bin/env or /usr/bin/grep missing; the entrypoint cannot be inspected"; exit 2; }
+[[ "${BASH_SOURCE[0]}" == "$0" ]] \
+  || { echo "RECEIPT_FAIL:this generator must be executed, not sourced"; exit 2; }
+BAD_ENTRY=$(/usr/bin/env | /usr/bin/grep -m1 -oE '^(BASH_FUNC_[^=%(]*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=?' || true)
+BAD_ENTRY=${BAD_ENTRY%=}
+if [[ -n $BAD_ENTRY ]]; then
+  case $BAD_ENTRY in
+    BASH_FUNC_*) echo "RECEIPT_FAIL:exported shell function ${BAD_ENTRY#BASH_FUNC_} is present; a function shadows PATH lookups" ;;
+    *) echo "RECEIPT_FAIL:$BAD_ENTRY is set; this generator must be started from a clean entrypoint" ;;
+  esac
+  exit 2
+fi
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_CONFIG \
+      GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS 2>/dev/null || true
+export GIT_CONFIG_NOSYSTEM=1
 REPO=${1:?repo dir}; MREL=${2:?manifest relpath}; OUT=${3:?output receipt path}
 : "${IMAGE_ID:?IMAGE_ID required}"
 : "${IMAGE_REF:?IMAGE_REF required}"
@@ -30,6 +52,19 @@ cd "$REPO"
 DIRTY=$(git status --porcelain -- benchmarks)
 [ -z "$DIRTY" ] || { echo "RECEIPT_FAIL:benchmarks tree not clean vs HEAD (incl. untracked):"; echo "$DIRTY"; exit 2; }
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Self-binding, same rule as the build wrapper: this generator and the two
+# validators it calls must BE the committed code of the repository they are
+# describing. A copy run from outside the tree, or an edited worktree file,
+# produces a receipt whose gate code nobody can recompute.
+REPO_ABS=$(cd "$REPO" && pwd)
+[ "$DIR" = "$REPO_ABS/benchmarks" ] \
+  || { echo "RECEIPT_FAIL:generator is running from $DIR, not $REPO_ABS/benchmarks"; exit 2; }
+for T in make_deploy_receipt.sh validate_receipt_sm90.sh validate_manifest_sm90.sh; do
+  WSHA=$(sha256sum "$DIR/$T" | cut -d' ' -f1)
+  CSHA=$(git -C "$REPO_ABS" cat-file blob "HEAD:benchmarks/$T" 2>/dev/null | sha256sum | cut -d' ' -f1)
+  [ "$WSHA" = "$CSHA" ] \
+    || { echo "RECEIPT_FAIL:packaging tool benchmarks/$T differs from its committed bytes at HEAD ($WSHA != $CSHA)"; exit 2; }
+done
 bash "$DIR/validate_manifest_sm90.sh" "$MREL" >/dev/null || { echo "RECEIPT_FAIL:manifest invalid"; exit 2; }
 SRC=$(git rev-parse HEAD)
 MSHA=$(sha256sum "$MREL" | cut -d' ' -f1)
@@ -93,6 +128,11 @@ chmod 444 "$TMP"
 # failure path.
 bash "$DIR/validate_receipt_sm90.sh" "$TMP" --check-mode >/dev/null \
   || { echo "RECEIPT_FAIL:generated receipt failed self-validation (not published)"; exit 2; }
-mv -f "$TMP" "$OUT"
+# hard link, never mv -f: the printed EXPECTED_RECEIPT_SHA256 is an out-of-band
+# anchor, and silently replacing the file it names leaves that hash pointing at
+# bytes that no longer exist. The build record is published the same way.
+ln "$TMP" "$OUT" 2>/dev/null \
+  || { echo "RECEIPT_FAIL:could not publish receipt to $OUT (already exists? evidence is never overwritten)"; exit 2; }
+rm -f "$TMP"
 trap - EXIT
 echo "EXPECTED_RECEIPT_SHA256:$(sha256sum "$OUT" | cut -d' ' -f1)"
