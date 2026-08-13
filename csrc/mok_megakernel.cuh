@@ -1252,15 +1252,17 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     auto (&a_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<a_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr);
     auto (&b_smem)[config::MLP_LOAD_PIPE_DEPTH]       = *reinterpret_cast<b_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem));
 #if defined(KITTENS_SM90)
-    auto (&a_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<a_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + MOK_AB_BASE);
-    auto (&b_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<b_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + 2 * sizeof(a_smem) + sizeof(b_smem));
-    #define MOK_AB_BASE (2 * sizeof(a_smem) + 2 * sizeof(b_smem))
+    // layout: a0@0, b0@A, a1@(A+B), b1@(2A+B), scales@(2A+2B) -- codex step-B review
+    auto (&a_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<a_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
+    auto (&b_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<b_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_smem2));
+    constexpr uint64_t MOK_AB_TOTAL = 2 * (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH;
+    static_assert(MOK_AB_TOTAL == 2 * (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH);
 #else
-    #define MOK_AB_BASE (sizeof(a_smem) + sizeof(b_smem))
+    constexpr uint64_t MOK_AB_TOTAL = (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH;
 #endif
-    auto (&a_sc_smem)[config::MLP_LOAD_PIPE_DEPTH]    = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + MOK_AB_BASE);
-    auto (&b_sc_smem)[config::MLP_LOAD_PIPE_DEPTH][2] = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH][2]>(smem_base_addr + MOK_AB_BASE + sizeof(a_sc_smem));
-    auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES] = *reinterpret_cast<mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>((smem_base_addr + MOK_AB_BASE + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
+    auto (&a_sc_smem)[config::MLP_LOAD_PIPE_DEPTH]    = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + MOK_AB_TOTAL);
+    auto (&b_sc_smem)[config::MLP_LOAD_PIPE_DEPTH][2] = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH][2]>(smem_base_addr + MOK_AB_TOTAL + sizeof(a_sc_smem));
+    auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES] = *reinterpret_cast<mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>((smem_base_addr + MOK_AB_TOTAL + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
     auto &d_fp8_smem                                  = *reinterpret_cast<mlp_fp8_d_tile *>(&d_bf16_smem[2]);
     auto (&d_sc_smem)[2]                              = *reinterpret_cast<mlp_sc_tile (*)[2]>(reinterpret_cast<uint64_t>(&d_fp8_smem) + sizeof(d_fp8_smem));
     static_assert(config::MLP_NUM_BF16_D_TILES >= 3);
@@ -1380,19 +1382,28 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     const auto &b_gmem_curr = idx < first_gemm_iters ? b_gmem : *b2_gmem;
                     const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
+#if defined(KITTENS_SM90)
+                    if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+                        tma::expect_bytes(gemm_inputs_arrived[input_ring], 2 * (sizeof(a_tile) + sizeof(b_tile)));
+#endif
                     tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
 #if defined(KITTENS_SM90)
                     if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
                         tma::cluster::load_async(a_smem2[input_ring], a_gmem_curr, {tile_coord.x * 2 + 1, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
 #endif
-                    if constexpr (IS_AB)
+                    if constexpr (IS_AB) {
                         tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
-                    else
+#if defined(KITTENS_SM90)
+                        if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+                            tma::cluster::load_async(b_smem2[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + 1}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
+#endif
+                    } else {
                         tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
 #if defined(KITTENS_SM90)
-                    if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
-                        tma::cluster::load_async(b_smem2[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + 1, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
+                        if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+                            tma::cluster::load_async(b_smem2[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + 1, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
 #endif
+                    }
                     update_phasebit<1>(gemm_bitfield, input_ring);
                     input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                 }
@@ -1478,14 +1489,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
 #if defined(KITTENS_SM90)
-        mok_sm90::wgmma_quad<a_tile, b_tile> quad;
+        mok_sm90::wgmma_quad<a_tile, b_tile, IS_AB> quad;
         if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
             int input_ring = 0;
             for (int idx = 0; idx < iters_per_task; ++idx) {
-                if (warpgroup::laneid() == 0)
-                    tma::expect_bytes(gemm_inputs_arrived[input_ring],
-                        2 * (sizeof(a_tile) + sizeof(b_tile)));
-                warpgroup::sync(2);
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
                 update_phasebit<0>(gemm_bitfield, input_ring);
                 quad.step(a_smem[input_ring], a_smem2[input_ring],
