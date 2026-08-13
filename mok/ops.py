@@ -3,9 +3,6 @@ import torch
 from . import _C
 
 
-@torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
-
-
 def _sm90_reject(op_name: str) -> None:
     """SM90 port supports only the BF16 forward path; fail fast at the public
     API for everything else (codex review: env opt-in alone is not a gate)."""
@@ -13,6 +10,10 @@ def _sm90_reject(op_name: str) -> None:
     if torch.cuda.get_device_capability() == (9, 0):
         raise NotImplementedError(
             f"MoK SM90 port: {op_name} is not supported (BF16 forward only)")
+
+
+
+@torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
 
 def all_gather_top_experts(
     top_experts: torch.Tensor,
