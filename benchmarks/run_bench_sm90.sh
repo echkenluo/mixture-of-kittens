@@ -14,6 +14,7 @@ RUN_ID=${RUN_ID:?RUN_ID required (host launcher generates it)}
 EXPECTED=${EXPECTED_HARNESS_SHA256:?EXPECTED_HARNESS_SHA256 required}
 EXPSO=${EXPECTED_SO_SHA256:?EXPECTED_SO_SHA256 required}
 MSHAE=${MANIFEST_SHA256:?MANIFEST_SHA256 required}
+RSHAE=${RECEIPT_SHA256:?RECEIPT_SHA256 required}
 BENCH_GPUS=${BENCH_GPUS:-0,1,2,3}
 PREFLIGHT_TRIES=${PREFLIGHT_TRIES:-24}
 mkdir -p /mok/runs  # container-owned; host writes only to host-runs/
@@ -28,6 +29,7 @@ ACTUAL=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
   echo "LOCK_HELD_BY:$$"
   echo "HARNESS_SHA256:$ACTUAL"
   echo "MANIFEST_SHA256:$MSHAE"
+  echo "RECEIPT_SHA256:$RSHAE"
   echo "BENCH_GPUS:$BENCH_GPUS"
 } > "$LOG"
 UUIDS=$(nvidia-smi -i "$BENCH_GPUS" --query-gpu=index,uuid --format=csv,noheader 2>&1)

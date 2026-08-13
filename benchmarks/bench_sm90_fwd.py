@@ -54,6 +54,7 @@ def _provenance():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     prov = {"frozen_commit_env": os.environ.get("MOK_FROZEN_COMMIT", "unset"),
             "manifest_sha256_env": os.environ.get("MANIFEST_SHA256", "unset (metadata_invalid)"),
+            "receipt_sha256_env": os.environ.get("RECEIPT_SHA256", "unset (metadata_invalid)"),
             "frozen_commit_provenance": "external env (host git); unset if launcher omitted it"}
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,

@@ -1,40 +1,59 @@
 #!/bin/bash
-# Completion gate v4 (tracked). Manifest-anchored four-way reconciliation:
-# manifest <-> run log <-> JSON <-> sidecar, with post-hoc tamper detection
-# (the sidecar's pre-start MANIFEST_SHA256 must match both the per-run copy
-# and the given committed manifest). Prints VERIFY_PASS or VERIFY_FAIL:<why>.
-# Usage: verify_run_sm90.sh <mokdir> <tag> <run_id> <manifest> [container]
+# Completion gate v5 (tracked). Receipt- and manifest-anchored reconciliation:
+#   - manifest sha256: given file == per-run copy == sidecar == runner log
+#     == JSON provenance.manifest_sha256_env (five-way EXACT equality)
+#   - receipt sha256: given file == sidecar == runner log
+#     == JSON provenance.receipt_sha256_env (four-way EXACT equality)
+#   - full semantic schema revalidation via the shared validator (never trust
+#     the launcher's pass), including harness/SO drift vs the current tree
+#   - image identity: sidecar IMAGE_ID/IMAGE_REF/IMAGE_REPO_DIGESTS == receipt
+#   - telemetry anchors: prelaunch + end blocks, TELEMETRY_FINAL_PASS,
+#     SIDECAR_END
+# Prints VERIFY_PASS or VERIFY_FAIL:<why>.
+# Usage: verify_run_sm90.sh <mokdir> <tag> <run_id> <manifest> <receipt> [container]
 set -uo pipefail
-M=${1:?}; T=${2:?}; R=${3:?}; MAN=${4:?}; CT=${5:-}
+M=${1:?}; T=${2:?}; R=${3:?}; MAN=${4:?}; REC=${5:?}; CT=${6:-}
+DIR=$(cd "$(dirname "$0")" && pwd)
 LOG=$M/runs/$T-$R.log; JSON=$M/runs/$T-$R.json
 SIDE=$M/host-runs/$T-$R.host; MCOPY=$M/host-runs/$T-$R.manifest
 vf() { echo "VERIFY_FAIL:$1"; exit 1; }
 [ -f "$MAN" ] || vf "manifest $MAN missing"
+[ -f "$REC" ] || vf "receipt $REC missing"
 [ -f "$MCOPY" ] || vf "per-run manifest copy missing"
 [ -f "$LOG" ] || vf "no log $LOG"
 [ -f "$JSON" ] || vf "no json $JSON"
 [ -f "$SIDE" ] || vf "no sidecar $SIDE"
-# independent full schema recheck (never trust the launcher's pass)
-REQ_KEYS="MANIFEST_SCHEMA FROZEN_COMMIT EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256 BENCH_GPUS TIMING_SEMANTICS tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
-head -1 "$MAN" | grep -q '^MANIFEST_SCHEMA=1$' || vf "manifest schema version"
-for K in $REQ_KEYS; do
-  [ "$(grep -c "^$K=" "$MAN" || true)" -eq 1 ] || vf "manifest key $K count != 1"
-  [ -n "$(grep "^$K=" "$MAN" | cut -d= -f2-)" ] || vf "manifest key $K empty"
+# independent full semantic recheck via the shared validator, incl. drift
+bash "$DIR/validate_manifest_sm90.sh" "$MAN" \
+  --harness "$M/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" \
+  --so-dir "$M/mixture-of-kittens/mok" >/dev/null || vf "manifest failed shared validator (schema or drift)"
+bash "$DIR/validate_manifest_sm90.sh" "$MCOPY" >/dev/null || vf "per-run copy failed shared validator"
+rget() { grep "^$1=" "$REC" | head -1 | cut -d= -f2-; }
+head -1 "$REC" | grep -q '^RECEIPT_SCHEMA=1$' || vf "receipt schema version"
+for K in MANIFEST_SHA256 HARNESS_SHA256 SO_SHA256 IMAGE_ID IMAGE_REF IMAGE_REPO_DIGESTS SOURCE_TREE_COMMIT BINARY_BUILD_COMMIT; do
+  [ -n "$(rget "$K")" ] || vf "receipt key $K missing/empty"
 done
-while IFS= read -r LINE; do
-  [ -z "$LINE" ] && continue
-  K=${LINE%%=*}
-  echo " $REQ_KEYS " | grep -q " $K " || vf "manifest unknown key $K"
-done < "$MAN"
+RSHA=$(sha256sum "$REC" | cut -d' ' -f1)
 MS_GIVEN=$(sha256sum "$MAN" | cut -d' ' -f1)
 MS_COPY=$(sha256sum "$MCOPY" | cut -d' ' -f1)
 MS_SIDE=$(grep '^MANIFEST_SHA256:' "$SIDE" | head -1 | cut -d: -f2)
 MS_LOG=$(grep '^MANIFEST_SHA256:' "$LOG" | head -1 | cut -d: -f2)
+[ "$MS_GIVEN" = "$(rget MANIFEST_SHA256)" ] || vf "given manifest sha != receipt"
 [ "$MS_GIVEN" = "$MS_COPY" ] || vf "manifest copy tampered (given $MS_GIVEN != copy $MS_COPY)"
 [ "$MS_SIDE" = "$MS_COPY" ] || vf "sidecar pre-start manifest hash != copy"
 [ "$MS_LOG" = "$MS_COPY" ] || vf "runner log manifest hash != copy"
+RS_SIDE=$(grep '^RECEIPT_SHA256:' "$SIDE" | head -1 | cut -d: -f2)
+RS_LOG=$(grep '^RECEIPT_SHA256:' "$LOG" | head -1 | cut -d: -f2)
+[ "$RS_SIDE" = "$RSHA" ] || vf "sidecar receipt sha != given receipt"
+[ "$RS_LOG" = "$RSHA" ] || vf "runner log receipt sha != given receipt"
+for K in IMAGE_ID IMAGE_REF IMAGE_REPO_DIGESTS; do
+  SV=$(grep "^$K:" "$SIDE" | head -1 | cut -d: -f2-)
+  [ "$SV" = "$(rget "$K")" ] || vf "sidecar $K ($SV) != receipt ($(rget "$K"))"
+done
 mget() { grep "^$1=" "$MAN" | head -1 | cut -d= -f2-; }
 SHA=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256); FC=$(mget FROZEN_COMMIT)
+[ "$(rget HARNESS_SHA256)" = "$SHA" ] || vf "receipt harness sha != manifest"
+[ "$(rget SO_SHA256)" = "$EXPSO" ] || vf "receipt so sha != manifest"
 grep -q "^RUN_ID:$R$" "$LOG" || vf "log run_id mismatch"
 grep -q "^HARNESS_SHA256:$SHA$" "$LOG" || vf "log harness sha != manifest"
 grep -q "^SO_SHA256:$EXPSO$" "$LOG" || vf "log so sha != manifest"
@@ -49,7 +68,13 @@ grep -q "^RUN_ID:$R$" "$SIDE" || vf "sidecar run_id mismatch"
 NPAIR=$(grep '^NVML_UUID_PID_PAIRS:' "$SIDE" | head -1 | tr ';' '\n' | grep -c 'GPU-' || true)
 [ "$NPAIR" -eq 4 ] || vf "need 4 nvml uuid,pid pairs, got $NPAIR"
 grep -q "^PID_ATTRIBUTION_PASS$" "$SIDE" || vf "no PID_ATTRIBUTION_PASS"
-python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" <<'PY' || exit 1
+for A in TELEMETRY_PRELAUNCH_BEGIN TELEMETRY_PRELAUNCH_END HOST_GPU_CLOCKS_PRELAUNCH \
+         TELEMETRY_END_BEGIN HOST_GPU_CLOCKS_END TELEMETRY_FINAL_PASS SIDECAR_END; do
+  grep -q "^$A" "$SIDE" || vf "missing sidecar telemetry anchor $A"
+done
+grep -q "^PRELAUNCH_OCCUPANCY:0$" "$SIDE" || vf "prelaunch occupancy not zero"
+grep -q "^END_OCCUPANCY:0$" "$SIDE" || vf "end occupancy not zero"
+python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$RSHA" <<'PY' || exit 1
 import json, math, statistics, sys
 d = json.load(open(sys.argv[1]))
 m = d["meta"]; p = m["provenance"]
@@ -60,7 +85,8 @@ checks = [
     (p["harness_sha256"] == sys.argv[2], "json harness sha != manifest"),
     (p["frozen_commit_env"] == sys.argv[3], "json frozen commit != manifest"),
     (p.get("so_sha256") == sys.argv[6], "json so sha256 != manifest"),
-    (p.get("manifest_sha256_env") not in (None, "unset (metadata_invalid)"), "json missing manifest sha"),
+    (p.get("manifest_sha256_env") == sys.argv[7], "json manifest sha != given manifest (exact)"),
+    (p.get("receipt_sha256_env") == sys.argv[8], "json receipt sha != given receipt (exact)"),
     (m.get("run_id") == sys.argv[4], "json run_id mismatch"),
     (len(d["samples_ms"]) == m["timed_iters"], "sample count mismatch"),
     (all(math.isfinite(x) and x > 0 for x in d["samples_ms"]), "samples not all finite>0"),
