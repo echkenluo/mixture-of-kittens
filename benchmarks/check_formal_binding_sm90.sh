@@ -56,6 +56,14 @@ if [ -n "${EXPECTED_BUILD_RECORD_SHA256:-}" ]; then
     || fb "record sha $RSHA != optional cross-check EXPECTED_BUILD_RECORD_SHA256 $EXPECTED_BUILD_RECORD_SHA256"
 fi
 brget() { grep "^$1=" "$REC"  | head -1 | cut -d= -f2- || true; }
+# a fixture record describes an arbitrary test command, not a build of this
+# source; it can never satisfy formal provenance
+[ "$(brget RECORD_MODE)" = "production" ] \
+  || fb "build record RECORD_MODE=$(brget RECORD_MODE) is not a production record"
+# formal requires registry provenance for the toolchain image; NONE marks a
+# local-only image and is canary/fixture territory
+[ "$(brget TOOLCHAIN_IMAGE_REPO_DIGESTS_ATTESTED)" != "NONE" ] \
+  || fb "toolchain image has no repo digest (NONE); formal requires registry provenance"
 rcget() { grep "^$1=" "$RCPT" | head -1 | cut -d= -f2- || true; }
 mnget() { grep "^$1=" "$MAN"  | head -1 | cut -d= -f2- || true; }
 [ "$(rcget RECEIPT_SCHEMA)" = "2" ] \

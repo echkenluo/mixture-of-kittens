@@ -55,6 +55,8 @@ if [ -n "${BUILD_RECORD:-}" ]; then
   [ -f "$BUILD_RECORD" ] || { echo "RECEIPT_FAIL:BUILD_RECORD $BUILD_RECORD missing"; exit 2; }
   bash "$DIR/validate_build_record_sm90.sh" "$BUILD_RECORD" --check-mode >/dev/null \
     || { echo "RECEIPT_FAIL:BUILD_RECORD failed shared validator"; exit 2; }
+  [ "$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)" = "production" ] \
+    || { echo "RECEIPT_FAIL:BUILD_RECORD is not a production record (RECORD_MODE=$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-))"; exit 2; }
   BRSHA=$(sha256sum "$BUILD_RECORD" | cut -d' ' -f1)
   REC_COMMIT=$(grep '^SOURCE_COMMIT=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
   REC_SO=$(grep '^SO_SHA256=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
@@ -69,9 +71,13 @@ if [ -n "${BUILD_RECORD:-}" ]; then
   # closure or a submodule set that the named commit never had.
   IDENT=$(bash "$DIR/compute_build_inputs_sm90.sh" "$REPO" "$REC_COMMIT") \
     || { echo "RECEIPT_FAIL:cannot recompute build inputs at record SOURCE_COMMIT $REC_COMMIT"; exit 2; }
+  # every source AND tooling AND command-spec claim is recomputed: a record
+  # produced by a modified wrapper, or naming a command spec the commit never
+  # had, must not be bindable
   for K in BUILD_INPUT_SPEC_NAME BUILD_INPUT_SPEC_SHA256 SOURCE_TREE_GIT_OID \
            BUILD_INPUT_FILE_COUNT BUILD_INPUT_LIST_SHA256 BUILD_INPUT_CONTENT_SHA256 \
-           SUBMODULE_COUNT SUBMODULE_LIST_SHA256; do
+           SUBMODULE_COUNT SUBMODULE_LIST_SHA256 TOOLING_FILE_COUNT TOOLING_LIST_SHA256 \
+           BUILD_COMMAND_SPEC_NAME BUILD_COMMAND_SPEC_SHA256; do
     RECV=$(grep "^$K=" "$BUILD_RECORD" | head -1 | cut -d= -f2-)
     CALC=$(printf '%s\n' "$IDENT" | grep "^$K=" | head -1 | cut -d= -f2-)
     [ "$RECV" = "$CALC" ] \
