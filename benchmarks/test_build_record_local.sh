@@ -574,6 +574,45 @@ CALCSHA=$(bash "$CBI" "$FIX" "$RESTORED" | grep '^BUILD_INPUT_SPEC_SHA256=' | cu
 [ "$BLOBSHA" = "$CALCSHA" ]; report S8_spec_hash_is_raw_blob $?
 echo "  S8 spec hash equals the raw git blob sha256"
 
+# S9/S10: both "unknown key" checks used the key as a GREP PATTERN, so a key
+# with a metacharacter matched an allowed name and passed as known. The key is
+# content - in a record it is attacker-influenced - so it must be compared as a
+# string. Demonstrated against 07170f0 first.
+OLD5=$TMPD/old5
+mkdir -p "$OLD5"
+git -C "$REPO" archive 07170f0 benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh 2>/dev/null | tar x -C "$OLD5" || true
+scase S9b_metachar_key_refused "$GOODSPEC
+PAT.=csrc" '^BUILD_INPUTS_FAIL:build input spec: unknown key PAT\.$'
+C9=$($GIT -C "$FIX" rev-parse HEAD)
+if [ -f "$OLD5/benchmarks/compute_build_inputs_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD5/benchmarks/compute_build_inputs_sm90.sh" "$FIX" "$C9" 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S9a_old_accepted_metachar_key $?
+  echo "  S9a old helper rc=$R (PAT. matched PATH in the allow-list)"
+else
+  report S9a_old_accepted_metachar_key 1; echo "  S9a could not extract 07170f0"
+fi
+printf '%s\n' "$GOODSPEC" > "$FIX/benchmarks/build_input_spec.v1"
+( cd "$FIX" && $GIT add -A && $GIT commit -qm restore-spec ) >/dev/null 2>&1
+cp "$GOODREC" "$TMPD/rec.smuggled"; chmod 644 "$TMPD/rec.smuggled"
+echo 'SO_SHA25.=smuggled' >> "$TMPD/rec.smuggled"
+chmod 444 "$TMPD/rec.smuggled"   # the validator refuses a writable record before it parses keys
+if [ -f "$OLD5/benchmarks/validate_build_record_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD5/benchmarks/validate_build_record_sm90.sh" "$TMPD/rec.smuggled" --check-mode 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S10a_old_accepted_smuggled_record_key $?
+  echo "  S10a old validator rc=$R (SO_SHA25. matched SO_SHA256)"
+else
+  report S10a_old_accepted_smuggled_record_key 1; echo "  S10a could not extract 07170f0"
+fi
+set +e
+O=$(bash "$VALB" "$TMPD/rec.smuggled" --check-mode 2>&1); R=$?
+set -u
+[ "$R" -eq 17 ] && has1 "$O" '^BUILD_RECORD_FAIL:unknown key SO_SHA25\.$'; report S10b_smuggled_record_key_refused $?
+echo "  S10b rc=$R want=17(a record key is content, not a regex)"
+
 # ---------- F: fixture records and NONE digests cannot reach formal --------
 MANF=$TMPD/fix.manifest
 SO_SHA=$(grep '^SO_SHA256=' "$GOODREC" | cut -d= -f2)
@@ -686,7 +725,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=49
+EXPECTED=53
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

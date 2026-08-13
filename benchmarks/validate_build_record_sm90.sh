@@ -39,10 +39,14 @@ for K in $REQ; do
   N=$(grep -c "^$K=" "$REC" || true)
   [ "$N" -eq 1 ] || { echo "BUILD_RECORD_FAIL:key $K count=$N (need exactly 1)"; exit 17; }
 done
+# exact string comparison, not a grep: the key comes from the record and is
+# therefore attacker-influenced, so using it as a regex means a smuggled key
+# like SO_SHA25. matches SO_SHA256 in the allow-list and passes as "known"
+known_key() { local N; for N in $REQ; do [ "$N" = "$1" ] && return 0; done; return 1; }
 while IFS= read -r LINE; do
   [ -z "$LINE" ] && continue
   K=${LINE%%=*}
-  echo " $REQ " | grep -q " $K " || { echo "BUILD_RECORD_FAIL:unknown key $K"; exit 17; }
+  known_key "$K" || { echo "BUILD_RECORD_FAIL:unknown key $K"; exit 17; }
 done < "$REC"
 rget() { grep "^$1=" "$REC" | head -1 | cut -d= -f2-; }
 for K in $REQ; do

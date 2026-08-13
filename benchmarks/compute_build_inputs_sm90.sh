@@ -44,7 +44,11 @@ strict_parse() { # spec-content allowed-keys single-keys context
     case "$LINE" in \#*) continue ;; esac
     case "$LINE" in *=*) : ;; *) bf "$CTX: line without '=': $LINE" ;; esac
     K=${LINE%%=*}; V=${LINE#*=}
-    echo " $ALLOWED " | grep -q " $K " || bf "$CTX: unknown key $K"
+    # exact comparison, not a grep: a key is content, and as a regex a key like
+    # PAT. matches PATH in the allow-list and slips through "unknown key"
+    local KNOWN=0 A
+    for A in $ALLOWED; do [ "$A" = "$K" ] && { KNOWN=1; break; }; done
+    [ "$KNOWN" -eq 1 ] || bf "$CTX: unknown key $K"
     [ -n "$V" ] || bf "$CTX: key $K has an empty value"
   done <<< "$CONTENT"
   for K in $SINGLE; do
