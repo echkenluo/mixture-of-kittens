@@ -47,3 +47,13 @@ its own register half to its d smem tiles (removes tcgen05.ld PTX + d_tt
 subtile loads). This also resolves the register-budget concern (128-wide
 accum per warpgroup fits). Scale-tt params (a_sc_tt/b_sc_tt) get parse stubs
 only (MXFP8 branches discarded in BF16 build).
+
+## P1-C contract (captured from call sites)
+clc::handle POD in smem; clc::schedule(handle, semaphore) async-requests next
+work and arrives the semaphore; clc::query(handle) -> {bool success; u32 x}
+with x a fresh CTA id (x / CLUSTER_SIZE = cluster_idx; success=false => no
+more work, worker exits). Software shim: global atomic ticket over the
+launched task-id space; MUST mirror TK's SM100 clc header semantics for the
+id space bound + per-launch counter reset (read
+third_party/ThunderKittens/include/ops/.../clc* next round; do NOT guess).
+Both fwd (1600-1849) and bwd (2177-2530) use identical patterns.
