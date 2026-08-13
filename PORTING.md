@@ -6,7 +6,7 @@ Logs: /mok/build-sm90*.log. Runtime: H20 MULTICAST_SUPPORTED=1 (NVLS comm OK).
 
 ## Convergence
 - r1 (stock + SM90 makefile branch): 96 errors
-- r2 (+ sm90_compat.cuh: e8m0->uint8 smem parse stubs): 55 errors
+- r2 (+ e8m0 smem stubs): 55; r3 (+ full_tt stub): 46; r4 (+ CLC shim): 14
   - e8m0 smem family and all cascades (tensor_to_gl/packing/tma::store): CLEARED
 
 ## Remaining fronts (r2 taxonomy)
