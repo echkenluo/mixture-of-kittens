@@ -1446,6 +1446,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             mok_sm90::wgmma_acc<a_tile, b_tile, config::MLP_Mb / 2, config::MLP_Nb> acc;
             int input_ring = 0;
             for (int idx = 0; idx < iters_per_task; ++idx) {
+                if (warpgroup::laneid() == 0)
+                    tma::expect_bytes(gemm_inputs_arrived[input_ring],
+                        config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                warpgroup::sync(2);
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
                 update_phasebit<0>(gemm_bitfield, input_ring);
                 acc.step(a_smem[input_ring], b_smem[input_ring], idx == 0);
