@@ -64,7 +64,7 @@ chmod +x "$FIX/tools/fake_build.sh"
   echo "ARGV=NVCC=/bin/echo -ccbin /bin/echo"
   echo "ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   echo "ENV_SET=HOME=@ARTIFACT_HOME@"; echo "ENV_SET=PYTHONNOUSERSITE=1"
-  echo "ENV_SET=PYTHONPATH="
+  echo "ENV_SET=PYTHONPATH="; echo "ENV_SET=TEST_EQ=a=b"
   echo "ENV_SET=LANG=C.UTF-8"; echo "TOOLCHAIN_ROOT=/usr"
   echo "ARGV=PYTHON_INCLUDES=-I/usr/include"
   echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
@@ -767,6 +767,86 @@ set -u
 [ "$R" -eq 17 ] && has1 "$O" '^BUILD_RECORD_FAIL:env manifest has an illegal variable name \[A-B\]; names must match \^\[A-Z_\]\[A-Z0-9_\]\*\$$'
 report S12b_record_illegal_env_name_refused $?
 echo "  S12b rc=$R want=17(a matching hash is not a well-formed environment)"
+# N16/N17: the wrapper's own environment checks, driven directly. The helper
+# refuses a malformed tracked spec, but fixture mode hands the wrapper a spec
+# the helper never saw, which is exactly the defence-in-depth path.
+mkbadenv() { # outfile env-lines...
+  local OUT=$1; shift
+  { echo "NAME=fixture-badenv"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+    echo "TOOLCHAIN_ROOT=/usr"
+    local L; for L in "$@"; do echo "ENV_SET=$L"; done
+    echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
+    echo "ARGV=NVCC=/bin/echo -ccbin /bin/echo"
+    echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+    echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"
+    echo "PROBE=nvcc|/bin/echo|nvcc release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc 12.3.0"
+    echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0+cu130\n13.0\n"
+    echo "PROBE=ext_suffix|printf|fixture.so"; echo "PROBE=py_include|printf|-I/usr/include"
+    echo "PROBE=torch_include|printf|-I/usr/include"; echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$OUT"
+}
+runbadenv() { # name spec want-reason-ERE
+  local NAME=$1 SPEC=$2 REASON=$3 A O R
+  A=$(newart "$NAME"); set +e
+  O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$SPEC" \
+       TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+       bash "$FIXWRAP" "$FIX" "$A" 2>&1 ); R=$?
+  set -u
+  [ "$R" -eq 2 ] && has1 "$O" "$REASON" && [ ! -f "$A/build_record.v4" ]; report "$NAME" $?
+  echo "  $NAME rc=$R want=2($REASON)"
+}
+mkbadenv "$TMPD/wrapenv.bad" "PATH=/usr/bin:/bin" "A-B=x"
+runbadenv N16_wrapper_refuses_illegal_env_name "$TMPD/wrapenv.bad" \
+  '^BUILD_RECORD_FAIL:ENV_SET entry has an illegal variable name \[A-B\]; names must match \^\[A-Z_\]\[A-Z0-9_\]\*\$$'
+mkbadenv "$TMPD/wrapenv.dup" "PATH=/usr/bin:/bin" "PATH=/opt/evil/bin"
+runbadenv N17_wrapper_refuses_duplicate_env_name "$TMPD/wrapenv.dup" \
+  '^BUILD_RECORD_FAIL:ENV_SET defines PATH more than once$'
+# S14: duplicate environment name in the TRACKED command spec. 96fc397 had no
+# duplicate gate on the spec at all, so this one is a new refusal.
+{ cat "$TMPD/cmdspec.good"; echo "ENV_SET=PATH=/opt/evil/bin"; } > "$FIX/benchmarks/build_command_spec.v2"
+( cd "$FIX" && $GIT add -A && { $GIT commit -qm dupenv || $GIT diff --quiet HEAD; } ) >/dev/null 2>&1 \
+  || { echo "TEST_HARNESS_FAIL:fixture commit 'dupenv' failed"; exit 1; }
+CDUP=$($GIT -C "$FIX" rev-parse HEAD)
+if [ -f "$OLD6/benchmarks/compute_build_inputs_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD6/benchmarks/compute_build_inputs_sm90.sh" "$FIX" "$CDUP" 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S14a_old_accepted_duplicate_env_name $?
+  echo "  S14a old helper rc=$R (the spec had no duplicate gate)"
+else
+  report S14a_old_accepted_duplicate_env_name 1; echo "  S14a could not extract 96fc397"
+fi
+set +e
+O=$(bash "$CBI" "$FIX" "$CDUP" 2>&1); R=$?
+set -u
+[ "$R" -eq 19 ] && has1 "$O" '^BUILD_INPUTS_FAIL:build command spec: ENV_SET defines PATH more than once$'
+report S14b_duplicate_env_name_refused $?
+echo "  S14b rc=$R want=19(two ENV_SET=PATH= in the tracked spec)"
+cp "$TMPD/cmdspec.good" "$FIX/benchmarks/build_command_spec.v2"
+( cd "$FIX" && $GIT add -A && { $GIT commit -qm restore-cmdspec2 || $GIT diff --quiet HEAD; } ) >/dev/null 2>&1 \
+  || { echo "TEST_HARNESS_FAIL:fixture commit 'restore-cmdspec2' failed"; exit 1; }
+# S15: duplicate LEGAL name inside a record, hash recomputed. REGRESSION GUARD,
+# not a new fix: 96fc397 already caught this shape, because grep -o '^[A-Z_]*='
+# does see a well-formed name. What changed is that the check now counts parsed
+# names, so a malformed one cannot dodge it (S12) - this case pins the old
+# behaviour so the rewrite did not lose it.
+cp "$GOODREC" "$TMPD/rec.dupenv"; chmod 644 "$TMPD/rec.dupenv"
+ENVPLAIN=$(grep '^ENV_MANIFEST_B64=' "$GOODREC" | cut -d= -f2- | base64 -d)
+ENVPLAIN=$(printf '%s\nPATH=/opt/evil/bin' "$ENVPLAIN")
+sed -i -e "s|^ENV_MANIFEST_B64=.*|ENV_MANIFEST_B64=$(printf '%s' "$ENVPLAIN" | base64 -w0)|" \
+       -e "s|^ENV_APPLIED_SHA256=.*|ENV_APPLIED_SHA256=$(printf '%s' "$ENVPLAIN" | sha256sum | cut -d' ' -f1)|" \
+       "$TMPD/rec.dupenv"
+chmod 444 "$TMPD/rec.dupenv"
+set +e
+ONEW=$(bash "$VALB" "$TMPD/rec.dupenv" --check-mode 2>&1); RNEW=$?
+OOLD=$(bash "$OLD6/benchmarks/validate_build_record_sm90.sh" "$TMPD/rec.dupenv" --check-mode 2>&1); ROLD=$?
+set -u
+[ "$RNEW" -eq 17 ] && has1 "$ONEW" '^BUILD_RECORD_FAIL:env manifest defines PATH more than once$' && [ "$ROLD" -eq 17 ]
+report S15_duplicate_legal_name_regression_guard $?
+echo "  S15 new rc=$RNEW old rc=$ROLD - both refuse; this pins existing behaviour, it is not a new fix"
+# N18: a legal value containing '=' is kept whole
+printf '%s' "$(grep '^ENV_MANIFEST_B64=' "$GOODREC" | cut -d= -f2-)" | base64 -d | grep -qx 'TEST_EQ=a=b'
+report N18_env_value_with_equals_kept $?
+echo "  N18 TEST_EQ=a=b survives the production path with its value intact"
 # N14: the legal empty value survives the whole production path
 printf '%s' "$(grep '^ENV_MANIFEST_B64=' "$GOODREC" | cut -d= -f2-)" | base64 -d | grep -qx 'PYTHONPATH='
 report N14_empty_env_value_accepted $?
@@ -884,7 +964,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=65
+EXPECTED=71
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"
