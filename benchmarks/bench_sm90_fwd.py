@@ -24,7 +24,8 @@ import torch.distributed as dist
 
 from benchmarks.utils import TIMED_ITERS, WARMUP_ITERS, get_num_local_experts, get_tflops, init_distributed
 from mok import functional
-from tests.utils import BF16_TOLERANCE, generate_inputs, run_reference_bf16
+from tests.utils import (BF16_TOLERANCE, generate_inputs, get_error_stats,
+                         run_forward_reference_bf16, run_fwd_epilogue_reference)
 
 NUM_LOCAL_TOKENS = int(os.environ.get("NUM_LOCAL_TOKENS", 2048))
 HIDDEN_DIM = int(os.environ.get("HIDDEN_DIM", 7168))
@@ -34,7 +35,6 @@ TOPK = int(os.environ.get("TOPK", 6))
 COMM_SMS = int(os.environ.get("BF16_FWD_COMM_SMS", 24))
 MINIBATCH_SIZE = int(os.environ.get("MINIBATCH_SIZE", 4096))
 MACROBATCH_SIZE = int(os.environ.get("MACROBATCH_SIZE", 32 * MINIBATCH_SIZE))
-SEED = int(os.environ.get("BENCH_SEED", 20260813))
 WARMUP = int(os.environ.get("BENCH_WARMUP", WARMUP_ITERS))
 OUTPUT = os.environ.get("BENCH_OUTPUT", "/mok/bench-sm90-fwd.json")
 
@@ -44,6 +44,33 @@ def rank_max_samples(samples_ms, device):
     gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
     return torch.stack(gathered).max(dim=0).values.cpu().tolist()
+
+
+def _provenance():
+    """Self-contained identity: the tar-synced container tree has no .git, so
+    git rev-parse is best-effort only. Primary identity = content hashes."""
+    import glob
+    import hashlib
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prov = {"frozen_commit_env": os.environ.get("MOK_FROZEN_COMMIT", "unset"),
+            "frozen_commit_provenance": "external env (host git); unset if launcher omitted it"}
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                           text=True, timeout=10, cwd=repo)
+        prov["git_rev_parse"] = r.stdout.strip() if r.returncode == 0 else \
+            f"unavailable ({(r.stderr or '').strip()[:60]})"
+    except Exception as e:
+        prov["git_rev_parse"] = f"unavailable ({e})"
+    with open(os.path.abspath(__file__), "rb") as f:
+        prov["harness_sha256"] = hashlib.sha256(f.read()).hexdigest()
+    so = sorted(glob.glob(os.path.join(repo, "mok", "_C*.so")))
+    if so:
+        with open(so[0], "rb") as f:
+            prov["so_md5"] = hashlib.md5(f.read()).hexdigest()
+        prov["so_path"] = so[0]
+    else:
+        prov["so_md5"] = "missing (metadata_invalid)"
+    return prov
 
 
 def gpu_snapshot():
@@ -61,7 +88,9 @@ def gpu_snapshot():
 def main() -> None:
     wall0 = time.time()
     rank, world_size, device = init_distributed()
-    torch.manual_seed(SEED + rank)
+    # input seed is FIXED inside generate_inputs (Generator.manual_seed(1234+rank));
+    # recorded as-is - there is no configurable bench seed.
+    input_seed = 1234 + rank
 
     num_local_experts = get_num_local_experts(NUM_EXPERTS, world_size)
     inputs = generate_inputs(rank, device, NUM_EXPERTS, num_local_experts, TOPK,
@@ -90,18 +119,28 @@ def main() -> None:
             w_routed_gate, w_routed_up, w_routed_down)
         return output
 
-    # --- correctness gate (fail loud, before any timing) ---
-    reference = run_reference_bf16(*inputs)
-    ref_out = reference[0] if isinstance(reference, (tuple, list)) else reference
+    # --- correctness gate: forward-only reference, same source as
+    # test_forward_bf16 (no backward reference; keeps init lean and matched) ---
+    (ref_combine_buffer, _rg, _ru, _rh, ref_y_shared) = run_forward_reference_bf16(
+        x, topk_experts, w_shared_gate, w_shared_up, w_shared_down,
+        w_routed_gate, w_routed_up, w_routed_down)
+    ref_out = run_fwd_epilogue_reference(ref_y_shared, ref_combine_buffer,
+                                         router_weights)
+    del ref_combine_buffer, _rg, _ru, _rh, ref_y_shared
     out = run_fwd()
     torch.cuda.synchronize()
-    rel = ((out.float() - ref_out.float()).abs()
-           / ref_out.float().abs().clamp_min(1e-3)).max().item()
-    if rel > BF16_TOLERANCE:
+    abs_mean, abs_max, relative = get_error_stats(ref_out, out)
+    absolute_tolerance, relative_tolerance = BF16_TOLERANCE
+    import math as _math
+    gate_pass = (all(_math.isfinite(v) for v in (abs_mean, abs_max, relative))
+                 and abs_max <= absolute_tolerance
+                 and relative <= relative_tolerance)
+    if not gate_pass:
         raise RuntimeError(
-            f"correctness gate FAILED on rank {rank}: max_rel {rel:.6f} > "
-            f"tolerance {BF16_TOLERANCE}")
-    del reference, ref_out, out
+            f"correctness gate FAILED on rank {rank}: abs_mean={abs_mean:.6f} "
+            f"abs_max={abs_max:.6f} relative={relative:.6f} vs tolerance "
+            f"(abs={absolute_tolerance}, rel={relative_tolerance})")
+    del ref_out, out
     init_wall_s = time.time() - wall0
     snap_start = gpu_snapshot() if rank == 0 else None
 
@@ -121,6 +160,11 @@ def main() -> None:
     torch.cuda.synchronize()
     dist.barrier()
 
+    pid_t = torch.tensor([os.getpid()], dtype=torch.int64, device=device)
+    pid_g = [torch.empty_like(pid_t) for _ in range(world_size)]
+    dist.all_gather(pid_g, pid_t)
+    self_pids = {int(t.item()) for t in pid_g}
+
     samples = rank_max_samples([s.elapsed_time(e) for s, e in events], device)
     ordered = sorted(samples)
     p50 = statistics.median(ordered)
@@ -134,17 +178,20 @@ def main() -> None:
                           "intermediate": INTERMEDIATE_DIM, "experts": NUM_EXPERTS,
                           "topk": TOPK, "world_size": world_size},
                 "comm_sms": COMM_SMS, "minibatch": MINIBATCH_SIZE,
-                "macrobatch": MACROBATCH_SIZE, "seed": SEED,
+                "macrobatch": MACROBATCH_SIZE, "input_seed_rank0": 1234,  # fixed in generate_inputs (1234+rank)
                 "warmup_iters": WARMUP, "timed_iters": TIMED_ITERS,
                 "timing_boundary": "build_schedule + forward per iteration; "
                                    "init and correctness gate excluded (see init_wall_s)",
                 "init_wall_s": round(init_wall_s, 1),
-                "correctness_gate": {"max_rel": rel, "tolerance": BF16_TOLERANCE},
-                "git_commit": os.environ.get("MOK_GIT_COMMIT", "unknown"),
+                "correctness_gate": {"abs_mean": abs_mean, "abs_max": abs_max,
+                                     "relative": relative,
+                                     "tolerance_abs_rel": list(BF16_TOLERANCE)},
+                "provenance": _provenance(),
                 "container_hostname": open("/etc/hostname").read().strip(),
                 "torch": torch.__version__, "cuda": torch.version.cuda,
                 "gpu_snapshot_start": snap_start,
                 "gpu_snapshot_end": gpu_snapshot(),
+                "self_rank_pids": sorted(self_pids),
                 "statistics_semantics": "p50/p95 over 100 per-launch rank-max "
                                         "samples; cross-launch aggregation is "
                                         "computed externally over >=5 launches",
@@ -158,7 +205,7 @@ def main() -> None:
         with open(OUTPUT, "w") as f:
             json.dump(record, f, indent=1)
         print(f"BENCH|sm90_fwd|comm_sms={COMM_SMS}|p50={p50:.4f}ms|p95={p95:.4f}ms"
-              f"|max_rel={rel:.6f}|out={OUTPUT}")
+              f"|abs_max={abs_max:.5f}|relative={relative:.6f}|out={OUTPUT}")
 
     dist.destroy_process_group()
 
