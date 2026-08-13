@@ -46,3 +46,22 @@ __device__ static inline result query(handle &) { return {0u, 0u, 0u, 0u}; }
 } // namespace clc
 } // namespace kittens
 #endif
+
+#if defined(KITTENS_SM90)
+namespace kittens {
+// tmem sync primitive mappings for the wgmma register-accumulator port:
+// no tensor memory on Hopper. Fences become no-ops; the load-wait maps to
+// the warpgroup wgmma drain; the cluster commit is replaced at call sites
+// by a direct semaphore arrive (see megakernel SM90 branches).
+__device__ static inline void tensor_before_thread_sync() {}
+__device__ static inline void tensor_after_thread_sync() {}
+__device__ static inline void tensor_load_wait() { warpgroup::mma_async_wait(); }
+namespace detail { namespace tcgen05 {
+template<int CLUSTER_SIZE> __device__ static inline void commit(semaphore &sem) {
+    // wgmma path: outputs are already in registers when the producer loop
+    // ends; arrive the cluster-visible semaphore both CTAs wait on.
+    if (warp::laneid() == 0) tma::cluster::arrive(sem, 0);
+}
+}} // namespace detail::tcgen05
+} // namespace kittens
+#endif
