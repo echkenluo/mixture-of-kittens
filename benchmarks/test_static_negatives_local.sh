@@ -349,8 +349,53 @@ done
 report S12_committed_cells_valid "$([ "$NBAD" -eq 0 ] && echo 0 || echo 1)" "invalid: $NBAD"
 echo "  S12_committed_cells_valid cells=$NCELL invalid=$NBAD"
 
+# ---- frozen-commit gate: the "frozen against X" claim must be checkable ----
+# Every committed cell must name a commit that exists, is reachable from HEAD,
+# and held EXACTLY the pinned harness bytes. The cell count is asserted so an
+# empty glob cannot pass as green.
+FROZ=$DIR/check_frozen_commit_sm90.sh
+REPO=$(cd "$DIR/.." && pwd)
+FCELL=0; FBAD=0
+for CM in "$DIR"/manifests/matrix-*.manifest; do
+  [ -f "$CM" ] || continue
+  FCELL=$((FCELL+1))
+  bash "$FROZ" "$REPO" "$CM" >/dev/null 2>&1 || FBAD=$((FBAD+1))
+done
+{ [ "$FCELL" -eq 8 ] && [ "$FBAD" -eq 0 ]; }; report F1_committed_cells_frozen $?
+echo "  F1_committed_cells_frozen cells=$FCELL (want 8) failed=$FBAD"
+
+# deterministic fixtures for the two failure modes that matter most
+REALCELL=$DIR/manifests/matrix-repo_micro-mok_sm90-sm24.manifest
+sed "s/^FROZEN_COMMIT=.*/FROZEN_COMMIT=$(printf 'd%.0s' $(seq 1 40))/" "$REALCELL" > "$TMPD/f2.manifest"
+set +e
+O=$(bash "$FROZ" "$REPO" "$TMPD/f2.manifest" 2>&1); R=$?
+set -u
+[ "$R" -eq 16 ] && has1 "$O" "^FROZEN_GATE_FAIL:FROZEN_COMMIT $(printf 'd%.0s' $(seq 1 40)) is not a commit in this repo\$"; report F2_unresolvable_commit $?
+echo "  F2_unresolvable_commit rc=$R want=16"
+sed "s/^EXPECTED_HARNESS_SHA256=.*/EXPECTED_HARNESS_SHA256=$(H64 c)/" "$REALCELL" > "$TMPD/f3.manifest"
+REALBLOB=$(git -C "$REPO" show "$(grep '^FROZEN_COMMIT=' "$REALCELL" | cut -d= -f2):benchmarks/bench_sm90_fwd.py" | sha256sum | cut -d' ' -f1)
+set +e
+O=$(bash "$FROZ" "$REPO" "$TMPD/f3.manifest" 2>&1); R=$?
+set -u
+[ "$R" -eq 16 ] && has1 "$O" "^FROZEN_GATE_FAIL:blob sha256 $REALBLOB at [0-9a-f]{40} != EXPECTED_HARNESS_SHA256 $(H64 c)\$"; report F3_blob_mismatch $?
+echo "  F3_blob_mismatch rc=$R want=16"
+# non-ancestor: throwaway repo with a commit that exists but is unreachable
+# from HEAD (never touches the real repository)
+FR=$TMPD/frepo
+mkdir -p "$FR/benchmarks"
+cp "$DIR/bench_sm90_fwd.py" "$FR/benchmarks/"
+( cd "$FR" && git init -q && git add -A && git -c user.email=t@e.com -c user.name=t commit -qm base   && git checkout -qb side && echo "# side" >> benchmarks/bench_sm90_fwd.py && git add -A   && git -c user.email=t@e.com -c user.name=t commit -qm side && git checkout -q master 2>/dev/null || git checkout -q main ) >/dev/null 2>&1
+SIDE=$(git -C "$FR" rev-parse side 2>/dev/null)
+SIDEBLOB=$(git -C "$FR" show "side:benchmarks/bench_sm90_fwd.py" 2>/dev/null | sha256sum | cut -d' ' -f1)
+sed -e "s/^FROZEN_COMMIT=.*/FROZEN_COMMIT=$SIDE/" -e "s/^EXPECTED_HARNESS_SHA256=.*/EXPECTED_HARNESS_SHA256=$SIDEBLOB/"   "$REALCELL" > "$TMPD/f4.manifest"
+set +e
+O=$(bash "$FROZ" "$FR" "$TMPD/f4.manifest" 2>&1); R=$?
+set -u
+[ "$R" -eq 16 ] && has1 "$O" "^FROZEN_GATE_FAIL:FROZEN_COMMIT $SIDE is not an ancestor of HEAD\$"; report F4_non_ancestor $?
+echo "  F4_non_ancestor rc=$R want=16"
+
 rm -rf "$TMPD"
-EXPECTED=63
+EXPECTED=67
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "STATIC_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "STATIC_NEGATIVES pass=$PASS fail=$FAIL"
