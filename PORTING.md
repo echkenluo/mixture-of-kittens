@@ -122,3 +122,12 @@ with wgmma_acc step/drain sequence wired to the existing input-ring
 semaphores + full-N B loads; then torchrun regression until
 test_forward_bf16 green; then V4-shape numerics vs DeepEP+DeepGEMM and
 methodology-v2 measurement.
+
+## r15 anchors (verified)
+Producer wg = groupid()==NUM_CONSUMERS (TMA loads, warpid3 leader; the MMA
+tcgen05-issue subbranch lives here too -> guard out on SM90). Consumer wg
+(groupid<NUM_CONSUMERS, 128 threads) currently waits gemm_outputs_arrived
+then drains tmem -> SM90: it instead waits gemm_inputs_arrived[ring] per K
+stage, runs wgmma_acc::step_ABt, arrives gemm_inputs_finished[ring], then
+drain_to the existing d smem/TMA store path. Two anchor edits: producer
+branch ~1332-1435 (guard), consumer else ~1439+ (replace head).
