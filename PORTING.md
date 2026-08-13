@@ -89,3 +89,12 @@ tcgen05::commit -> plain semaphore arrive after mma_async_wait.
   (warpgroup::mm_/mma_ABt on per-CTA rt_fl, B full-N).
 - 6x load_mxnv_scale_async2: MXFP8-only branches -> parse stub in compat.
 Convergence: 96/55/46/14/10/9/3 -> unmasked 101 (deeper layer, mapped).
+
+## r9 diagnosis
+Forwarder failed: (a) COORD param lacked =coord<ST> default so braced-init
+coords do not deduce; (b) 22 calls are group-scope (inside group<> struct,
+compat overload unreachable). FIX = call-site transform: strip the trailing
+", 0" / ", (uint16_t)(...), 0" LAST arg on tma::cluster::load_async calls
+under SM90 (python regex over megakernel, calls span 1-2 lines), and guard
+the tcgen05.ld drain block (~1482) + tt.addr uses behind #ifndef KITTENS_SM90
+with zeroed d_reg scaffold. Then rebuild r10.
