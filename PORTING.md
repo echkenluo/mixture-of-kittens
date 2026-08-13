@@ -131,3 +131,21 @@ then drains tmem -> SM90: it instead waits gemm_inputs_arrived[ring] per K
 stage, runs wgmma_acc::step_ABt, arrives gemm_inputs_finished[ring], then
 drain_to the existing d smem/TMA store path. Two anchor edits: producer
 branch ~1332-1435 (guard), consumer else ~1439+ (replace head).
+
+## Codex port review ADOPTED (2026-08-13 20:47 review)
+All findings verified true: [P0-1] drain_to never called, epilogue still
+zero-fills (my R10 scaffold never replaced); [P0-2] CTA ownership covers
+only diagonal quadrants (A AND B both cta_rank-halved; R19 "natural fit"
+reasoning was wrong); [P1-3] expect_bytes counts CLUSTER_SIZE x (A+B) but
+TMA delivers 1x per local barrier -> the hang; [P1-4] capability gate
+overexposes SM90; test harness TEST_EXIT:0 on timeouts = false completions;
+only 3/4 beacons landed (4th replace was a no-op).
+
+## SM90 v1 ownership decision (adopted per review order step 1)
+CLUSTER_SIZE=1 with quarter tiles (MLP_Mb=128, MLP_Nb=128) for SM90:
+single-CTA task ownership, full quadrant coverage via task decomposition,
+acc = 2 x rt_fl<16,128> = 128 regs/thread (fits), no cross-CTA mbarrier
+semantics at all. Next per review: (2) standalone wgmma_acc numeric test
+vs torch.matmul BEFORE megakernel rewiring; (3) expect_bytes 1x + ordering;
+(4) drain into 8 epilogue N-stages, no zero-fill; (5) harness real exit
+codes + pytest summary required; (6) fail-fast MXFP8/wgrad on SM90.
