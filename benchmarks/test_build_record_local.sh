@@ -64,6 +64,7 @@ chmod +x "$FIX/tools/fake_build.sh"
   echo "ARGV=NVCC=/bin/echo -ccbin /bin/echo"
   echo "ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   echo "ENV_SET=HOME=@ARTIFACT_HOME@"; echo "ENV_SET=PYTHONNOUSERSITE=1"
+  echo "ENV_SET=PYTHONPATH="
   echo "ENV_SET=LANG=C.UTF-8"; echo "TOOLCHAIN_ROOT=/usr"
   echo "ARGV=PYTHON_INCLUDES=-I/usr/include"
   echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
@@ -143,7 +144,8 @@ echo "  A2b new wrapper rc=$NEWRC (self-binding rejects a copy run from elsewher
 
 # A3 BUILD_INPUT_SPEC_PATH: a caller override of the closure
 { echo "BUILD_INPUT_SPEC=1"; echo "NAME=narrow"; echo "PATH=csrc"; } > "$FIX/benchmarks/narrow.spec"
-( cd "$FIX" && $GIT add -A && $GIT commit -qm narrow ) >/dev/null 2>&1
+( cd "$FIX" && $GIT add -A && { $GIT commit -qm narrow || $GIT diff --quiet HEAD; } ) >/dev/null 2>&1 \
+  || { echo "TEST_HARNESS_FAIL:fixture commit 'narrow' failed"; exit 1; }
 NARROWSRC=$($GIT -C "$FIX" rev-parse HEAD)
 set +e
 OLDOUT=$( cd "$FIX" && BUILD_INPUT_SPEC_PATH=benchmarks/narrow.spec BUILD_COMMAND_SPEC="$TMPD/evil.argv" \
@@ -153,7 +155,9 @@ OLDOUT=$( cd "$FIX" && BUILD_INPUT_SPEC_PATH=benchmarks/narrow.spec BUILD_COMMAN
     bash "$OLDWRAP" "$FIX" "$TMPD/a3.old.record" 2>&1 ); OLDRC=$?
 set -u
 OLDCOUNT=$(grep '^BUILD_INPUT_FILE_COUNT=' "$TMPD/a3.old.record" 2>/dev/null | cut -d= -f2)
-[ "$OLDRC" -eq 0 ] && [ "${OLDCOUNT:-0}" -eq 1 ]; report A3a_old_honoured_narrowed_closure $?
+[ "$OLDRC" -eq 0 ] && [ "${OLDCOUNT:-0}" -eq 1 ]
+RA3=$?; [ "$RA3" -eq 0 ] || { echo "--- A3a old wrapper output (rc=$OLDRC) ---"; printf '%s\n' "$OLDOUT" | tail -5; }
+report A3a_old_honoured_narrowed_closure "$RA3"
 echo "  A3a old wrapper rc=$OLDRC recorded a closure of ${OLDCOUNT:-?} file(s) instead of the full spec"
 set +e
 ART=$(newart a3new)
@@ -613,6 +617,161 @@ set -u
 [ "$R" -eq 17 ] && has1 "$O" '^BUILD_RECORD_FAIL:unknown key SO_SHA25\.$'; report S10b_smuggled_record_key_refused $?
 echo "  S10b rc=$R want=17(a record key is content, not a regex)"
 
+# ---------- N12-N15 / S11-S13: measured version and environment names ------
+# Every "old accepts" case below runs 96fc397's own file, swapped into the
+# fixture repo and committed, because that wrapper self-binds and refuses to
+# run from anywhere else.
+OLD6=$TMPD/old6
+mkdir -p "$OLD6"
+git -C "$REPO" archive 96fc397 benchmarks/build_and_record_sm90.sh \
+  benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh 2>/dev/null | tar x -C "$OLD6" || true
+# the wrapper self-validates before publishing, so the demonstration has to run
+# the OLD STACK - wrapper and validator together - or the new validator blocks
+# the publish and hides how far the old wrapper actually got
+# a swallowed commit failure would silently leave the wrapper unbound and show
+# up as an unexplained case failure, so this one is loud (a no-op commit is
+# tolerated only when the tree really does match HEAD)
+fixcommit() { ( cd "$FIX" && $GIT add -A && { $GIT commit -qm "$1" || $GIT diff --quiet HEAD; } ) >/dev/null 2>&1 \
+  || { echo "TEST_HARNESS_FAIL:fixture commit '$1' failed"; exit 1; }; }
+use_stack() { cp "$1/build_and_record_sm90.sh" "$FIX/benchmarks/build_and_record_sm90.sh"
+  cp "$1/validate_build_record_sm90.sh" "$FIX/benchmarks/validate_build_record_sm90.sh"
+  fixcommit stack-swap; }
+NOREL=$TMPD/norelease.cmdspec
+{ echo "NAME=fixture-no-release"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
+  echo "ARGV=NVCC=/bin/echo -ccbin /bin/echo"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"
+  echo "PROBE=nvcc|/bin/echo|GNU coreutils 9.4"; echo "PROBE=hostcc|/bin/echo|gcc 12.3.0"
+  echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0+cu130\n13.0\n"
+  echo "PROBE=ext_suffix|printf|fixture.so"; echo "PROBE=py_include|printf|-I/usr/include"
+  echo "PROBE=torch_include|printf|-I/usr/include"; echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$NOREL"
+# command and probe agree on /bin/echo; it just is not a CUDA compiler
+if [ -f "$OLD6/benchmarks/build_and_record_sm90.sh" ]; then
+  use_stack "$OLD6/benchmarks"
+  ART=$(newart n12old); set +e
+  O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$NOREL" \
+       TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+       bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+  set -u
+  [ "$R" -eq 0 ] && grep -q '^MEASURED_NVCC_VERSION=GNU coreutils 9.4$' "$ART/build_record.v4" 2>/dev/null
+  RN12=$?; [ "$RN12" -eq 0 ] || { echo "--- N12a old stack output (rc=$R) ---"; printf '%s\n' "$O" | tail -4; }
+  report N12a_old_recorded_any_first_line "$RN12"
+  echo "  N12a old wrapper rc=$R recorded MEASURED_NVCC_VERSION=GNU coreutils 9.4"
+  use_stack "$DIR"
+else
+  report N12a_old_recorded_any_first_line 1; echo "  N12a could not extract 96fc397"
+fi
+ART=$(newart n12new); set +e
+O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$NOREL" \
+     TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+     bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:the nvcc probe output has no CUDA 'release <major>\.<minor>' field; /bin/echo did not identify itself as a CUDA compiler and no record is published$" \
+  && [ ! -f "$ART/build_record.v4" ]; report N12b_no_release_field_refused $?
+echo "  N12b rc=$R want=2(an exit-0 tool that is not nvcc cannot supply a version)"
+# and independently on the record, which can arrive from elsewhere
+cp "$GOODREC" "$TMPD/rec.norelease"; chmod 644 "$TMPD/rec.norelease"
+sed -i 's|^MEASURED_NVCC_VERSION=.*|MEASURED_NVCC_VERSION=GNU coreutils 9.4|' "$TMPD/rec.norelease"
+chmod 444 "$TMPD/rec.norelease"
+if [ -f "$OLD6/benchmarks/validate_build_record_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD6/benchmarks/validate_build_record_sm90.sh" "$TMPD/rec.norelease" --check-mode 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report N13a_old_validated_coreutils_version $?
+  echo "  N13a old validator rc=$R (only unavailable/unknown were rejected)"
+else
+  report N13a_old_validated_coreutils_version 1; echo "  N13a could not extract 96fc397"
+fi
+set +e
+O=$(bash "$VALB" "$TMPD/rec.norelease" --check-mode 2>&1); R=$?
+set -u
+[ "$R" -eq 17 ] && has1 "$O" "^BUILD_RECORD_FAIL:MEASURED_NVCC_VERSION has no CUDA 'release <major>\.<minor>' field: GNU coreutils 9\.4$"
+report N13b_record_version_must_be_a_release $?
+echo "  N13b rc=$R want=17(the record is checked independently of the wrapper)"
+# S11: an illegal environment NAME in the tracked command spec
+cp "$FIX/benchmarks/build_command_spec.v2" "$TMPD/cmdspec.good"
+{ cat "$TMPD/cmdspec.good"; echo "ENV_SET=A-B=x"; } > "$FIX/benchmarks/build_command_spec.v2"
+( cd "$FIX" && $GIT add -A && $GIT commit -qm badenvname ) >/dev/null 2>&1
+CBAD=$($GIT -C "$FIX" rev-parse HEAD)
+if [ -f "$OLD6/benchmarks/compute_build_inputs_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD6/benchmarks/compute_build_inputs_sm90.sh" "$FIX" "$CBAD" 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S11a_old_accepted_illegal_env_name $?
+  echo "  S11a old helper rc=$R (case [A-Z_]*=* only pinned the first character)"
+else
+  report S11a_old_accepted_illegal_env_name 1; echo "  S11a could not extract 96fc397"
+fi
+set +e
+O=$(bash "$CBI" "$FIX" "$CBAD" 2>&1); R=$?
+set -u
+[ "$R" -eq 19 ] && has1 "$O" '^BUILD_INPUTS_FAIL:build command spec: ENV_SET entry has an illegal variable name \[A-B\]; names must match \^\[A-Z_\]\[A-Z0-9_\]\*\$$'
+report S11b_illegal_env_name_refused $?
+echo "  S11b rc=$R want=19(A-B is not a variable name any shell can reference)"
+# S13: a relative toolchain root, same spec stage
+{ cat "$TMPD/cmdspec.good"; echo "TOOLCHAIN_ROOT=usr"; } > "$FIX/benchmarks/build_command_spec.v2"
+( cd "$FIX" && $GIT add -A && $GIT commit -qm relroot ) >/dev/null 2>&1
+CREL=$($GIT -C "$FIX" rev-parse HEAD)
+if [ -f "$OLD6/benchmarks/compute_build_inputs_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD6/benchmarks/compute_build_inputs_sm90.sh" "$FIX" "$CREL" 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S13a_old_accepted_relative_root $?
+  echo "  S13a old helper rc=$R (roots were never required to be absolute)"
+else
+  report S13a_old_accepted_relative_root 1; echo "  S13a could not extract 96fc397"
+fi
+set +e
+O=$(bash "$CBI" "$FIX" "$CREL" 2>&1); R=$?
+set -u
+[ "$R" -eq 19 ] && has1 "$O" '^BUILD_INPUTS_FAIL:build command spec: TOOLCHAIN_ROOT must be an absolute path: usr$'
+report S13_relative_toolchain_root_refused $?
+echo "  S13 rc=$R want=19(readlink -f would resolve it against the repository)"
+cp "$TMPD/cmdspec.good" "$FIX/benchmarks/build_command_spec.v2"
+( cd "$FIX" && $GIT add -A && $GIT commit -qm restore-cmdspec ) >/dev/null 2>&1
+# N15: the wrapper refuses it too, not only the helper
+RELROOT=$TMPD/relroot.cmdspec
+sed 's|^TOOLCHAIN_ROOT=/usr$|TOOLCHAIN_ROOT=usr|' "$NOREL" > "$RELROOT"
+sed -i 's|^PROBE=nvcc.*|PROBE=nvcc\|/bin/echo\|nvcc release 13.0|' "$RELROOT"
+ART=$(newart n15); set +e
+O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$RELROOT" \
+     TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+     bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:TOOLCHAIN_ROOT must be an absolute path: usr$' \
+  && [ ! -f "$ART/build_record.v4" ]; report N15_wrapper_refuses_relative_root $?
+echo "  N15 rc=$R want=2(defence in depth: the wrapper checks the roots as well)"
+# S12: an illegal environment NAME inside a record, with the hash recomputed -
+# this is what proves the manifest is parsed and not merely hashed
+cp "$GOODREC" "$TMPD/rec.badenv"; chmod 644 "$TMPD/rec.badenv"
+ENVPLAIN=$(grep '^ENV_MANIFEST_B64=' "$GOODREC" | cut -d= -f2- | base64 -d)
+ENVPLAIN=$(printf '%s\nA-B=x' "$ENVPLAIN")
+sed -i -e "s|^ENV_MANIFEST_B64=.*|ENV_MANIFEST_B64=$(printf '%s' "$ENVPLAIN" | base64 -w0)|" \
+       -e "s|^ENV_APPLIED_SHA256=.*|ENV_APPLIED_SHA256=$(printf '%s' "$ENVPLAIN" | sha256sum | cut -d' ' -f1)|" \
+       "$TMPD/rec.badenv"
+chmod 444 "$TMPD/rec.badenv"
+if [ -f "$OLD6/benchmarks/validate_build_record_sm90.sh" ]; then
+  set +e
+  O=$(bash "$OLD6/benchmarks/validate_build_record_sm90.sh" "$TMPD/rec.badenv" --check-mode 2>&1); R=$?
+  set -u
+  [ "$R" -eq 0 ]; report S12a_old_validated_illegal_env_name $?
+  echo "  S12a old validator rc=$R (hash agreed, so the malformed name passed)"
+else
+  report S12a_old_validated_illegal_env_name 1; echo "  S12a could not extract 96fc397"
+fi
+set +e
+O=$(bash "$VALB" "$TMPD/rec.badenv" --check-mode 2>&1); R=$?
+set -u
+[ "$R" -eq 17 ] && has1 "$O" '^BUILD_RECORD_FAIL:env manifest has an illegal variable name \[A-B\]; names must match \^\[A-Z_\]\[A-Z0-9_\]\*\$$'
+report S12b_record_illegal_env_name_refused $?
+echo "  S12b rc=$R want=17(a matching hash is not a well-formed environment)"
+# N14: the legal empty value survives the whole production path
+printf '%s' "$(grep '^ENV_MANIFEST_B64=' "$GOODREC" | cut -d= -f2-)" | base64 -d | grep -qx 'PYTHONPATH='
+report N14_empty_env_value_accepted $?
+echo "  N14 PYTHONPATH= (empty value) is recorded and validates"
+
 # ---------- F: fixture records and NONE digests cannot reach formal --------
 MANF=$TMPD/fix.manifest
 SO_SHA=$(grep '^SO_SHA256=' "$GOODREC" | cut -d= -f2)
@@ -725,7 +884,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=53
+EXPECTED=65
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

@@ -95,11 +95,26 @@ NPROBE=$(printf '%s\n' "$CMD" | grep -c '^PROBE=' || true)
 [ "$NPROBE" -gt 0 ] || bf "build command spec lists no PROBE entries"
 NENV=$(printf '%s\n' "$CMD" | grep -c '^ENV_SET=' || true)
 [ "$NENV" -gt 0 ] || bf "build command spec declares no ENV_SET environment"
+# `[A-Z_]*=*` only constrained the first character - the trailing * matched
+# anything - so A-B=x, "A B=x" and A$=x were all accepted as environment
+# entries. The name is checked exactly; an empty value (PYTHONPATH=) and a
+# value containing '=' stay legal, and duplicates are caught by exact name.
+ENVSEEN=""
 while IFS= read -r E; do
-  case "$E" in [A-Z_]*=*) : ;; *) bf "build command spec: ENV_SET entry is not NAME=value: $E" ;; esac
+  case "$E" in *=*) : ;; *) bf "build command spec: ENV_SET entry is not NAME=value: $E" ;; esac
+  EN=${E%%=*}
+  printf '%s' "$EN" | grep -qE '^[A-Z_][A-Z0-9_]*$' \
+    || bf "build command spec: ENV_SET entry has an illegal variable name [$EN]; names must match ^[A-Z_][A-Z0-9_]*$"
+  case "$ENVSEEN" in *" $EN "*) bf "build command spec: ENV_SET defines $EN more than once" ;; esac
+  ENVSEEN="$ENVSEEN $EN "
 done < <(printf '%s\n' "$CMD" | grep '^ENV_SET=' | cut -d= -f2-)
 NROOT=$(printf '%s\n' "$CMD" | grep -c '^TOOLCHAIN_ROOT=' || true)
 [ "$NROOT" -gt 0 ] || bf "build command spec declares no TOOLCHAIN_ROOT"
+# absolute only: a relative root would be resolved against whatever directory
+# the wrapper happens to run in, i.e. the repository itself
+while IFS= read -r R; do
+  case "$R" in /*) : ;; *) bf "build command spec: TOOLCHAIN_ROOT must be an absolute path: $R" ;; esac
+done < <(printf '%s\n' "$CMD" | grep '^TOOLCHAIN_ROOT=' | cut -d= -f2-)
 CMD_HOSTCC=$(printf '%s\n' "$CMD" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
 case "$CMD_HOSTCC" in /*) : ;; *) bf "build command spec HOST_COMPILER must be absolute: $CMD_HOSTCC" ;; esac
 

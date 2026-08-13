@@ -177,6 +177,12 @@ mapfile -t ENV_SET < <(printf '%s\n' "$CMDSPEC" | grep '^ENV_SET=' | cut -d= -f2
 [ "${#ENV_SET[@]}" -gt 0 ] || fail "command spec declares no ENV_SET environment"
 mapfile -t TOOLCHAIN_ROOTS < <(printf '%s\n' "$CMDSPEC" | grep '^TOOLCHAIN_ROOT=' | cut -d= -f2-)
 [ "${#TOOLCHAIN_ROOTS[@]}" -gt 0 ] || fail "command spec declares no TOOLCHAIN_ROOT"
+# absolute only: readlink -f resolves a relative root against the current
+# directory, which is the repository, so `TOOLCHAIN_ROOT=.` would make every
+# path inside the checkout count as part of the toolchain image
+for R in "${TOOLCHAIN_ROOTS[@]}"; do
+  case "$R" in /*) : ;; *) fail "TOOLCHAIN_ROOT must be an absolute path: $R" ;; esac
+done
 HOST_COMPILER=$(printf '%s\n' "$CMDSPEC" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
 [ -n "$HOST_COMPILER" ] || fail "command spec does not pin HOST_COMPILER"
 case "$HOST_COMPILER" in /*) : ;; *) fail "HOST_COMPILER must be an absolute path: $HOST_COMPILER" ;; esac
@@ -204,12 +210,19 @@ for P in "${PROBES[@]}"; do case "$P" in nvcc\|*) NVCC_PROBE=${P#nvcc|}; NVCC_PR
 BUILD_HOME=$ARTDIR/build_home
 mkdir -p "$BUILD_HOME" || fail "cannot create the build HOME under the artifact dir"
 [ -z "$(ls -A "$BUILD_HOME" 2>/dev/null)" ] || fail "build HOME $BUILD_HOME is not empty"
-ENVARGS=()
+# Defence in depth - the helper already refused a malformed spec, but this
+# wrapper is what actually builds the environment. `[A-Z_]*=*` only constrained
+# the FIRST character, so A-B=x, "A B=x" and A$=x all passed and became real
+# environment entries with names no shell can reference. The name is now exact;
+# an empty value (PYTHONPATH=) and a value containing '=' are both legal.
+ENVARGS=(); ENVSEEN=""
 for E in "${ENV_SET[@]}"; do
-  case "$E" in
-    [A-Z_]*=*) : ;;
-    *) fail "ENV_SET entry is not NAME=value: $E" ;;
-  esac
+  case "$E" in *=*) : ;; *) fail "ENV_SET entry is not NAME=value: $E" ;; esac
+  EN=${E%%=*}
+  printf '%s' "$EN" | grep -qE '^[A-Z_][A-Z0-9_]*$' \
+    || fail "ENV_SET entry has an illegal variable name [$EN]; names must match ^[A-Z_][A-Z0-9_]*$"
+  case "$ENVSEEN" in *" $EN "*) fail "ENV_SET defines $EN more than once" ;; esac
+  ENVSEEN="$ENVSEEN $EN "
   E=${E//@ARTIFACT_HOME@/$BUILD_HOME}
   ENVARGS+=("$E")
 done
@@ -300,10 +313,18 @@ done
 probe_line() { # label lineno
   printf '%s\n' "${PROBE_OUT[$1]:-}" | grep -v '^[[:space:]]*$' | sed -n "$2p" | tr -s ' ' | sed 's/^ //;s/ $//'
 }
-# || true: a probe whose output has no "release" line must fall through to the
-# generic first-line extractor, not kill the script under set -e
-MEASURED_NVCC_VERSION=$(printf '%s\n' "${PROBE_OUT[nvcc]:-}" | { grep -m1 'release' || true; } | tr -s ' ' | sed 's/^ //')
-[ -n "$MEASURED_NVCC_VERSION" ] || MEASURED_NVCC_VERSION=$(probe_line nvcc 1)
+# The nvcc version has to come from a real CUDA release field. The previous
+# version fell back to "first non-empty probe line" when no release line was
+# found, so any exit-0 tool passed: /bin/true --version recorded
+# MEASURED_NVCC_VERSION=Written by Jim Meyering, and the validator let it
+# through because it only rejected unavailable/unknown/not measured. That
+# fallback is gone - no release field, no record.
+# The `|| true` only keeps set -e from killing the assignment; the emptiness
+# test below is what decides, so the refusal is reported instead of silent.
+MEASURED_NVCC_VERSION=$(printf '%s\n' "${PROBE_OUT[nvcc]:-}" \
+  | { grep -m1 -E 'release [0-9]+\.[0-9]+' || true; } | tr -s ' ' | sed 's/^ //;s/ $//')
+[ -n "$MEASURED_NVCC_VERSION" ] \
+  || fail "the nvcc probe output has no CUDA 'release <major>.<minor>' field; $NVCC_CMD did not identify itself as a CUDA compiler and no record is published"
 MEASURED_HOST_COMPILER_VERSION=$(probe_line hostcc 1)
 MEASURED_PYTHON_VERSION=$(probe_line python 1)
 MEASURED_TORCH_VERSION=$(probe_line torch 1)

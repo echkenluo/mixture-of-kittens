@@ -133,18 +133,30 @@ ENVSHA=$(printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d | sha256sum | cut -d
 # NOTE: this checks the record is internally well-formed; it does NOT verify
 # the environment against the command spec - the spec lives in git and this
 # validator is handed only a record.
+# The name is checked EXACTLY. `[A-Z_]*=*` only pinned the first character, so
+# a record could carry A-B=x, and the duplicate scan (grep -o '^[A-Z_]*=') did
+# not even see such a line, so it was excluded from that check as well. An
+# empty value (PYTHONPATH=) and a value containing '=' are legal.
 ENVDEC=$(printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d)
+ENVNAMES=""
 while IFS= read -r EL; do
   [ -z "$EL" ] && continue
-  case "$EL" in
-    [A-Z_]*=*) : ;;
-    *) echo "BUILD_RECORD_FAIL:env manifest line is not NAME=value: $EL"; exit 17 ;;
-  esac
+  case "$EL" in *=*) : ;; *) echo "BUILD_RECORD_FAIL:env manifest line is not NAME=value: $EL"; exit 17 ;; esac
+  EN=${EL%%=*}
+  printf '%s' "$EN" | grep -qE '^[A-Z_][A-Z0-9_]*$' \
+    || { echo "BUILD_RECORD_FAIL:env manifest has an illegal variable name [$EN]; names must match ^[A-Z_][A-Z0-9_]*\$"; exit 17; }
+  ENVNAMES="$ENVNAMES$EN
+"
 done <<< "$ENVDEC"
-ENVDUP=$(printf '%s\n' "$ENVDEC" | grep -o '^[A-Z_]*=' | LC_ALL=C sort | uniq -d | head -1)
-[ -z "$ENVDUP" ] || { echo "BUILD_RECORD_FAIL:env manifest defines ${ENVDUP%=} more than once"; exit 17; }
+# duplicates by PARSED name, so malformed lines cannot dodge this check either
+ENVDUP=$(printf '%s' "$ENVNAMES" | LC_ALL=C sort | uniq -d | head -1)
+[ -z "$ENVDUP" ] || { echo "BUILD_RECORD_FAIL:env manifest defines $ENVDUP more than once"; exit 17; }
 printf '%s\n' "$ENVDEC" | grep -q '^PATH=/' \
   || { echo "BUILD_RECORD_FAIL:the recorded environment has no absolute PATH"; exit 17; }
+# the wrapper refuses to record a version that is not a CUDA release field;
+# the record is checked independently, since it can arrive from elsewhere
+printf '%s' "$(rget MEASURED_NVCC_VERSION)" | grep -qE 'release [0-9]+\.[0-9]+' \
+  || { echo "BUILD_RECORD_FAIL:MEASURED_NVCC_VERSION has no CUDA 'release <major>.<minor>' field: $(rget MEASURED_NVCC_VERSION)"; exit 17; }
 case "$(rget MEASURED_HOST_COMPILER_PATH)" in
   /*) : ;;
   *) echo "BUILD_RECORD_FAIL:MEASURED_HOST_COMPILER_PATH must be an absolute path"; exit 17 ;;
