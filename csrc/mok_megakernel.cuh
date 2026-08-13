@@ -1442,7 +1442,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
-        { // SM90: consumer warpgroup computes wgmma over the input ring
+        if constexpr (!USE_ROUTED_MXFP8) { // SM90 wgmma loop (BF16 path only for now)
             mok_sm90::wgmma_acc<a_tile, b_tile, config::MLP_Mb / 2, config::MLP_Nb> acc;
             int input_ring = 0;
             for (int idx = 0; idx < iters_per_task; ++idx) {

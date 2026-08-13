@@ -12,7 +12,7 @@ using namespace kittens;
 // then calls step(); arrives gemm_inputs_finished[ring] after.
 template<typename AST, typename BST, int MB, int NB>
 struct wgmma_acc {
-    rt_fl<MB / 4 / 16, NB> acc; // per-warp rows in TK tile units
+    rt_fl<MB / 4, NB / 2> acc; // per-warp rows x N-half (register budget + per-CTA N split)
     __device__ inline void zero_() { warp::zero(acc); }
     __device__ inline void step_ABt(const AST &a, const BST &b, bool first) {
         if (first) warpgroup::mm_ABt (acc, a, b);
