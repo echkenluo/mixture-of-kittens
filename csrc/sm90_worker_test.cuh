@@ -18,6 +18,7 @@ using d_gl = gl<bf16, 1, 1, -1, -1, d_st>;
 
 struct globals { a_gl A; b_gl B; d_gl D; int k_chunks; };
 
+template<bool IS_AB>
 __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals g) {
     extern __shared__ int __shm[];
     shared_allocator al((int*)&__shm[0]);
@@ -26,11 +27,16 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
     b_st &b_smem1 = al.allocate<b_st>();
     d_st &d_smem = al.allocate<d_st>();
     using a_half = st_bf<64, 64>;
-    wgmma_quad<a_half, b_st> acc;
+    wgmma_quad<a_half, b_st, IS_AB> acc;
     for (int k = 0; k < g.k_chunks; ++k) {
         warpgroup::load(a_smem, g.A, {0, k});
-        warpgroup::load(b_smem0, g.B, {k, 0});
-        warpgroup::load(b_smem1, g.B, {k, 1});
+        if constexpr (IS_AB) {
+            warpgroup::load(b_smem0, g.B, {k, 0}); // B [K,N]
+            warpgroup::load(b_smem1, g.B, {k, 1});
+        } else {
+            warpgroup::load(b_smem0, g.B, {0, k}); // B [N,K]
+            warpgroup::load(b_smem1, g.B, {1, k});
+        }
         warpgroup::sync(0);
         auto &a0 = *reinterpret_cast<a_half *>(&a_smem);
         auto &a1 = *reinterpret_cast<a_half *>(
@@ -43,8 +49,9 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
     warpgroup::store(g.D, d_smem, {0, 0});
 }
 
-inline at::Tensor entry(at::Tensor A, at::Tensor B) {
-    TORCH_CHECK(A.size(0) == 128 && B.size(1) == 128 && A.size(1) == B.size(0));
+inline at::Tensor entry(at::Tensor A, at::Tensor B, bool is_ab) {
+    if (is_ab) { TORCH_CHECK(A.size(0) == 128 && B.size(1) == 128 && A.size(1) == B.size(0)); }
+    else       { TORCH_CHECK(A.size(0) == 128 && B.size(0) == 128 && A.size(1) == B.size(1)); }
     TORCH_CHECK(A.size(1) % 64 == 0);
     auto D = at::empty({128, 128}, A.options());
     globals g{
@@ -53,8 +60,13 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B) {
         d_gl{reinterpret_cast<kittens::bf16*>(D.data_ptr()), nullptr, nullptr, 128, 128},
         (int)(A.size(1) / 64)};
     constexpr int SMEM = sizeof(a_st) + 2 * sizeof(b_st) + sizeof(d_st) + 1024;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-    kernel<<<1, 128, SMEM>>>(g);
+    if (is_ab) {
+        cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        kernel<true><<<1, 128, SMEM>>>(g);
+    } else {
+        cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        kernel<false><<<1, 128, SMEM>>>(g);
+    }
     return D;
 }
 } // namespace wtest

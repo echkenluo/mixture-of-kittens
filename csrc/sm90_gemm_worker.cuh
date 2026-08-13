@@ -6,10 +6,12 @@
 namespace mok_sm90 {
 using namespace kittens;
 
-template<typename AST, typename BST>
+template<typename AST, typename BST, bool IS_AB>
 struct wgmma_quad {
+    // Layout is EXPLICIT (codex finding 2): after the quarter config both AB
+    // and ABt B tiles are 64x64, so shape-based dispatch is impossible.
     static constexpr int AH = AST::rows;
-    static constexpr int BN = BST::cols;
+    static constexpr int BN = IS_AB ? BST::cols : BST::rows;
     rt_fl<AH / 4, BN> acc[2][2];
     __device__ inline void step(const AST &a0, const AST &a1,
                                 const BST &b0, const BST &b1, bool first) {
@@ -19,8 +21,13 @@ struct wgmma_quad {
         for (int hm = 0; hm < 2; ++hm) {
             #pragma unroll
             for (int hn = 0; hn < 2; ++hn) {
-                if (first) warpgroup::mm_AB (acc[hm][hn], *as[hm], *bs[hn]);
-                else       warpgroup::mma_AB(acc[hm][hn], *as[hm], *bs[hn]);
+                if constexpr (IS_AB) {
+                    if (first) warpgroup::mm_AB (acc[hm][hn], *as[hm], *bs[hn]);
+                    else       warpgroup::mma_AB(acc[hm][hn], *as[hm], *bs[hn]);
+                } else {
+                    if (first) warpgroup::mm_ABt (acc[hm][hn], *as[hm], *bs[hn]);
+                    else       warpgroup::mma_ABt(acc[hm][hn], *as[hm], *bs[hn]);
+                }
             }
         }
         warpgroup::mma_async_wait();
