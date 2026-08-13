@@ -3,6 +3,8 @@
 #include "kittens.cuh"
 #include "pyutils/torchutils.cuh"
 
+#include "sm90_compat.cuh"
+
 #include "mxfp8.cuh"
 #include "utils.cuh"
 
