@@ -12,15 +12,25 @@ using namespace kittens;
 // then calls step(); arrives gemm_inputs_finished[ring] after.
 template<typename AST, typename BST, int MB, int NB>
 struct wgmma_acc {
-    rt_fl<MB / 4, NB / 2> acc; // per-warp rows x N-half (register budget + per-CTA N split)
-    __device__ inline void zero_() { warp::zero(acc); }
+    // TK SM90 warpgroup mma is fixed at M=64 per call (A height 4 tiles,
+    // D height 1 tile/warp): loop the MB rows in 64-row chunks.
+    static constexpr int MCH = MB / 64;
+    using a_sub_t = st_bf<64, AST::cols>;
+    rt_fl<16, NB / 2> acc[MCH];
     __device__ inline void step_ABt(const AST &a, const BST &b, bool first) {
-        if (first) warpgroup::mm_ABt (acc, a, b);
-        else       warpgroup::mma_ABt(acc, a, b);
+        #pragma unroll
+        for (int m = 0; m < MCH; ++m) {
+            auto &a_sub = subtile_inplace<64, AST::cols>(
+                const_cast<AST &>(a), {m, 0});
+            if (first) warpgroup::mm_ABt (acc[m], a_sub, b);
+            else       warpgroup::mma_ABt(acc[m], a_sub, b);
+        }
         warpgroup::mma_async_wait();
     }
     template<typename DST> __device__ inline void drain_to(DST &d_smem) {
-        warpgroup::store(d_smem, acc); // bf16 convert via TK store
+        #pragma unroll
+        for (int m = 0; m < MCH; ++m)
+            warpgroup::store(subtile_inplace<64, DST::cols>(d_smem, {m, 0}), acc[m]);
         warpgroup::sync(1);
     }
 };
