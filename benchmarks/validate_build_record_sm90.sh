@@ -1,19 +1,21 @@
 #!/bin/bash
-# Shared build-record validator (tracked). BUILD_RECORD_SCHEMA=3.
+# Shared build-record validator (tracked). BUILD_RECORD_SCHEMA=4.
 #
-# Schemas 1 and 2 are GONE, not deprecated, and each for a different reason:
-# schema 1 came from a generator that never ran a build; schema 2 existed in
-# two mutually incompatible shapes (32 keys with an unbound command and
-# tooling, then 36 keys) - reusing one version number for formats that cannot
-# be interchanged makes archived records ambiguous. Schema 3 is the first that
-# binds the command, the tooling AND the build environment.
+# Schemas 1, 2 and 3 are all GONE, each for its own reason: 1 came from a
+# generator that never ran a build; 2 existed in two mutually incompatible
+# shapes; 3 was likewise published twice with different field sets
+# (TOOLING_*/ENV_PASS_NAMES, then BUILD_SIDE_TOOLING_*/ENV_MANIFEST_B64 plus
+# the toolchain-path fields). Reusing a version number for formats that cannot
+# be interchanged makes archived records ambiguous - the same mistake twice,
+# so schema 4 is a real bump and 3 is refused explicitly.
 #
 # The schema separates what was MEASURED by the wrapper (source identity,
 # input closure, submodules, the argv spec it exec'd, the output it observed,
-# the logs it created, versions it probed) from what is ATTESTED by the
-# orchestrator (the container image identity, which cannot be measured from
-# inside the container). PROVENANCE_CLASS carries that split and must keep
-# saying so - a record that quietly drops the attested marker is refused.
+# the logs it created, versions and toolchain paths it probed) from what is
+# merely DECLARED BY THE CALLER (the container image identity - nothing here
+# verifies it) and what is UNVERIFIED EXTERNALLY (the clean entrypoint, which
+# a script cannot establish about itself). PROVENANCE_CLASS carries all three
+# and a record that drops any of the markers is refused.
 #
 #   any violation -> exit 17 BUILD_RECORD_FAIL:<why>
 #   valid         -> exit 0, prints BUILD_RECORD_VALID:<sha256>
@@ -31,8 +33,8 @@ REQ="BUILD_RECORD_SCHEMA RECORD_MODE PROVENANCE_CLASS BUILD_START_UTC BUILD_END_
 HEX64="ENV_APPLIED_SHA256 BUILD_SIDE_TOOLING_LIST_SHA256 BUILD_INPUT_SPEC_SHA256 BUILD_INPUT_LIST_SHA256 BUILD_INPUT_CONTENT_SHA256 SUBMODULE_LIST_SHA256 BUILD_COMMAND_SPEC_SHA256 PROBE_LOG_SHA256 SO_SHA256 BUILD_LOG_SHA256"
 HEX40="SOURCE_COMMIT SOURCE_TREE_GIT_OID"
 POSINT="BUILD_SIDE_TOOLING_FILE_COUNT BUILD_INPUT_FILE_COUNT PROBE_LOG_BYTES SO_BYTES BUILD_LOG_BYTES"
-head -1 "$REC" | grep -q '^BUILD_RECORD_SCHEMA=3$' \
-  || { echo "BUILD_RECORD_FAIL:bad or missing schema version (only 3 is valid; 1 never ran a build, 2 had two incompatible shapes and bound neither the environment nor the host compiler)"; exit 17; }
+head -1 "$REC" | grep -q '^BUILD_RECORD_SCHEMA=4$' \
+  || { echo "BUILD_RECORD_FAIL:bad or missing schema version (only 4 is valid; 1 never ran a build, and 2 and 3 were each published in two incompatible field sets)"; exit 17; }
 for K in $REQ; do
   N=$(grep -c "^$K=" "$REC" || true)
   [ "$N" -eq 1 ] || { echo "BUILD_RECORD_FAIL:key $K count=$N (need exactly 1)"; exit 17; }
@@ -89,6 +91,8 @@ rget PROVENANCE_CLASS | grep -q 'measured:.*build_side_tooling' \
   || { echo "BUILD_RECORD_FAIL:PROVENANCE_CLASS must declare build_side_tooling as measured"; exit 17; }
 # the image identity is a caller assertion with no verification behind it;
 # calling it "attested" overstated what the code does
+rget PROVENANCE_CLASS | grep -q 'unverified_external:clean_entrypoint' \
+  || { echo "BUILD_RECORD_FAIL:PROVENANCE_CLASS must declare unverified_external:clean_entrypoint (a script cannot prove its own entrypoint was clean)"; exit 17; }
 rget PROVENANCE_CLASS | grep -q 'declared_unverified:toolchain_image' \
   || { echo "BUILD_RECORD_FAIL:PROVENANCE_CLASS must declare declared_unverified:toolchain_image (the image identity is a caller assertion, not a verified attestation)"; exit 17; }
 rget PROVENANCE_CLASS | grep -q 'measured:.*env' \
@@ -116,9 +120,25 @@ esac
 # the env manifest must be present verbatim, not just as a hash
 printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d >/dev/null 2>&1 \
   || { echo "BUILD_RECORD_FAIL:ENV_MANIFEST_B64 is not valid base64"; exit 17; }
-ENVDEC=$(printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d)
-[ "$(printf '%s' "$ENVDEC" | sha256sum | cut -d' ' -f1)" = "$(rget ENV_APPLIED_SHA256)" ] \
+# stream the decode into sha256sum: a command substitution would strip the
+# trailing newline and make the comparison depend on an invisible detail
+ENVSHA=$(printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d | sha256sum | cut -d' ' -f1)
+[ "$ENVSHA" = "$(rget ENV_APPLIED_SHA256)" ] \
   || { echo "BUILD_RECORD_FAIL:ENV_APPLIED_SHA256 does not match ENV_MANIFEST_B64"; exit 17; }
+# strict parse of the manifest itself: unique NAME=value lines, absolute PATH.
+# NOTE: this checks the record is internally well-formed; it does NOT verify
+# the environment against the command spec - the spec lives in git and this
+# validator is handed only a record.
+ENVDEC=$(printf '%s' "$(rget ENV_MANIFEST_B64)" | base64 -d)
+while IFS= read -r EL; do
+  [ -z "$EL" ] && continue
+  case "$EL" in
+    [A-Z_]*=*) : ;;
+    *) echo "BUILD_RECORD_FAIL:env manifest line is not NAME=value: $EL"; exit 17 ;;
+  esac
+done <<< "$ENVDEC"
+ENVDUP=$(printf '%s\n' "$ENVDEC" | grep -o '^[A-Z_]*=' | LC_ALL=C sort | uniq -d | head -1)
+[ -z "$ENVDUP" ] || { echo "BUILD_RECORD_FAIL:env manifest defines ${ENVDUP%=} more than once"; exit 17; }
 printf '%s\n' "$ENVDEC" | grep -q '^PATH=/' \
   || { echo "BUILD_RECORD_FAIL:the recorded environment has no absolute PATH"; exit 17; }
 case "$(rget MEASURED_HOST_COMPILER_PATH)" in

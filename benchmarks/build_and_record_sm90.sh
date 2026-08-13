@@ -30,7 +30,8 @@
 # Production mode (RECORD_MODE=production) takes NOTHING about the build from
 # the caller: command, argv, output path, closure and probes all come from
 # tracked specs at HEAD. The caller supplies only the artifact directory and
-# the attested container image identity.
+# the container image identity, which it DECLARES - nothing here verifies it,
+# which is why those fields are recorded as *_DECLARED_BY_CALLER.
 #
 # Fixture mode (RECORD_MODE=fixture) exists so tests can drive an arbitrary
 # command. It is structurally isolated: the record carries RECORD_MODE=fixture
@@ -38,7 +39,7 @@
 # can never stand in for a production build.
 #
 # Still NOT proven by any of this: that a rebuild reproduces the same bytes,
-# that the attested image is the one the orchestrator claims, and - until a
+# that the declared image is the one the build actually ran in, and - until a
 # real build runs - that the closure covers everything nvcc actually reads.
 #
 # Usage: build_and_record_sm90.sh <repo_dir> <artifact_dir>
@@ -48,11 +49,21 @@
 # Required env: TOOLCHAIN_IMAGE_ID TOOLCHAIN_IMAGE_REF TOOLCHAIN_IMAGE_REPO_DIGESTS
 # Fixture-only env: BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC=<file>
 set -euo pipefail
-# CONTROL-PLANE HARDENING, before anything else runs. Everything below - git,
-# sha256sum, readlink, stat, env - would otherwise be resolved through the
-# CALLER's PATH, and git would honour the caller's GIT_* overrides. A fake
-# `git` or `sha256sum` defeats every check in this file, so the environment is
-# normalised here rather than trusted.
+# CONTROL-PLANE NORMALISATION - and an honest statement of its limit.
+#
+# This normalises PATH and clears Git/Make/compiler overrides so that an
+# ACCIDENTALLY dirty environment cannot steer git, sha256sum, readlink or
+# stat. It is NOT a proof that the control plane was clean: a non-interactive
+# bash reads BASH_ENV BEFORE this line executes, and a shell function defined
+# there shadows any command on PATH. A script cannot establish its own clean
+# entrypoint from inside itself.
+#
+# The real boundary belongs to a trusted orchestrator invoking
+#   /usr/bin/env -i ... /bin/bash --noprofile --norc <this script>
+# (or an execve with a fixed environment). That orchestrator does not exist
+# yet, so every record carries unverified_external:clean_entrypoint and no
+# record can be promoted to a receipt. The checks below are misuse protection,
+# not an attestation.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL \
@@ -63,10 +74,25 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       LIBRARY_PATH LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME \
       PYTHONSTARTUP CC CXX 2>/dev/null || true
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+# fail closed on the entrypoint variables we CAN see, and on exported shell
+# functions, which take precedence over PATH lookups
+# printenv, not ${!V}: SHELLOPTS and BASHOPTS always exist as shell variables
+# in bash, so reading the variable would reject every invocation. What matters
+# is whether the value was INHERITED from the environment.
+for V in BASH_ENV ENV SHELLOPTS BASHOPTS; do
+  if [ -n "$(printenv "$V" || true)" ]; then
+    echo "BUILD_RECORD_FAIL:$V is set; this wrapper must be started from a clean entrypoint (env -i ... bash --noprofile --norc)"
+    exit 2
+  fi
+done
+while IFS= read -r FN; do
+  echo "BUILD_RECORD_FAIL:exported shell function $FN is present; a function shadows PATH lookups and the entrypoint is not clean"
+  exit 2
+done < <(declare -Fx | awk '{print $3}')
 REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}
-: "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (attested)}"
-: "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (attested)}"
-: "${TOOLCHAIN_IMAGE_REPO_DIGESTS:?TOOLCHAIN_IMAGE_REPO_DIGESTS required (attested; NONE only for local fixtures)}"
+: "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (unverified caller declaration)}"
+: "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (unverified caller declaration)}"
+: "${TOOLCHAIN_IMAGE_REPO_DIGESTS:?TOOLCHAIN_IMAGE_REPO_DIGESTS required (unverified caller declaration; NONE only for local fixtures)}"
 FIXTURE=${BUILD_RECORD_FIXTURE_MODE:-0}
 fail() { echo "BUILD_RECORD_FAIL:$1"; exit 2; }
 
@@ -82,7 +108,7 @@ CANON_SELF=$REPO/benchmarks/build_and_record_sm90.sh
   || fail "wrapper is running from $SELF, not the repository's benchmarks/build_and_record_sm90.sh"
 for T in benchmarks/build_and_record_sm90.sh benchmarks/compute_build_inputs_sm90.sh \
          benchmarks/validate_build_record_sm90.sh benchmarks/build_input_spec.v1 \
-         benchmarks/build_command_spec.v1; do
+         benchmarks/build_command_spec.v2; do
   [ -f "$T" ] || fail "tooling file $T missing from the worktree"
   git cat-file -e "$SOURCE_COMMIT:$T" 2>/dev/null || fail "tooling file $T does not exist at $SOURCE_COMMIT"
   W=$(sha256sum "$T" | cut -d' ' -f1)
@@ -125,7 +151,7 @@ else
   RECORD_MODE=production
   [ -z "${BUILD_FIXTURE_COMMAND_SPEC:-}" ] \
     || fail "BUILD_FIXTURE_COMMAND_SPEC is set outside fixture mode"
-  CMDSPEC=$(git cat-file blob "$SOURCE_COMMIT:benchmarks/build_command_spec.v1")
+  CMDSPEC=$(git cat-file blob "$SOURCE_COMMIT:benchmarks/build_command_spec.v2")
   BUILD_COMMAND_SPEC_SHA256=$(iget BUILD_COMMAND_SPEC_SHA256)
   BUILD_COMMAND_SPEC_NAME=$(iget BUILD_COMMAND_SPEC_NAME)
 fi
@@ -150,6 +176,16 @@ for A in "${ARGV[@]}"; do
 done
 [ "$CCBIN_OK" -eq 1 ] \
   || fail "no ARGV element routes -ccbin $HOST_COMPILER into NVCC; the host compiler would be chosen by search"
+# the nvcc the command runs and the nvcc the probe measures must be the same
+# absolute file, or the record describes a compiler that did not build this
+NVCC_CMD=""
+for A in "${ARGV[@]}"; do case "$A" in NVCC=*) NVCC_CMD=${A#NVCC=}; NVCC_CMD=${NVCC_CMD%% *} ;; esac; done
+[ -n "$NVCC_CMD" ] || fail "command spec does not pin NVCC"
+case "$NVCC_CMD" in /*) : ;; *) fail "NVCC must be an absolute path in the command spec, got $NVCC_CMD" ;; esac
+NVCC_PROBE=""
+for P in "${PROBES[@]}"; do case "$P" in nvcc\|*) NVCC_PROBE=${P#nvcc|}; NVCC_PROBE=${NVCC_PROBE%%|*} ;; esac; done
+[ "$NVCC_PROBE" = "$NVCC_CMD" ] \
+  || fail "the nvcc probe measures $NVCC_PROBE but the command runs $NVCC_CMD"
 # the environment the build will see: FIXED VALUES from the tracked spec, with
 # nothing taken from the caller. HOME points at an empty directory this run
 # creates, so tool/user configuration cannot reach the build either.
@@ -252,7 +288,9 @@ done
 probe_line() { # label lineno
   printf '%s\n' "${PROBE_OUT[$1]:-}" | grep -v '^[[:space:]]*$' | sed -n "$2p" | tr -s ' ' | sed 's/^ //;s/ $//'
 }
-MEASURED_NVCC_VERSION=$(printf '%s\n' "${PROBE_OUT[nvcc]:-}" | grep -m1 'release' | tr -s ' ' | sed 's/^ //')
+# || true: a probe whose output has no "release" line must fall through to the
+# generic first-line extractor, not kill the script under set -e
+MEASURED_NVCC_VERSION=$(printf '%s\n' "${PROBE_OUT[nvcc]:-}" | { grep -m1 'release' || true; } | tr -s ' ' | sed 's/^ //')
 [ -n "$MEASURED_NVCC_VERSION" ] || MEASURED_NVCC_VERSION=$(probe_line nvcc 1)
 MEASURED_HOST_COMPILER_VERSION=$(probe_line hostcc 1)
 MEASURED_PYTHON_VERSION=$(probe_line python 1)
@@ -278,9 +316,15 @@ for PAIR in "PYTHON_INCLUDES:$MEASURED_PY_INCLUDE" \
   for TOK in $MEAS; do
     D=${TOK#-I}; D=${D#-L}
     [ -d "$D" ] || fail "$K path $D does not exist"
+    # realpath first: a lexical prefix check is defeated by a symlink
+    DR=$(readlink -f "$D") || fail "$K path $D cannot be resolved"
     OK=0
-    for R in "${TOOLCHAIN_ROOTS[@]}"; do case "$D/" in "$R"/*) OK=1 ;; esac; done
-    [ "$OK" -eq 1 ] || fail "$K path $D is outside the declared toolchain roots"
+    for R in "${TOOLCHAIN_ROOTS[@]}"; do
+      RR=$(readlink -f "$R" 2>/dev/null) || continue
+      case "$DR/" in "$RR"/*) OK=1 ;; esac
+    done
+    [ "$OK" -eq 1 ] \
+      || fail "$K path $D resolves to $DR, outside the declared toolchain image roots"
   done
 done
 # ABI check: a python 3.11 image can compile something and still leave a file
@@ -297,14 +341,14 @@ done
 PROBE_LOG_BYTES=$(stat -c %s "$PROBE_LOG_PATH")
 PROBE_LOG_SHA256=$(sha256sum "$PROBE_LOG_PATH" | cut -d' ' -f1)
 
-OUT=$ARTDIR/build_record.v3
+OUT=$ARTDIR/build_record.v4
 if [ -e "$OUT" ] || [ -L "$OUT" ]; then fail "record $OUT already exists; evidence is never overwritten"; fi
 TMP=$(mktemp "$ARTDIR/.buildrecord.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 {
-  echo "BUILD_RECORD_SCHEMA=3"
+  echo "BUILD_RECORD_SCHEMA=4"
   echo "RECORD_MODE=$RECORD_MODE"
-  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,build_side_tooling,command,env,toolchain_paths,output,logs,versions;declared_unverified:toolchain_image"
+  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,build_side_tooling,command,env,toolchain_paths,output,logs,versions;declared_unverified:toolchain_image;unverified_external:clean_entrypoint"
   echo "BUILD_START_UTC=$BUILD_START_UTC"
   echo "BUILD_END_UTC=$BUILD_END_UTC"
   echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE"

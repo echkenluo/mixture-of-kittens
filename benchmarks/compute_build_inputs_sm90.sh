@@ -24,8 +24,8 @@
 set -uo pipefail
 REPO=${1:?repo dir}; COMMIT=${2:?commit}
 SPEC_PATH=benchmarks/build_input_spec.v1
-CMD_SPEC_PATH=benchmarks/build_command_spec.v1
-BUILD_SIDE_TOOLING_PATHS="benchmarks/build_and_record_sm90.sh benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh benchmarks/build_input_spec.v1 benchmarks/build_command_spec.v1"
+CMD_SPEC_PATH=benchmarks/build_command_spec.v2
+BUILD_SIDE_TOOLING_PATHS="benchmarks/build_and_record_sm90.sh benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh benchmarks/build_input_spec.v1 benchmarks/build_command_spec.v2"
 bf() { echo "BUILD_INPUTS_FAIL:$1"; exit 19; }
 [ "$(git -C "$REPO" cat-file -t "$COMMIT" 2>/dev/null)" = "commit" ] \
   || bf "commit $COMMIT does not exist in this repository"
@@ -79,8 +79,8 @@ git -C "$REPO" cat-file -e "$COMMIT:$CMD_SPEC_PATH" 2>/dev/null \
   || bf "$CMD_SPEC_PATH does not exist at $COMMIT"
 CMD_SHA=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH" | sha256sum | cut -d' ' -f1)
 CMD=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH")
-printf '%s\n' "$CMD" | head -1 | grep -q '^BUILD_COMMAND_SPEC=1$' \
-  || bf "build command spec at $COMMIT has a bad schema line"
+printf '%s\n' "$CMD" | head -1 | grep -q '^BUILD_COMMAND_SPEC=2$' \
+  || bf "build command spec at $COMMIT is not schema 2 (schema 1 meant ENV_PASS and is not interchangeable)"
 strict_parse "$CMD" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER ARGV PROBE ENV_SET TOOLCHAIN_ROOT" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER" "build command spec"
 CMD_NAME=$(printf '%s\n' "$CMD" | grep '^NAME=' | head -1 | cut -d= -f2-)
 CMD_OUTPUT=$(printf '%s\n' "$CMD" | grep '^OUTPUT=' | head -1 | cut -d= -f2-)

@@ -50,46 +50,16 @@ SOSHA=$(grep '^EXPECTED_SO_SHA256=' "$MREL" | head -1 | cut -d= -f2)
 # Optional build-record binding (schema 2). When a record is supplied, the
 # commit is DERIVED from it - the operator cannot assert a different one - and
 # the manifest's expected SO must already agree with what was actually built.
+# A build record can no longer be turned into a receipt. The receipt's IMAGE_*
+# fields carry no label, so binding a record would launder a caller
+# declaration into something a later reader takes as verified. There is
+# deliberately NO override variable: an escape hatch is the same hole with an
+# extra step. Receipts are schema 1 (canary) until a trusted toolchain image
+# attestation exists.
 RSCHEMA=1; BRSHA=""
 if [ -n "${BUILD_RECORD:-}" ]; then
-  [ -f "$BUILD_RECORD" ] || { echo "RECEIPT_FAIL:BUILD_RECORD $BUILD_RECORD missing"; exit 2; }
-  bash "$DIR/validate_build_record_sm90.sh" "$BUILD_RECORD" --check-mode >/dev/null \
-    || { echo "RECEIPT_FAIL:BUILD_RECORD failed shared validator"; exit 2; }
-  # the receipt's IMAGE_* fields are unlabelled, so binding a production record
-  # here would launder a caller declaration into something that reads as
-  # verified. Refused until a trusted attestation artifact exists.
-  [ "${ALLOW_UNVERIFIED_IMAGE_BINDING:-0}" = "1" ] \
-    || { echo "RECEIPT_FAIL:binding a production build record requires a trusted toolchain image attestation, which is not implemented"; exit 2; }
-  [ "$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)" = "production" ] \
-    || { echo "RECEIPT_FAIL:BUILD_RECORD is not a production record (RECORD_MODE=$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-))"; exit 2; }
-  BRSHA=$(sha256sum "$BUILD_RECORD" | cut -d' ' -f1)
-  REC_COMMIT=$(grep '^SOURCE_COMMIT=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
-  REC_SO=$(grep '^SO_SHA256=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
-  [ "$REC_SO" = "$SOSHA" ] \
-    || { echo "RECEIPT_FAIL:manifest EXPECTED_SO_SHA256 $SOSHA != build record SO_SHA256 $REC_SO"; exit 2; }
-  if [ "$BINARY_BUILD_COMMIT" != "UNKNOWN" ] && [ "$BINARY_BUILD_COMMIT" != "$REC_COMMIT" ]; then
-    echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT $BINARY_BUILD_COMMIT != build record SOURCE_COMMIT $REC_COMMIT"; exit 2
-  fi
-  # D: the record's own claims about the source are RECOMPUTED here from git
-  # objects at its SOURCE_COMMIT. Without this, any syntactically valid record
-  # could be bound to any receipt - a record could claim a tree, an input
-  # closure or a submodule set that the named commit never had.
-  IDENT=$(bash "$DIR/compute_build_inputs_sm90.sh" "$REPO" "$REC_COMMIT") \
-    || { echo "RECEIPT_FAIL:cannot recompute build inputs at record SOURCE_COMMIT $REC_COMMIT"; exit 2; }
-  # every source AND tooling AND command-spec claim is recomputed: a record
-  # produced by a modified wrapper, or naming a command spec the commit never
-  # had, must not be bindable
-  for K in BUILD_INPUT_SPEC_NAME BUILD_INPUT_SPEC_SHA256 SOURCE_TREE_GIT_OID \
-           BUILD_INPUT_FILE_COUNT BUILD_INPUT_LIST_SHA256 BUILD_INPUT_CONTENT_SHA256 \
-           SUBMODULE_COUNT SUBMODULE_LIST_SHA256 BUILD_SIDE_TOOLING_FILE_COUNT BUILD_SIDE_TOOLING_LIST_SHA256 \
-           BUILD_COMMAND_SPEC_NAME BUILD_COMMAND_SPEC_SHA256; do
-    RECV=$(grep "^$K=" "$BUILD_RECORD" | head -1 | cut -d= -f2-)
-    CALC=$(printf '%s\n' "$IDENT" | grep "^$K=" | head -1 | cut -d= -f2-)
-    [ "$RECV" = "$CALC" ] \
-      || { echo "RECEIPT_FAIL:record $K=$RECV != recomputed $CALC at $REC_COMMIT"; exit 2; }
-  done
-  BINARY_BUILD_COMMIT=$REC_COMMIT
-  RSCHEMA=2
+  echo "RECEIPT_FAIL:publishing a receipt from a build record requires a trusted toolchain image attestation, which is not implemented"
+  exit 2
 fi
 # resolvability is checked AFTER the record binding: when a record is present
 # the commit is derived from it, and a disagreement must be reported as a
@@ -116,7 +86,6 @@ trap 'rm -f "$TMP"' EXIT
   echo "IMAGE_ID=$IMAGE_ID"
   echo "IMAGE_REF=$IMAGE_REF"
   echo "IMAGE_REPO_DIGESTS=$IMAGE_REPO_DIGESTS"
-  [ "$RSCHEMA" = "2" ] && echo "BUILD_RECORD_SHA256=$BRSHA"
 } > "$TMP"
 chmod 444 "$TMP"
 # validate BEFORE publishing: a bad receipt must never reach $OUT, and must

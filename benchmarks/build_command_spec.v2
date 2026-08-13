@@ -1,5 +1,9 @@
-BUILD_COMMAND_SPEC=1
-NAME=mok-sm90-make-v3
+BUILD_COMMAND_SPEC=2
+NAME=mok-sm90-make-v2
+# SCHEMA 2, and the file is build_command_spec.v2: schema 1 meant ENV_PASS
+# (an allowlist of caller values) with no TOOLCHAIN_ROOT. That is not the same
+# contract, so it does not get to keep the same version number - a parser
+# reading a v1 spec under v2 rules would silently mean something different.
 # The production build command as an argv array, the output it must produce,
 # the EXACT environment it runs in, and the tools whose versions must be
 # probed. All TRACKED and read from the commit being built.
@@ -21,9 +25,11 @@ ENV_SET=PYTHONNOUSERSITE=1
 ENV_SET=PYTHONPATH=
 ENV_SET=LANG=C.UTF-8
 ENV_SET=LC_ALL=C.UTF-8
-# Absolute roots the derived python/torch include and library paths must live
-# under. A pinned path that points outside these is refused rather than
-# recorded.
+# Absolute roots the derived python/torch include and library paths must
+# resolve under, checked after realpath so a symlink cannot escape. These are
+# IMAGE FILESYSTEM boundaries, not part of the source closure - they say
+# "this path belongs to the toolchain image", nothing about the source.
+# (/usr already contains /usr/local; both are listed for clarity.)
 TOOLCHAIN_ROOT=/usr
 TOOLCHAIN_ROOT=/usr/local
 OUTPUT=mok/_C.cpython-312-x86_64-linux-gnu.so
@@ -34,7 +40,7 @@ ARGV=Makefile
 ARGV=ARCH=SM90
 ARGV=SRC=csrc/bindings.cu
 ARGV=THUNDERKITTENS_ROOT=./third_party/ThunderKittens
-ARGV=NVCC=nvcc -ccbin /usr/bin/g++
+ARGV=NVCC=/usr/local/cuda/bin/nvcc -ccbin /usr/bin/g++
 ARGV=PYTHON=/usr/bin/python3
 ARGV=OUT=mok/_C.cpython-312-x86_64-linux-gnu.so
 ARGV=PYTHON_INCLUDES=-I/usr/include/python3.12
