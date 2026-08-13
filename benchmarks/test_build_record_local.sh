@@ -46,18 +46,26 @@ printf '[build-system]\n' > "$FIX/pyproject.toml"
 NONCE="nonce-$$-$(date -u +%s)"
 # the production build command is a TRACKED script inside the closure
 { echo '#!/bin/bash'; echo 'set -e'; echo 'echo "fixture build running"'
+  echo 'echo "SAW PYTHON_INCLUDES=${PYTHON_INCLUDES:-}"'
+  echo 'echo "SAW PYTORCH_LIBDIR=${PYTORCH_LIBDIR:-}"'
+  echo 'echo "SAW MAKEFILES=${MAKEFILES:-}"'
+  echo 'echo "SAW NVCC_CCBIN=${NVCC_CCBIN:-}"'
+  echo 'echo "SAW CPATH=${CPATH:-}"'
   echo "printf 'built %s\\n' \"$NONCE\" > mok/_Cfixture.so"; } > "$FIX/tools/fake_build.sh"
 chmod +x "$FIX/tools/fake_build.sh"
 { echo "BUILD_INPUT_SPEC=1"; echo "NAME=fixture-inputs-v1"; echo "PATH=Makefile"
   echo "PATH=pyproject.toml"; echo "PATH=csrc"; echo "PATH=tools"
   echo "SUBMODULE=third_party/tk"; } > "$FIX/benchmarks/build_input_spec.v1"
 { echo "BUILD_COMMAND_SPEC=1"; echo "NAME=fixture-command-v1"
-  echo "OUTPUT=mok/_Cfixture.so"
+  echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
+  echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+  echo "ENV_PASS=PATH"; echo "ENV_PASS=HOME"
   echo "PROBE=nvcc|printf|release 13.0, V13.0.88"
-  echo "PROBE=cc|printf|gcc (fixture) 12.3.0"
+  echo "PROBE=hostcc|/bin/echo|(fixture host compiler) 12.3.0"
   echo "PROBE=python|printf|Python 3.12.3"
-  echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"; } > "$FIX/benchmarks/build_command_spec.v1"
+  echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"
+  echo "PROBE=ext_suffix|printf|fixture.so"; } > "$FIX/benchmarks/build_command_spec.v1"
 for T in build_and_record_sm90.sh compute_build_inputs_sm90.sh validate_build_record_sm90.sh; do
   cp "$DIR/$T" "$FIX/benchmarks/$T"
 done
@@ -67,10 +75,12 @@ FIXSRC=$($GIT -C "$FIX" rev-parse HEAD)
 FIXWRAP=$FIX/benchmarks/build_and_record_sm90.sh
 
 newart() { local D=$TMPD/art.$1; mkdir -p "$D"; echo "$D"; }
-runnew() { # artifact-tag out-record [extra env from caller]
+# the artifact dir is computed by the CALLER: runwrap_at runs in a command
+# substitution, so anything it assigns would be lost with its subshell
+runwrap_at() { # artifact-dir
   ( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF="build:cu130" \
       TOOLCHAIN_IMAGE_REPO_DIGESTS="${N_DIGESTS:-registry.local/build@sha256:$(H64 3)}" \
-      bash "$FIXWRAP" "$FIX" "$(newart "$1")" "$2" 2>&1 )
+      bash "$FIXWRAP" "$FIX" "$1" 2>&1 )
 }
 
 # ---------- A: attacks that worked on 8e0035f and must now be refused ------
@@ -82,6 +92,7 @@ EVIL=$TMPD/evil.sh
   echo "cp $TMPD/old_prebuilt.so mok/_Cfixture.so"; } > "$EVIL"
 chmod +x "$EVIL"
 printf 'bash\n%s\n' "$EVIL" > "$TMPD/evil.argv"
+printf 'bash\ntools/fake_build.sh\n' > "$TMPD/tracked.argv"
 set +e
 OLDOUT=$( cd "$FIX" && BUILD_COMMAND_SPEC="$TMPD/evil.argv" BUILD_OUTPUT_PATH=mok/_Cfixture.so \
     BUILD_LOG_PATH="$TMPD/a1.build.log" PROBE_LOG_PATH="$TMPD/a1.probe.log" TARGET_ARCH=SM90 \
@@ -96,10 +107,10 @@ set +e
 NEWOUT=$( cd "$FIX" && BUILD_FIXTURE_COMMAND_SPEC="$TMPD/evil.argv" \
     TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
     TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
-    bash "$FIXWRAP" "$FIX" "$(newart a1new)" "$TMPD/a1.new.record" 2>&1 ); NEWRC=$?
+    bash "$FIXWRAP" "$FIX" "$(newart a1new)" 2>&1 ); NEWRC=$?
 set -u
 [ "$NEWRC" -eq 2 ] && has1 "$NEWOUT" '^BUILD_RECORD_FAIL:BUILD_FIXTURE_COMMAND_SPEC is set outside fixture mode$' \
-  && [ ! -f "$TMPD/a1.new.record" ]; report A1b_new_refuses_external_command $?
+  && [ ! -f "$TMPD/art.a1new/build_record.v3" ]; report A1b_new_refuses_external_command $?
 echo "  A1b new wrapper rc=$NEWRC (production mode takes no command from the caller)"
 
 # A2 a modified wrapper run from outside the repository
@@ -115,7 +126,7 @@ echo "  A2a old wrapper rc=$OLDRC ran happily from $OLDBM (outside the repo it r
 set +e
 NEWOUT=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
     TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
-    bash "$TMPD/tampered_wrapper.sh" "$FIX" "$(newart a2new)" "$TMPD/a2.new.record" 2>&1 ); NEWRC=$?
+    bash "$TMPD/tampered_wrapper.sh" "$FIX" "$(newart a2new)" 2>&1 ); NEWRC=$?
 set -u
 [ "$NEWRC" -eq 2 ] && has1 "$NEWOUT" '^BUILD_RECORD_FAIL:wrapper is running from .*, not the repository.s benchmarks/build_and_record_sm90\.sh$'; report A2b_new_refuses_foreign_wrapper $?
 echo "  A2b new wrapper rc=$NEWRC (self-binding rejects a copy run from elsewhere)"
@@ -135,89 +146,125 @@ OLDCOUNT=$(grep '^BUILD_INPUT_FILE_COUNT=' "$TMPD/a3.old.record" 2>/dev/null | c
 [ "$OLDRC" -eq 0 ] && [ "${OLDCOUNT:-0}" -eq 1 ]; report A3a_old_honoured_narrowed_closure $?
 echo "  A3a old wrapper rc=$OLDRC recorded a closure of ${OLDCOUNT:-?} file(s) instead of the full spec"
 set +e
-NEWOUT=$(BUILD_INPUT_SPEC_PATH=benchmarks/narrow.spec runnew a3new "$TMPD/a3.new.record"); NEWRC=$?
+ART=$(newart a3new)
+NEWOUT=$(BUILD_INPUT_SPEC_PATH=benchmarks/narrow.spec runwrap_at "$ART"); NEWRC=$?
+REC=$ART/build_record.v3
 set -u
-NEWCOUNT=$(grep '^BUILD_INPUT_FILE_COUNT=' "$TMPD/a3.new.record" 2>/dev/null | cut -d= -f2)
+NEWCOUNT=$(grep '^BUILD_INPUT_FILE_COUNT=' "$REC" 2>/dev/null | cut -d= -f2)
 [ "$NEWRC" -eq 0 ] && [ "${NEWCOUNT:-0}" -eq 4 ]; report A3b_new_ignores_spec_override $?
 echo "  A3b new wrapper rc=$NEWRC closure=${NEWCOUNT:-?} files, want 4 (override ignored; spec path is fixed)"
 
 # ---------- N: the current implementation's own gates ----------
 set +e
-O=$(runnew n1 "$TMPD/rec.ok"); R=$?
+ART=$(newart n1)
+O=$(runwrap_at "$ART"); R=$?
+REC_OK=$ART/build_record.v3
 set -u
-RECSHA=$(sha256sum "$TMPD/rec.ok" 2>/dev/null | cut -d' ' -f1)
+RECSHA=$(sha256sum "$REC_OK" 2>/dev/null | cut -d' ' -f1)
 [ "$R" -eq 0 ] && has1 "$O" "^BUILD_RECORD_SHA256:$RECSHA\$" && has1 "$O" '^RECORD_MODE:production$' \
-  && [ "$(stat -c %a "$TMPD/rec.ok")" = "444" ]; report N1_production_positive $?
+  && [ "$(stat -c %a "$REC_OK")" = "444" ]; report N1_production_positive $?
 echo "  N1 rc=$R want=0(production record published)"
 grep -q "$NONCE" "$FIX/mok/_Cfixture.so" 2>/dev/null \
-  && [ "$(grep '^SO_SHA256=' "$TMPD/rec.ok" | cut -d= -f2)" = "$(sha256sum "$FIX/mok/_Cfixture.so" | cut -d' ' -f1)" ] \
-  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$TMPD/rec.ok" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90" ] \
-  && [ "$(grep '^TARGET_ARCH=' "$TMPD/rec.ok" | cut -d= -f2)" = "SM90" ]; report N2_argv_and_output_from_tracked_spec $?
+  && [ "$(grep '^SO_SHA256=' "$REC_OK" | cut -d= -f2)" = "$(sha256sum "$FIX/mok/_Cfixture.so" | cut -d' ' -f1)" ] \
+  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC_OK" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo" ] \
+  && [ "$(grep '^TARGET_ARCH=' "$REC_OK" | cut -d= -f2)" = "SM90" ]; report N2_argv_and_output_from_tracked_spec $?
 echo "  N2 argv, ARCH and output all come from the tracked command spec"
 GOODSO=$TMPD/built.so; cp "$FIX/mok/_Cfixture.so" "$GOODSO"
-GOODREC=$TMPD/rec.good; cp "$TMPD/rec.ok" "$GOODREC"; chmod 444 "$GOODREC"
+GOODREC=$TMPD/rec.good; cp "$REC_OK" "$GOODREC"; chmod 444 "$GOODREC"
 # Make-style variables cannot be injected from the environment
 set +e
+ART=$(newart n3)
 O=$(SRC=/evil.cu NVCC=/evil-nvcc PYTHON=/evil-python THUNDERKITTENS_ROOT=/evil ARCH=SM100 \
-    OUT=/tmp/escaped.so runnew n3 "$TMPD/rec.envoverride"); R=$?
+    OUT=/tmp/escaped.so PYTHON_INCLUDES=-I/tmp/evil PYTORCH_LIBDIR=-L/tmp/evil \
+    MAKEFILES=/tmp/evil.mk NVCC_CCBIN=/tmp/evil-g++ CPATH=/tmp/evil \
+    runwrap_at "$ART"); R=$?
+REC=$ART/build_record.v3
 set -u
 [ "$R" -eq 0 ] \
-  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$TMPD/rec.envoverride" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90" ] \
-  && [ "$(grep '^TARGET_ARCH=' "$TMPD/rec.envoverride" | cut -d= -f2)" = "SM90" ] \
+  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo" ] \
+  && [ "$(grep '^TARGET_ARCH=' "$REC" | cut -d= -f2)" = "SM90" ] \
   && [ ! -f /tmp/escaped.so ]; report N3_make_vars_not_injectable $?
 echo "  N3 rc=$R SRC/NVCC/PYTHON/TK/ARCH/OUT from the environment changed nothing"
+# and the build itself saw NONE of the injected compile-steering variables
+BL=$ART/build.log
+grep -q '^SAW PYTHON_INCLUDES=$' "$BL" && grep -q '^SAW PYTORCH_LIBDIR=$' "$BL" \
+  && grep -q '^SAW MAKEFILES=$' "$BL" && grep -q '^SAW NVCC_CCBIN=$' "$BL" \
+  && grep -q '^SAW CPATH=$' "$BL"; report N3b_env_closure_holds $?
+echo "  N3b the build saw empty PYTHON_INCLUDES/PYTORCH_LIBDIR/MAKEFILES/NVCC_CCBIN/CPATH"
+# the same injection reaches the build on the previous implementation
+OLDART=$TMPD/oldenv; mkdir -p "$OLDART"
+set +e
+OLDOUT=$( cd "$FIX" && PYTHON_INCLUDES=-I/tmp/evil PYTORCH_LIBDIR=-L/tmp/evil \
+    MAKEFILES=/tmp/evil.mk NVCC_CCBIN=/tmp/evil-g++ CPATH=/tmp/evil \
+    BUILD_COMMAND_SPEC="$TMPD/tracked.argv" BUILD_OUTPUT_PATH=mok/_Cfixture.so \
+    BUILD_LOG_PATH="$OLDART/build.log" PROBE_LOG_PATH="$OLDART/probe.log" TARGET_ARCH=SM90 \
+    TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+    bash "$OLDWRAP" "$FIX" "$TMPD/env.old.record" 2>&1 ); OLDRC=$?
+set -u
+grep -q '^SAW PYTHON_INCLUDES=-I/tmp/evil$' "$OLDART/build.log" 2>/dev/null \
+  && grep -q '^SAW MAKEFILES=/tmp/evil.mk$' "$OLDART/build.log" 2>/dev/null \
+  && grep -qF 'SAW NVCC_CCBIN=/tmp/evil-g++' "$OLDART/build.log" 2>/dev/null; report N3c_old_leaked_env_into_build $?
+echo "  N3c old wrapper rc=$OLDRC let PYTHON_INCLUDES/MAKEFILES/NVCC_CCBIN reach the build"
 # tooling tamper in the worktree
 cp "$FIX/benchmarks/compute_build_inputs_sm90.sh" "$TMPD/cbi.bak"
 echo "# tampered" >> "$FIX/benchmarks/compute_build_inputs_sm90.sh"
 set +e
-O=$(runnew n4 "$TMPD/rec.tampered"); R=$?
+ART=$(newart n4)
+O=$(runwrap_at "$ART"); R=$?
+REC=$ART/build_record.v3
 set -u
 cp "$TMPD/cbi.bak" "$FIX/benchmarks/compute_build_inputs_sm90.sh"
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:tooling file benchmarks/compute_build_inputs_sm90\.sh differs from its committed bytes at [0-9a-f]{40} \([0-9a-f]{64} != [0-9a-f]{64}\)$'; report N4_tooling_tamper_refused $?
 echo "  N4 rc=$R want=2(helper modified in the worktree)"
 # fixture mode is labelled and isolated
 FIXCMD=$TMPD/fixture.cmdspec
-{ echo "NAME=fixture-arbitrary"; echo "OUTPUT=mok/_Cfixture.so"
+{ echo "NAME=fixture-arbitrary"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
-  echo "PROBE=nvcc|printf|release 13.0, V13.0.88"; echo "PROBE=cc|printf|gcc 12.3.0"
-  echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"; } > "$FIXCMD"
+  echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+  echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc 12.3.0"
+  echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"
+  echo "PROBE=ext_suffix|printf|fixture.so"; } > "$FIXCMD"
 set +e
+ART=$(newart n5); FIXREC=$ART/build_record.v3
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$FIXCMD" \
      TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
      TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
-     bash "$FIXWRAP" "$FIX" "$(newart n5)" "$TMPD/rec.fixture" 2>&1 ); R=$?
+     bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
 set -u
-[ "$R" -eq 0 ] && grep -q '^RECORD_MODE=fixture$' "$TMPD/rec.fixture"; report N5_fixture_mode_labelled $?
+[ "$R" -eq 0 ] && grep -q '^RECORD_MODE=fixture$' "$FIXREC"; report N5_fixture_mode_labelled $?
 echo "  N5 rc=$R want=0(fixture record carries RECORD_MODE=fixture)"
 # output symlink
 SYMCMD=$TMPD/sym.cmdspec
-{ echo "NAME=fixture-symlink"; echo "OUTPUT=mok/_Cfixture.so"
+{ echo "NAME=fixture-symlink"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
   echo "ARGV=bash"; echo "ARGV=-c"; echo "ARGV=ln -s $TMPD/old_prebuilt.so mok/_Cfixture.so"
-  echo "ARGV=ARCH=SM90"
-  echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=cc|printf|gcc"; echo "PROBE=python|printf|Python 3"
-  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; } > "$SYMCMD"
+  echo "ARGV=ARCH=SM90"; echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+  echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc"; echo "PROBE=python|printf|Python 3"
+  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"; } > "$SYMCMD"
+ART6=$(newart n6); SYMREC=$ART6/build_record.v3
 set +e
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$SYMCMD" \
      TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
-     bash "$FIXWRAP" "$FIX" "$(newart n6)" "$TMPD/rec.sym" 2>&1 ); R=$?
+     bash "$FIXWRAP" "$FIX" "$ART6" 2>&1 ); R=$?
 set -u
 rm -f "$FIX/mok/_Cfixture.so"
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:build created mok/_Cfixture\.so as a symlink; refusing to hash the target$' \
-  && [ ! -f "$TMPD/rec.sym" ]; report N6_output_symlink_refused $?
+  && [ ! -f "$SYMREC" ]; report N6_output_symlink_refused $?
 echo "  N6 rc=$R want=2(output created as a symlink to an old binary)"
 # probe failure
 BADPROBE=$TMPD/badprobe.cmdspec
-{ echo "NAME=fixture-badprobe"; echo "OUTPUT=mok/_Cfixture.so"
+{ echo "NAME=fixture-badprobe"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
-  echo "PROBE=nvcc|false"; echo "PROBE=cc|printf|gcc"; echo "PROBE=python|printf|Python 3"
-  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; } > "$BADPROBE"
+  echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+  echo "PROBE=nvcc|false"; echo "PROBE=hostcc|/bin/echo|gcc"; echo "PROBE=python|printf|Python 3"
+  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"; } > "$BADPROBE"
+ART7=$(newart n7); PROBEREC=$ART7/build_record.v3
 set +e
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$BADPROBE" \
      TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
-     bash "$FIXWRAP" "$FIX" "$(newart n7)" "$TMPD/rec.badprobe" 2>&1 ); R=$?
+     bash "$FIXWRAP" "$FIX" "$ART7" 2>&1 ); R=$?
 set -u
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:probe nvcc exited 1; the toolchain cannot be described and no record is published$' \
-  && [ ! -f "$TMPD/rec.badprobe" ]; report N7_probe_failure_refused $?
+  && [ ! -f "$PROBEREC" ]; report N7_probe_failure_refused $?
 echo "  N7 rc=$R want=2(a probe failed; no record)"
 # artifact dir problems
 AD=$TMPD/art.reuse; mkdir -p "$AD"; : > "$AD/build.log"
@@ -237,7 +284,9 @@ echo "  N9 rc=$R want=2(artifact dir is a symlink)"
 # dirty closure and submodule drift still refused
 touch "$FIX/csrc/untracked.cu"
 set +e
-O=$(runnew n10 "$TMPD/rec.dirty"); R=$?
+ART=$(newart n10)
+O=$(runwrap_at "$ART"); R=$?
+REC=$ART/build_record.v3
 set -u
 rm -f "$FIX/csrc/untracked.cu"
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:build inputs not clean vs HEAD \(incl\. untracked\):$'; report N10_dirty_inputs $?
@@ -246,7 +295,9 @@ printf '// tk v2\n' >> "$SUBSRC/tk.h"
 ( cd "$SUBSRC" && $GIT add -A && $GIT commit -qm tk2 ) >/dev/null 2>&1
 ( cd "$FIX/third_party/tk" && $GIT fetch -q origin && { $GIT checkout -q origin/HEAD || $GIT checkout -q origin/master || $GIT checkout -q origin/main; } ) >/dev/null 2>&1
 set +e
-O=$(runnew n11 "$TMPD/rec.drift"); R=$?
+ART=$(newart n11)
+O=$(runwrap_at "$ART"); R=$?
+REC=$ART/build_record.v3
 set -u
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:submodule third_party/tk drifted or uninitialized:$'; report N11_submodule_drift $?
 echo "  N11 rc=$R want=2(submodule off its recorded gitlink)"
@@ -307,17 +358,17 @@ RCPT=$TMPD/f.receipt
   echo "HARNESS_SHA256=$(grep '^EXPECTED_HARNESS_SHA256=' "$MANF" | cut -d= -f2)"
   echo "SO_SHA256=$SO_SHA"; echo "IMAGE_ID=sha256:$(H64 1)"; echo "IMAGE_REF=x:1"
   echo "IMAGE_REPO_DIGESTS=registry.local/mok@sha256:$(H64 9)"
-  echo "BUILD_RECORD_SHA256=$(sha256sum "$TMPD/rec.fixture" | cut -d' ' -f1)"; } > "$RCPT"
+  echo "BUILD_RECORD_SHA256=$(sha256sum "$FIXREC" | cut -d' ' -f1)"; } > "$RCPT"
 chmod 444 "$RCPT"
 SODIR=$TMPD/deployed; mkdir -p "$SODIR"; cp "$GOODSO" "$SODIR/_Cfixture.so"
 set +e
 O=$(EXPECTED_RECEIPT_SHA256=$(sha256sum "$RCPT" | cut -d' ' -f1) \
-    bash "$BIND" "$RCPT" "$TMPD/rec.fixture" "$MANF" "$SODIR" 2>&1); R=$?
+    bash "$BIND" "$RCPT" "$FIXREC" "$MANF" "$SODIR" 2>&1); R=$?
 set -u
 [ "$R" -eq 18 ] && has1 "$O" '^FORMAL_BINDING_FAIL:build record RECORD_MODE=fixture is not a production record$'; report F1_fixture_record_refused $?
 echo "  F1 rc=$R want=18(fixture record cannot satisfy formal)"
 NONEREC=$TMPD/rec.none
-sed 's|^TOOLCHAIN_IMAGE_REPO_DIGESTS_ATTESTED=.*|TOOLCHAIN_IMAGE_REPO_DIGESTS_ATTESTED=NONE|' \
+sed 's|^TOOLCHAIN_IMAGE_REPO_DIGESTS_DECLARED_BY_CALLER=.*|TOOLCHAIN_IMAGE_REPO_DIGESTS_DECLARED_BY_CALLER=NONE|' \
   "$GOODREC" > "$NONEREC"; chmod 444 "$NONEREC"
 RCPT2=$TMPD/f2.receipt
 sed "s|^BUILD_RECORD_SHA256=.*|BUILD_RECORD_SHA256=$(sha256sum "$NONEREC" | cut -d' ' -f1)|" "$RCPT" > "$RCPT2"
@@ -329,7 +380,7 @@ set -u
 [ "$R" -eq 18 ] && has1 "$O" '^FORMAL_BINDING_FAIL:toolchain image has no repo digest \(NONE\); formal requires registry provenance$'; report F2_none_digest_refused $?
 echo "  F2 rc=$R want=18(NONE repo digest cannot satisfy formal)"
 set +e
-O=$(bash "$VALB" "$TMPD/rec.fixture" --check-mode 2>&1); R=$?
+O=$(bash "$VALB" "$FIXREC" --check-mode 2>&1); R=$?
 set -u
 [ "$R" -eq 0 ] && has1 "$O" '^BUILD_RECORD_VALID:[0-9a-f]{64}$'; report F3_fixture_record_still_valid_schema $?
 echo "  F3 rc=$R want=0(a fixture record is schema-valid but not formal-capable)"
@@ -353,7 +404,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=30
+EXPECTED=32
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

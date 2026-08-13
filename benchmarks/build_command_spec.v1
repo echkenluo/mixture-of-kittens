@@ -1,34 +1,47 @@
 BUILD_COMMAND_SPEC=1
-NAME=mok-sm90-make-v1
-# The production build command, as an argv array (one element per ARGV line),
-# and the output it must produce. Both are TRACKED and read from the commit
-# being built - the wrapper takes no command from the caller in production
-# mode, so there is no argv file outside the repository to swap.
+NAME=mok-sm90-make-v2
+# The production build command as an argv array, the output it must produce,
+# the environment it is allowed to see, and the tools whose versions must be
+# probed. All TRACKED and read from the commit being built.
 #
-# Every Make variable the build depends on is pinned here rather than
-# inherited: an inherited SRC, OUT, NVCC, PYTHON, THUNDERKITTENS_ROOT or ARCH
-# would let the environment change what gets compiled while the record still
-# claimed this command.
+# Every Makefile variable declared with ?= is environment-overridable, so ALL
+# of them are pinned here, not just the obvious ones. An earlier version
+# pinned SRC/OUT/ARCH/NVCC/PYTHON/THUNDERKITTENS_ROOT and left
+# PYTHON_INCLUDES, PYTORCH_INCLUDES and PYTORCH_LIBDIR inheritable - which
+# let any caller point the compile at arbitrary headers and libraries while
+# the record still claimed this command.
 #
-# OUTPUT is the path the build must create. It is relative to the repository
-# root, must stay inside it, and the wrapper refuses a symlink there.
+# HOST_COMPILER is pinned and passed through -ccbin: the Makefile never sets
+# it, so nvcc would otherwise pick a host compiler by its own search (and
+# NVCC_CCBIN could redirect it), while the record described whatever `cc`
+# happened to be.
 OUTPUT=mok/_C.cpython-312-x86_64-linux-gnu.so
+HOST_COMPILER=/usr/bin/g++
 ARGV=make
 ARGV=-f
 ARGV=Makefile
 ARGV=ARCH=SM90
 ARGV=SRC=csrc/bindings.cu
 ARGV=THUNDERKITTENS_ROOT=./third_party/ThunderKittens
-ARGV=NVCC=nvcc
+ARGV=NVCC=nvcc -ccbin /usr/bin/g++
 ARGV=PYTHON=python3
 ARGV=OUT=mok/_C.cpython-312-x86_64-linux-gnu.so
-# Tools whose versions MUST be probed successfully; a probe failure means the
-# record cannot describe the toolchain and nothing is published. Each line is
-# label|argv0|argv1|... - pipe-delimited so an argument containing spaces or
-# semicolons stays one element and no shell is involved. The labels are fixed:
-# nvcc, cc, python, torch (torch prints the torch version then the CUDA
-# version). These are the tools this command actually uses, not a generic set.
+ARGV=PYTHON_INCLUDES=-I/usr/include/python3.12
+ARGV=PYTORCH_INCLUDES=-I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include
+ARGV=PYTORCH_LIBDIR=-L/usr/local/lib/python3.12/dist-packages/torch/lib
+# The build runs under `env -i` with ONLY these names passed through. Anything
+# not listed - MAKEFILES, MAKEFLAGS, GNUMAKEFLAGS, MFLAGS, NVCC_CCBIN, CPATH,
+# CPLUS_INCLUDE_PATH, LIBRARY_PATH, LD_LIBRARY_PATH, PYTHONPATH and the rest -
+# is absent from the build environment rather than merely unused.
+ENV_PASS=PATH
+ENV_PASS=HOME
+ENV_PASS=CUDA_HOME
+ENV_PASS=LANG
+# label|argv0|argv1|... - pipe-delimited, no shell. Labels are fixed:
+# nvcc, hostcc, python, torch, ext_suffix. hostcc probes the exact HOST_COMPILER
+# the command pins; ext_suffix must match the OUTPUT basename.
 PROBE=nvcc|nvcc|--version
-PROBE=cc|cc|--version
+PROBE=hostcc|/usr/bin/g++|--version
 PROBE=python|python3|--version
 PROBE=torch|python3|-c|import torch; print(torch.__version__); print(torch.version.cuda)
+PROBE=ext_suffix|python3|-c|import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))

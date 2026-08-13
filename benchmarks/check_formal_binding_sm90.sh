@@ -60,9 +60,11 @@ brget() { grep "^$1=" "$REC"  | head -1 | cut -d= -f2- || true; }
 # source; it can never satisfy formal provenance
 [ "$(brget RECORD_MODE)" = "production" ] \
   || fb "build record RECORD_MODE=$(brget RECORD_MODE) is not a production record"
-# formal requires registry provenance for the toolchain image; NONE marks a
-# local-only image and is canary/fixture territory
-[ "$(brget TOOLCHAIN_IMAGE_REPO_DIGESTS_ATTESTED)" != "NONE" ] \
+# NONE marks a local-only image. NOTE: a non-NONE digest here is still only
+# what the CALLER declared - nothing in this chain verifies it against a
+# trusted orchestrator artifact. This check therefore cannot be the reason
+# formal is opened; formal stays refused until a verified attestation exists.
+[ "$(brget TOOLCHAIN_IMAGE_REPO_DIGESTS_DECLARED_BY_CALLER)" != "NONE" ] \
   || fb "toolchain image has no repo digest (NONE); formal requires registry provenance"
 rcget() { grep "^$1=" "$RCPT" | head -1 | cut -d= -f2- || true; }
 mnget() { grep "^$1=" "$MAN"  | head -1 | cut -d= -f2- || true; }

@@ -1,10 +1,12 @@
 #!/bin/bash
 # Build-input identity, computed from git OBJECTS at a given commit (tracked).
 #
-# One implementation, used by both sides on purpose: the build wrapper records
-# these values, and the packaging host RECOMPUTES them at the record's
-# SOURCE_COMMIT and compares. If each side had its own implementation, a
-# mismatch would be ambiguous; with one, a mismatch means the record is wrong.
+# One implementation, used by both sides: the build wrapper records these
+# values and the packaging host recomputes them at the record's SOURCE_COMMIT.
+# NOTE ON WHAT THAT BUYS: sharing the implementation gives CONSISTENCY, not
+# correctness - a bug here is reproduced identically on both sides and the
+# comparison still passes. Correctness evidence comes from the independent
+# negative cases in test_build_record_local.sh, not from the agreement.
 #
 # The spec path is FIXED here. An earlier version accepted it as an argument,
 # which was a caller override of the very thing that must not be caller-
@@ -78,7 +80,7 @@ CMD_SHA=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH" | sha256sum | cu
 CMD=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH")
 printf '%s\n' "$CMD" | head -1 | grep -q '^BUILD_COMMAND_SPEC=1$' \
   || bf "build command spec at $COMMIT has a bad schema line"
-strict_parse "$CMD" "BUILD_COMMAND_SPEC NAME OUTPUT ARGV PROBE" "BUILD_COMMAND_SPEC NAME OUTPUT" "build command spec"
+strict_parse "$CMD" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER ARGV PROBE ENV_PASS" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER" "build command spec"
 CMD_NAME=$(printf '%s\n' "$CMD" | grep '^NAME=' | head -1 | cut -d= -f2-)
 CMD_OUTPUT=$(printf '%s\n' "$CMD" | grep '^OUTPUT=' | head -1 | cut -d= -f2-)
 safe_rel "$CMD_OUTPUT" "build command spec OUTPUT"
@@ -86,6 +88,10 @@ NARGV=$(printf '%s\n' "$CMD" | grep -c '^ARGV=' || true)
 [ "$NARGV" -gt 0 ] || bf "build command spec lists no ARGV entries"
 NPROBE=$(printf '%s\n' "$CMD" | grep -c '^PROBE=' || true)
 [ "$NPROBE" -gt 0 ] || bf "build command spec lists no PROBE entries"
+NENV=$(printf '%s\n' "$CMD" | grep -c '^ENV_PASS=' || true)
+[ "$NENV" -gt 0 ] || bf "build command spec declares no ENV_PASS allowlist"
+CMD_HOSTCC=$(printf '%s\n' "$CMD" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
+case "$CMD_HOSTCC" in /*) : ;; *) bf "build command spec HOST_COMPILER must be absolute: $CMD_HOSTCC" ;; esac
 
 TREE_OID=$(git -C "$REPO" rev-parse "$COMMIT^{tree}" 2>/dev/null) || bf "cannot resolve tree of $COMMIT"
 LIST=$(git -C "$REPO" ls-tree -r "$COMMIT" -- "${PATHS[@]}" 2>/dev/null \

@@ -11,6 +11,11 @@
 #     file to swap, and the argv identity is the spec blob.
 #   - "no environment variable can narrow the closure" was FALSE: this script
 #     itself had added BUILD_INPUT_SPEC_PATH. That override is gone.
+#   - "the Make variables that decide what gets compiled are pinned" was FALSE
+#     too: PYTHON_INCLUDES, PYTORCH_INCLUDES and PYTORCH_LIBDIR are ?= in the
+#     Makefile and were still inheritable, and nothing stopped MAKEFILES,
+#     MAKEFLAGS, NVCC_CCBIN, CPATH, LIBRARY_PATH or PYTHONPATH from steering
+#     the build. The build now runs under `env -i` with a tracked allowlist.
 # Also fixed: nothing bound the wrapper, the helper or the validators, so a
 # modified wrapper run from /tmp against a clean repo produced a valid-looking
 # record. The tooling is now self-bound to the commit.
@@ -29,11 +34,14 @@
 # that the attested image is the one the orchestrator claims, and - until a
 # real build runs - that the closure covers everything nvcc actually reads.
 #
-# Usage: build_and_record_sm90.sh <repo_dir> <artifact_dir> <out_record>
+# Usage: build_and_record_sm90.sh <repo_dir> <artifact_dir>
+#   The record is published INSIDE the artifact directory under a canonical
+#   name. An earlier version took the path from the caller and mv -f'd onto it,
+#   which could write outside the repo and silently overwrite existing evidence.
 # Required env: TOOLCHAIN_IMAGE_ID TOOLCHAIN_IMAGE_REF TOOLCHAIN_IMAGE_REPO_DIGESTS
 # Fixture-only env: BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC=<file>
 set -euo pipefail
-REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}; OUT=${3:?output record path}
+REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}
 : "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (attested)}"
 : "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (attested)}"
 : "${TOOLCHAIN_IMAGE_REPO_DIGESTS:?TOOLCHAIN_IMAGE_REPO_DIGESTS required (attested; NONE only for local fixtures)}"
@@ -105,7 +113,33 @@ OUTPUT_PATH=$(printf '%s\n' "$CMDSPEC" | grep '^OUTPUT=' | head -1 | cut -d= -f2
 [ -n "$OUTPUT_PATH" ] || fail "command spec has no OUTPUT"
 mapfile -t PROBES < <(printf '%s\n' "$CMDSPEC" | grep '^PROBE=' | cut -d= -f2-)
 [ "${#PROBES[@]}" -gt 0 ] || fail "command spec lists no PROBE entries"
+mapfile -t ENV_PASS < <(printf '%s\n' "$CMDSPEC" | grep '^ENV_PASS=' | cut -d= -f2-)
+[ "${#ENV_PASS[@]}" -gt 0 ] || fail "command spec declares no ENV_PASS allowlist"
+HOST_COMPILER=$(printf '%s\n' "$CMDSPEC" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
+[ -n "$HOST_COMPILER" ] || fail "command spec does not pin HOST_COMPILER"
+case "$HOST_COMPILER" in /*) : ;; *) fail "HOST_COMPILER must be an absolute path: $HOST_COMPILER" ;; esac
 BUILD_COMMAND_ARGV_JOINED=$(printf '%s ' "${ARGV[@]}" | sed 's/ $//')
+# the pinned host compiler must actually be routed into nvcc by the argv
+CCBIN_OK=0
+for A in "${ARGV[@]}"; do
+  case "$A" in NVCC=*"-ccbin $HOST_COMPILER"*) CCBIN_OK=1 ;; esac
+done
+[ "$CCBIN_OK" -eq 1 ] \
+  || fail "no ARGV element routes -ccbin $HOST_COMPILER into NVCC; the host compiler would be chosen by search"
+# the environment the build will see, built from the allowlist only
+ENVARGS=(); ENV_APPLIED=""
+for N in "${ENV_PASS[@]}"; do
+  case "$N" in
+    [A-Z_]*) : ;;
+    *) fail "ENV_PASS name is not an environment variable name: $N" ;;
+  esac
+  V=$(printenv "$N" || true)
+  ENVARGS+=("$N=$V")
+  ENV_APPLIED="$ENV_APPLIED$N=$V
+"
+done
+ENV_PASS_NAMES=$(printf '%s,' "${ENV_PASS[@]}" | sed 's/,$//')
+ENV_APPLIED_SHA256=$(printf '%s' "$ENV_APPLIED" | sha256sum | cut -d' ' -f1)
 # TARGET_ARCH is derived from the command, not asserted alongside it
 TARGET_ARCH=""
 for A in "${ARGV[@]}"; do case "$A" in ARCH=*) TARGET_ARCH=${A#ARCH=} ;; esac; done
@@ -143,9 +177,15 @@ START_EPOCH=$(date -u +%s)
   echo "### source_commit $SOURCE_COMMIT"
   echo "### record_mode $RECORD_MODE"
   echo "### argv $BUILD_COMMAND_ARGV_JOINED"
+  echo "### env_pass $ENV_PASS_NAMES"
+  echo "### env_applied_sha256 $ENV_APPLIED_SHA256"
   echo "### start $BUILD_START_UTC"; } > "$BUILD_LOG_PATH"
 set +e
-"${ARGV[@]}" >> "$BUILD_LOG_PATH" 2>&1
+# env -i: the build sees ONLY the allowlisted names. Anything that could steer
+# make, nvcc, the header/library search or python imports is absent, not merely
+# unused - MAKEFILES, MAKEFLAGS, GNUMAKEFLAGS, MFLAGS, NVCC_CCBIN, CPATH,
+# CPLUS_INCLUDE_PATH, LIBRARY_PATH, LD_LIBRARY_PATH, PYTHONPATH included.
+env -i "${ENVARGS[@]}" "${ARGV[@]}" >> "$BUILD_LOG_PATH" 2>&1
 BUILD_EXIT_CODE=$?
 set -e
 BUILD_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -172,7 +212,7 @@ for P in "${PROBES[@]}"; do
   [ -n "$LABEL" ] && [ "${#PARGV[@]}" -gt 0 ] || fail "malformed PROBE entry: $P"
   echo "### probe $LABEL: ${PARGV[*]}" >> "$PROBE_LOG_PATH"
   set +e
-  POUT=$("${PARGV[@]}" 2>&1); PRC=$?
+  POUT=$(env -i "${ENVARGS[@]}" "${PARGV[@]}" 2>&1); PRC=$?
   set -e
   printf '%s\n' "$POUT" >> "$PROBE_LOG_PATH"
   [ "$PRC" -eq 0 ] \
@@ -184,23 +224,32 @@ probe_line() { # label lineno
 }
 MEASURED_NVCC_VERSION=$(printf '%s\n' "${PROBE_OUT[nvcc]:-}" | grep -m1 'release' | tr -s ' ' | sed 's/^ //')
 [ -n "$MEASURED_NVCC_VERSION" ] || MEASURED_NVCC_VERSION=$(probe_line nvcc 1)
-MEASURED_HOST_COMPILER_VERSION=$(probe_line cc 1)
+MEASURED_HOST_COMPILER_VERSION=$(probe_line hostcc 1)
 MEASURED_PYTHON_VERSION=$(probe_line python 1)
 MEASURED_TORCH_VERSION=$(probe_line torch 1)
 MEASURED_CUDA_VERSION=$(probe_line torch 2)
+MEASURED_EXT_SUFFIX=$(probe_line ext_suffix 1)
+# ABI check: a python 3.11 image can compile something and still leave a file
+# named cp312. The OUTPUT basename must match what this interpreter reports.
+[ -n "$MEASURED_EXT_SUFFIX" ] || fail "ext_suffix could not be measured"
+EXPECT_BASENAME=_C$MEASURED_EXT_SUFFIX
+[ "$(basename "$OUTPUT_PATH")" = "$EXPECT_BASENAME" ] \
+  || fail "OUTPUT basename $(basename "$OUTPUT_PATH") != _C\$EXT_SUFFIX ($EXPECT_BASENAME) reported by the interpreter"
 for V in MEASURED_NVCC_VERSION MEASURED_HOST_COMPILER_VERSION MEASURED_PYTHON_VERSION \
-         MEASURED_TORCH_VERSION MEASURED_CUDA_VERSION; do
+         MEASURED_TORCH_VERSION MEASURED_CUDA_VERSION MEASURED_EXT_SUFFIX; do
   [ -n "${!V}" ] || fail "$V could not be measured from the probe output; no record is published"
 done
 PROBE_LOG_BYTES=$(stat -c %s "$PROBE_LOG_PATH")
 PROBE_LOG_SHA256=$(sha256sum "$PROBE_LOG_PATH" | cut -d' ' -f1)
 
-TMP=$(mktemp "$(dirname "$OUT")/.buildrecord.XXXXXX")
+OUT=$ARTDIR/build_record.v3
+if [ -e "$OUT" ] || [ -L "$OUT" ]; then fail "record $OUT already exists; evidence is never overwritten"; fi
+TMP=$(mktemp "$ARTDIR/.buildrecord.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 {
-  echo "BUILD_RECORD_SCHEMA=2"
+  echo "BUILD_RECORD_SCHEMA=3"
   echo "RECORD_MODE=$RECORD_MODE"
-  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,tooling,command,output,logs,versions;attested:toolchain_image"
+  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,tooling,command,env,output,logs,versions;declared_unverified:toolchain_image"
   echo "BUILD_START_UTC=$BUILD_START_UTC"
   echo "BUILD_END_UTC=$BUILD_END_UTC"
   echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE"
@@ -218,14 +267,18 @@ trap 'rm -f "$TMP"' EXIT
   echo "BUILD_COMMAND_SPEC_NAME=$BUILD_COMMAND_SPEC_NAME"
   echo "BUILD_COMMAND_SPEC_SHA256=$BUILD_COMMAND_SPEC_SHA256"
   echo "BUILD_COMMAND_ARGV_JOINED=$BUILD_COMMAND_ARGV_JOINED"
-  echo "TOOLCHAIN_IMAGE_ID_ATTESTED=$TOOLCHAIN_IMAGE_ID"
-  echo "TOOLCHAIN_IMAGE_REF_ATTESTED=$TOOLCHAIN_IMAGE_REF"
-  echo "TOOLCHAIN_IMAGE_REPO_DIGESTS_ATTESTED=$TOOLCHAIN_IMAGE_REPO_DIGESTS"
+  echo "TOOLCHAIN_IMAGE_ID_DECLARED_BY_CALLER=$TOOLCHAIN_IMAGE_ID"
+  echo "TOOLCHAIN_IMAGE_REF_DECLARED_BY_CALLER=$TOOLCHAIN_IMAGE_REF"
+  echo "TOOLCHAIN_IMAGE_REPO_DIGESTS_DECLARED_BY_CALLER=$TOOLCHAIN_IMAGE_REPO_DIGESTS"
   echo "MEASURED_CUDA_VERSION=$MEASURED_CUDA_VERSION"
   echo "MEASURED_NVCC_VERSION=$MEASURED_NVCC_VERSION"
   echo "MEASURED_HOST_COMPILER_VERSION=$MEASURED_HOST_COMPILER_VERSION"
   echo "MEASURED_PYTHON_VERSION=$MEASURED_PYTHON_VERSION"
   echo "MEASURED_TORCH_VERSION=$MEASURED_TORCH_VERSION"
+  echo "MEASURED_EXT_SUFFIX=$MEASURED_EXT_SUFFIX"
+  echo "MEASURED_HOST_COMPILER_PATH=$HOST_COMPILER"
+  echo "ENV_PASS_NAMES=$ENV_PASS_NAMES"
+  echo "ENV_APPLIED_SHA256=$ENV_APPLIED_SHA256"
   echo "PROBE_LOG_SHA256=$PROBE_LOG_SHA256"
   echo "PROBE_LOG_BYTES=$PROBE_LOG_BYTES"
   echo "TARGET_ARCH=$TARGET_ARCH"
@@ -238,7 +291,11 @@ trap 'rm -f "$TMP"' EXIT
 chmod 444 "$TMP"
 bash "$REPO/benchmarks/validate_build_record_sm90.sh" "$TMP" --check-mode >/dev/null \
   || fail "generated record failed self-validation (not published)"
-mv -f "$TMP" "$OUT"
+# publish by hard link inside the same directory: link fails if the target
+# exists, so a concurrent or repeated run can never clobber a good record
+ln "$TMP" "$OUT" 2>/dev/null || fail "could not publish record to $OUT (already exists?)"
+rm -f "$TMP"
 trap - EXIT
+echo "BUILD_RECORD_PATH:$OUT"
 echo "BUILD_RECORD_SHA256:$(sha256sum "$OUT" | cut -d' ' -f1)"
 echo "RECORD_MODE:$RECORD_MODE"
