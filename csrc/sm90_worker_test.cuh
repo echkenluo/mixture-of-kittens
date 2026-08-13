@@ -45,20 +45,25 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
         warpgroup::sync(0);
     }
     if (g.staged) {
-        // megakernel epilogue path: half staging -> 8 slices -> full tile
-        __shared__ st_bf<64, 128> d_half;
+        // EXACT mirror of the fused epilogue path (commit 379005f+):
+        // per (h, hn): drain one quadrant into a 64x64 stage, load four
+        // 64x16 slices, place into output columns hn*64 + i2*16.
+        __shared__ st_bf<64, 64> d_stage64;
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            acc.drain_half_to(d_half, h);
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                rt_bf<16, 16> slice;
-                auto stg = d_half.template subtile<64, 16>(int2{0, i});
-                warpgroup::load(slice, stg);
-                auto dst = d_smem.template subtile<64, 16>(int2{h, i});
-                warpgroup::store(dst, slice);
+            for (int hn = 0; hn < 2; ++hn) {
+                acc.drain_quadrant_to(d_stage64, h, hn);
+                #pragma unroll
+                for (int i2 = 0; i2 < 4; ++i2) {
+                    rt_bf<16, 16> slice;
+                    auto stg = d_stage64.template subtile<64, 16>(int2{0, i2});
+                    warpgroup::load(slice, stg);
+                    auto dst = d_smem.template subtile<64, 16>(int2{h, hn * 4 + i2});
+                    warpgroup::store(dst, slice);
+                }
+                warpgroup::sync(0);
             }
-            warpgroup::sync(0);
         }
     } else {
         acc.drain_to(d_smem);
