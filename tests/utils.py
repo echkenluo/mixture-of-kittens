@@ -9,6 +9,9 @@ MXFP8_TOLERANCE = (1.0, 0.1)
 
 
 def shapes(world_size: int) -> tuple[tuple[str, int, int, int, int, int], ...]:
+    import os
+    if os.environ.get("MOK_TEST_MIN") == "1":  # focused fused smoke (SM90 port)
+        return (("All minimums", world_size, 256, 256, 1, 512),)
     return (  # (name, routed experts, hidden dim, intermediate dim, top-k, num local tokens)
         ("Kimi K2.7 Code", 384, 7168, 2048, 8, 7168),
         ("GLM-5.2", 256, 6144, 2048, 8, 7168),
@@ -26,6 +29,10 @@ def shapes(world_size: int) -> tuple[tuple[str, int, int, int, int, int], ...]:
 
 
 def mok_params() -> tuple[tuple[str, int, int, int, int], ...]:
+    import os
+    if os.environ.get("MOK_TEST_MIN") == "1":  # Default + two-consecutive-task case
+        return (("Default", 40, 28, 4096, 131072),
+                ("Minimum minibatch", 40, 28, 256, 131072))
     return (  # (name, forward comm SMs, backward comm SMs, minibatch size, macrobatch size)
         ("Default", 40, 28, 4096, 131072),
         ("Minimum forward comm SMs", 2, 28, 4096, 131072),
@@ -38,6 +45,9 @@ def mok_params() -> tuple[tuple[str, int, int, int, int], ...]:
 
 
 def swiglu_params() -> tuple[tuple[str, float | None], ...]:
+    import os
+    if os.environ.get("MOK_TEST_MIN") == "1":
+        return (("Unclamped SwiGLU", None),)
     return (
         ("Unclamped SwiGLU", None),
         ("Clamped SwiGLU", 4.0),
