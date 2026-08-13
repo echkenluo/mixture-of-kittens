@@ -191,3 +191,9 @@ Registers: 4 x rt_fl<16,64> = 128/thread. Smem: doubles vs quarter config =
 equals the original full-config budget. Epilogue: outer m loop over the
 existing 8-stage loop; stage i uses acc[m][i/4], cols (i%4)*16..+16, store
 coord {2*tile_coord.x + m, EPI*tile_coord.y + i}.
+
+## MILESTONE: quadrant worker VERIFIED (both layouts)
+wgmma_quad passes vs torch.matmul: AB and ABt, K=256/4096, max_rel 0.39%,
+zero_frac 0. Codex P0-2 (quadrant loss) remedied and numerically certified.
+Next: step-B megakernel rewiring (producer loads both halves per stage,
+expect 2x, epilogue stitches quadrants), then honest-harness BF16 matrix.
