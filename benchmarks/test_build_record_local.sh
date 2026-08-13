@@ -454,6 +454,48 @@ set -u
 echo "  E2 rc=$R want=2(an exported shell function shadows PATH lookups)"
 # the record must say the entrypoint is externally unverified
 grep -q '^PROVENANCE_CLASS=.*unverified_external:clean_entrypoint' "$GOODREC"; report E3_record_declares_entrypoint_unverified $?
+# E7: a52f336's own guards ran `printenv` and `declare -Fx | awk`, both of which
+# an exported function shadows. The demonstration is against a52f336: with
+# printenv and awk stubbed out, BASH_ENV is sourced and NO guard fires.
+OLD4=$TMPD/old4
+mkdir -p "$OLD4"
+git -C "$REPO" archive a52f336 benchmarks/build_and_record_sm90.sh 2>/dev/null | tar x -C "$OLD4" || true
+SHADOW='printenv() { :; }; awk() { :; }; declare() { :; }; export -f printenv awk declare; exec bash "$0" "$1" "$2"'
+: > "$TMPD/e7.witness"
+{ echo "echo hijacked >> $TMPD/e7.witness"; } > "$TMPD/e7.bashenv"
+if [ -f "$OLD4/benchmarks/build_and_record_sm90.sh" ]; then
+  set +e
+  OLDOUT=$( cd "$FIX" && BASH_ENV="$TMPD/e7.bashenv" TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" \
+      TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+      bash -c "$SHADOW" "$OLD4/benchmarks/build_and_record_sm90.sh" "$FIX" "$(newart e7old)" 2>&1 )
+  set -u
+  [ -s "$TMPD/e7.witness" ] && ! printf '%s\n' "$OLDOUT" | grep -q 'clean entrypoint'
+  report E7a_old_guard_shadowed_by_functions $?
+  echo "  E7a a52f336: BASH_ENV sourced and neither entrypoint guard fired"
+else
+  report E7a_old_guard_shadowed_by_functions 1
+  echo "  E7a could not extract a52f336 for the comparison"
+fi
+ART=$(newart e7new)
+set +e
+O=$( cd "$FIX" && BASH_ENV="$TMPD/e7.bashenv" TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" \
+     TOOLCHAIN_IMAGE_REF="build:cu130" TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
+     bash -c "$SHADOW" "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+# either finding is a correct refusal; env output order is not specified
+[ "$R" -eq 2 ] \
+  && has1 "$O" '^BUILD_RECORD_FAIL:(BASH_ENV is set; this wrapper must be started from a clean entrypoint \(env -i \.\.\. bash --noprofile --norc\)|exported shell function (printenv|awk|declare) is present; a function shadows PATH lookups and the entrypoint is not clean)$' \
+  && [ ! -f "$ART/build_record.v4" ]; report E7b_new_guard_survives_shadowing $?
+echo "  E7b rc=$R want=2(absolute-path detection cannot be shadowed by a function)"
+ART=$(newart e7src)
+set +e
+O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF="build:cu130" \
+     TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
+     bash -c 'source "$1" "$2" "$3"' bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+[ "$R" -ne 0 ] && has1 "$O" "^BUILD_RECORD_FAIL:this wrapper must be executed, not sourced; a sourcing shell's own functions stay live$" \
+  && [ ! -f "$ART/build_record.v4" ]; report E7c_sourcing_refused $?
+echo "  E7c rc=$R want!=0(ordinary sourcing caught; a spoofed \$0 is not detectable)"
 echo "  E3 the record declares unverified_external:clean_entrypoint"
 # a schema-3 record must be refused outright
 sed 's/^BUILD_RECORD_SCHEMA=4$/BUILD_RECORD_SCHEMA=3/' "$GOODREC" > "$TMPD/rec.schema3"
@@ -644,7 +686,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=46
+EXPECTED=49
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

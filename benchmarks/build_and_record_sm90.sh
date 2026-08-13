@@ -64,6 +64,33 @@ set -euo pipefail
 # yet, so every record carries unverified_external:clean_entrypoint and no
 # record can be promoted to a receipt. The checks below are misuse protection,
 # not an attestation.
+# THIS BLOCK RUNS FIRST, and uses only reserved words, parameter expansion and
+# ABSOLUTE paths. Reserved words ([[, if, case) are parsed rather than looked
+# up, and bash never resolves a function for a name containing a slash, so
+# neither can be shadowed. a52f336 got this wrong: its guards ran `printenv`
+# and `declare -Fx | awk`, and exporting functions named printenv/awk defeated
+# both of them (E7a demonstrates it - BASH_ENV is sourced and no guard fires).
+# Even `export`/`unset` below are ordinary builtins a function can shadow, so
+# the guard has to come before them, not after.
+# Residual, and the reason the record still says the entrypoint is unverified:
+# a caller who shadows `exit` or `echo` degrades this into a diagnostic.
+[[ -x /usr/bin/env && -x /usr/bin/grep ]] \
+  || { echo "BUILD_RECORD_FAIL:/usr/bin/env or /usr/bin/grep is missing; the entrypoint cannot be inspected"; exit 2; }
+# best effort only: a caller that sources this file with $0 spoofed to the
+# script's own path is indistinguishable from an execution here. It catches the
+# ordinary mistake; it is not a proof, which is the whole reason the record
+# declares the entrypoint unverified.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] \
+  || { echo "BUILD_RECORD_FAIL:this wrapper must be executed, not sourced; a sourcing shell's own functions stay live"; exit 2; }
+BAD_ENTRY=$(/usr/bin/env | /usr/bin/grep -m1 -oE '^(BASH_FUNC_[^=%(]*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=?' || true)
+BAD_ENTRY=${BAD_ENTRY%=}
+if [[ -n $BAD_ENTRY ]]; then
+  case $BAD_ENTRY in
+    BASH_FUNC_*) echo "BUILD_RECORD_FAIL:exported shell function ${BAD_ENTRY#BASH_FUNC_} is present; a function shadows PATH lookups and the entrypoint is not clean" ;;
+    *) echo "BUILD_RECORD_FAIL:$BAD_ENTRY is set; this wrapper must be started from a clean entrypoint (env -i ... bash --noprofile --norc)" ;;
+  esac
+  exit 2
+fi
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL \
@@ -74,21 +101,6 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       LIBRARY_PATH LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME \
       PYTHONSTARTUP CC CXX 2>/dev/null || true
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-# fail closed on the entrypoint variables we CAN see, and on exported shell
-# functions, which take precedence over PATH lookups
-# printenv, not ${!V}: SHELLOPTS and BASHOPTS always exist as shell variables
-# in bash, so reading the variable would reject every invocation. What matters
-# is whether the value was INHERITED from the environment.
-for V in BASH_ENV ENV SHELLOPTS BASHOPTS; do
-  if [ -n "$(printenv "$V" || true)" ]; then
-    echo "BUILD_RECORD_FAIL:$V is set; this wrapper must be started from a clean entrypoint (env -i ... bash --noprofile --norc)"
-    exit 2
-  fi
-done
-while IFS= read -r FN; do
-  echo "BUILD_RECORD_FAIL:exported shell function $FN is present; a function shadows PATH lookups and the entrypoint is not clean"
-  exit 2
-done < <(declare -Fx | awk '{print $3}')
 REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}
 : "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (unverified caller declaration)}"
 : "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (unverified caller declaration)}"
