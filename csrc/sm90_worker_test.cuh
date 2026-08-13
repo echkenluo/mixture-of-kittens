@@ -16,7 +16,7 @@ using a_gl = gl<bf16, 1, 1, -1, -1, a_st>;
 using b_gl = gl<bf16, 1, 1, -1, -1, b_st>;
 using d_gl = gl<bf16, 1, 1, -1, -1, d_st>;
 
-struct globals { a_gl A; b_gl B; d_gl D; int k_chunks; };
+struct globals { a_gl A; b_gl B; d_gl D; int k_chunks; int staged; };
 
 template<bool IS_AB>
 __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals g) {
@@ -44,12 +44,30 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
         acc.step(a0, a1, b_smem0, b_smem1, k == 0);
         warpgroup::sync(0);
     }
-    acc.drain_to(d_smem);
+    if (g.staged) {
+        // megakernel epilogue path: half staging -> 8 slices -> full tile
+        __shared__ st_bf<64, 128> d_half;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            acc.drain_half_to(d_half, h);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                rt_bf<16, 16> slice;
+                auto stg = d_half.template subtile<64, 16>(int2{0, i});
+                warpgroup::load(slice, stg);
+                auto dst = d_smem.template subtile<64, 16>(int2{h, i});
+                warpgroup::store(dst, slice);
+            }
+            warpgroup::sync(0);
+        }
+    } else {
+        acc.drain_to(d_smem);
+    }
     warpgroup::sync(0);
     warpgroup::store(g.D, d_smem, {0, 0});
 }
 
-inline at::Tensor entry(at::Tensor A, at::Tensor B, bool is_ab) {
+inline at::Tensor entry(at::Tensor A, at::Tensor B, bool is_ab, bool staged) {
     if (is_ab) { TORCH_CHECK(A.size(0) == 128 && B.size(1) == 128 && A.size(1) == B.size(0)); }
     else       { TORCH_CHECK(A.size(0) == 128 && B.size(0) == 128 && A.size(1) == B.size(1)); }
     TORCH_CHECK(A.size(1) % 64 == 0);
@@ -58,7 +76,7 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B, bool is_ab) {
         a_gl{reinterpret_cast<kittens::bf16*>(A.data_ptr()), nullptr, nullptr, (int)A.size(0), (int)A.size(1)},
         b_gl{reinterpret_cast<kittens::bf16*>(B.data_ptr()), nullptr, nullptr, (int)B.size(0), (int)B.size(1)},
         d_gl{reinterpret_cast<kittens::bf16*>(D.data_ptr()), nullptr, nullptr, 128, 128},
-        (int)(A.size(1) / 64)};
+        (int)(A.size(1) / 64), staged ? 1 : 0};
     constexpr int SMEM = sizeof(a_st) + 2 * sizeof(b_st) + sizeof(d_st) + 1024;
     if (is_ab) {
         cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
