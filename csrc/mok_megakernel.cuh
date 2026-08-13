@@ -1249,7 +1249,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     auto &d_fp8_smem                                  = *reinterpret_cast<mlp_fp8_d_tile *>(&d_bf16_smem[2]);
     auto (&d_sc_smem)[2]                              = *reinterpret_cast<mlp_sc_tile (*)[2]>(reinterpret_cast<uint64_t>(&d_fp8_smem) + sizeof(d_fp8_smem));
     static_assert(config::MLP_NUM_BF16_D_TILES >= 3);
+#if !defined(KITTENS_SM90) // MXFP8 packing invariant; bf16-only SM90 never uses the fp8/sc aliases
     static_assert(sizeof(mlp_fp8_d_tile) + 2 * sizeof(mlp_sc_tile) <= sizeof(mlp_bf16_d_tile));
+#endif
 
     const int col_blocks = ((IS_WGRAD && !USE_ROUTED_MXFP8) || IS_AB) ? b_gmem.cols() / config::MLP_Nb : b_gmem.rows() / config::MLP_Nb;
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
