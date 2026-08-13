@@ -170,3 +170,24 @@ cta_rank -- loads BOTH halves per ring stage (a/b smem slots x2, expect_bytes
 (predicted numeric gate failure at exactly 50% row coverage validates the
 plumbing); step B = full h-loop in producer loads + expect 2x + both-half
 stores.
+
+## Codex R29 urgent review ADOPTED - frozen quadrant table (before any wiring)
+Defects confirmed: (1) h-loop as written was diagonal-only again; (2) hoisted
+wgmma_acc<a_tile,b_tile,128,256> with quarter-config a_tile=st_bf<64,64> is an
+OUT-OF-OBJECT smem read (MCH=2 stacks past the single tile); R29 results void.
+Standalone worker test remains valid (owns real 128x128 operands).
+
+### Frozen SM90 ownership table (per task = 128x128 output, CLUSTER=1)
+Quadrant (m,n), m,n in {0,1}; K-stage = ring slot r; task coords (x,y):
+| q | A smem obj | A TMA coord | B smem obj | B TMA coord | acc | epilogue dest |
+|---|---|---|---|---|---|---|
+| (0,0) | a_smem[r][0] st_bf<64,64> | {2x+0, k} | b_smem[r][0] st_bf<64,64> | {k, 2y+0}/layout var | acc[0][0] rt_fl<16,64> | stages 0-3 rows via {2x+0} |
+| (0,1) | a_smem[r][0] | same | b_smem[r][1] | {k, 2y+1} | acc[0][1] | stages 4-7 rows via {2x+0} |
+| (1,0) | a_smem[r][1] | {2x+1, k} | b_smem[r][0] | same as (0,0) | acc[1][0] | stages 0-3 rows via {2x+1} |
+| (1,1) | a_smem[r][1] | same | b_smem[r][1] | same as (0,1) | acc[1][1] | stages 4-7 rows via {2x+1} |
+Barrier bytes per stage: 2*sizeof(a_tile) + 2*sizeof(b_tile) (two real A
+objects + two real B objects; no subtiles anywhere near wgmma).
+Registers: 4 x rt_fl<16,64> = 128/thread. Smem: doubles vs quarter config =
+equals the original full-config budget. Epilogue: outer m loop over the
+existing 8-stage loop; stage i uses acc[m][i/4], cols (i%4)*16..+16, store
+coord {2*tile_coord.x + m, EPI*tile_coord.y + i}.
