@@ -79,3 +79,24 @@ template<int... Args> struct tensor_allocator {
 };
 } // namespace kittens
 #endif
+
+#if defined(KITTENS_SM90)
+namespace kittens { namespace tma { namespace cluster {
+// SM100 call form carries a trailing dst_mbar_cta; SM90 signature lacks it.
+template<ducks::st::all ST, ducks::gl::all GL, typename COORD>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx,
+        semaphore &bar, uint16_t cluster_mask, int /*dst_mbar_cta*/) {
+    load_async(dst, src, idx, bar, cluster_mask);
+}
+}}} // kittens::tma::cluster
+namespace kittens {
+// SCAFFOLD (numerics-invalid until wgmma rewrite): MMA layer no-ops.
+template<typename... A> __device__ static inline void mm2_ABt(A&&...) {}
+template<typename... A> __device__ static inline void mma2_ABt(A&&...) {}
+template<typename... A> __device__ static inline void mm2_AB(A&&...) {}
+template<typename... A> __device__ static inline void mma2_AB(A&&...) {}
+template<typename... A> __device__ static inline void mm2_AtB(A&&...) {}
+template<typename... A> __device__ static inline void mma2_AtB(A&&...) {}
+template<typename... A> __device__ static inline void load_mxnv_scale_async2(A&&...) {}
+} // namespace kittens
+#endif
