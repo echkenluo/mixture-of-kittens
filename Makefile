@@ -33,8 +33,10 @@ ifeq ($(ARCH),SM103)
 NVCCFLAGS += -DKITTENS_SM103 -gencode arch=compute_103a,code=sm_103a
 else ifeq ($(ARCH),SM100)
 NVCCFLAGS += -DKITTENS_SM100 -gencode arch=compute_100a,code=sm_100a
+else ifeq ($(ARCH),SM90)
+NVCCFLAGS += -DKITTENS_SM90 -gencode arch=compute_90a,code=sm_90a
 else
-$(error Unsupported ARCH '$(ARCH)'; expected SM100 or SM103)
+$(error Unsupported ARCH '$(ARCH)'; expected SM90, SM100 or SM103)
 endif
 
 all: $(OUT)
