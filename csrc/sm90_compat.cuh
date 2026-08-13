@@ -72,6 +72,7 @@ namespace kittens {
 // while the wgmma register rewrite lands. tt ops are no-ops; P2 torchrun
 // tests MUST fail until the real accumulator path replaces this.
 template<typename T, int M, int N> struct tt {
+    uint32_t addr = 0; // scalar for parse of discarded tcgen05.ld asm
     template<typename S> __device__ inline S subtile(int, int = 0) const { return S{}; }
 };
 template<int... Args> struct tensor_allocator {
