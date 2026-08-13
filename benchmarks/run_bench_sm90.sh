@@ -12,6 +12,7 @@ set -uo pipefail
 TAG=${BENCH_TAG:?BENCH_TAG required}
 RUN_ID=${RUN_ID:?RUN_ID required (host launcher generates it)}
 EXPECTED=${EXPECTED_HARNESS_SHA256:?EXPECTED_HARNESS_SHA256 required}
+EXPSO=${EXPECTED_SO_HASH:?EXPECTED_SO_HASH required}
 BENCH_GPUS=${BENCH_GPUS:-0,1,2,3}
 PREFLIGHT_TRIES=${PREFLIGHT_TRIES:-24}
 mkdir -p /mok/runs  # container-owned; host writes only to host-runs/
@@ -53,6 +54,17 @@ if [ "$CLEAR" -ne 1 ]; then
   echo "PREFLIGHT_FAIL:target GPUs still occupied after $PREFLIGHT_TRIES tries" >> "$LOG"; exit 7
 fi
 echo "PREFLIGHT_PASS" >> "$LOG"
+SOLIST=(mok/_C*.so)
+if [ "${#SOLIST[@]}" -ne 1 ] || [ ! -f "${SOLIST[0]}" ]; then
+  echo "SO_GATE_FAIL:need exactly one mok/_C*.so, found ${#SOLIST[@]}" >> "$LOG"; exit 10
+fi
+SOMD5=$(md5sum "${SOLIST[0]}" | cut -d' ' -f1)
+echo "SO_PATH:${SOLIST[0]}" >> "$LOG"
+echo "SO_MD5:$SOMD5" >> "$LOG"
+if [ "$SOMD5" != "$EXPSO" ]; then
+  echo "SO_GATE_FAIL expected=$EXPSO actual=$SOMD5" >> "$LOG"; exit 10
+fi
+echo "SO_GATE_PASS" >> "$LOG"
 export CUDA_VISIBLE_DEVICES="$BENCH_GPUS"
 echo "RUN_START:$(date -u +%F_%T)" >> "$LOG"
 export BENCH_OUTPUT="$JSON"

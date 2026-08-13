@@ -73,6 +73,7 @@ for i in $(seq 1 20); do
   [[ "${N:-0}" =~ ^[0-9]+$ ]] && [ "${N:-0}" -eq 0 ] && break
   sleep 3
 done
+[[ "${N:-1}" =~ ^[0-9]+$ ]] && [ "${N:-1}" -eq 0 ] || { echo "SUITE_SETUP_FAIL:n4 GPU not cleared after holder (N=$N)"; exit 3; }
 
 # --- N5 unwritable host-runs: rc=4 + exact message + NO runner artifacts created
 CID=n5-$SUITE

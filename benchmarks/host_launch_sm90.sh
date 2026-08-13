@@ -29,7 +29,10 @@ side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
 
 EXPECTED=$(sha256sum "$MOKDIR/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" | cut -d' ' -f1)
-ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID" -e EXPECTED_HARNESS_SHA256="$EXPECTED")
+SOG=("$MOKDIR"/mixture-of-kittens/mok/_C*.so)
+{ [ "${#SOG[@]}" -eq 1 ] && [ -f "${SOG[0]}" ]; } || { echo "LAUNCH_VERIFY_FAIL:need exactly one host .so, found ${#SOG[@]}"; exit 7; }
+EXPSO=$(md5sum "${SOG[0]}" | cut -d' ' -f1)
+ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID" -e EXPECTED_HARNESS_SHA256="$EXPECTED" -e EXPECTED_SO_HASH="$EXPSO")
 for v in MOK_SM90_EXPERIMENTAL MOK_FROZEN_COMMIT NUM_LOCAL_TOKENS HIDDEN_DIM \
          INTERMEDIATE_DIM NUM_EXPERTS TOPK MINIBATCH_SIZE MACROBATCH_SIZE \
          BENCH_WARMUP BENCH_TIMEOUT BF16_FWD_COMM_SMS BENCH_GPUS PREFLIGHT_TRIES; do
@@ -40,8 +43,8 @@ docker exec -d "${ENVARGS[@]}" "$CT" bash /mok/mixture-of-kittens/benchmarks/run
 
 for i in $(seq 1 12); do sleep 5; [ -f "$LOG" ] && grep -q "RUN_ID:$RUN_ID" "$LOG" && break; done
 [ -f "$LOG" ] && grep -q "RUN_ID:$RUN_ID" "$LOG" || fail "no run log at exact path $LOG" 7
-if grep -qE "HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY" "$LOG"; then
-  fail "runner gate rejected: $(grep -E 'HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY' "$LOG" | head -1)" 8
+if grep -qE "HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY|SO_GATE_FAIL" "$LOG"; then
+  fail "runner gate rejected: $(grep -E 'HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY|SO_GATE_FAIL' "$LOG" | head -1)" 8
 fi
 
 # --- GPU identity join (container UUIDs -> host indices) ---
