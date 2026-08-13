@@ -27,8 +27,10 @@ ACTUAL=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
   echo "HARNESS_SHA256:$ACTUAL"
   echo "BENCH_GPUS:$BENCH_GPUS"
 } > "$LOG"
-if ! UUIDS=$(nvidia-smi -i "$BENCH_GPUS" --query-gpu=index,uuid --format=csv,noheader 2>&1); then
-  echo "PREFLIGHT_FAIL:nvidia-smi-uuid-query rc=$? out=$UUIDS" >> "$LOG"; exit 7
+UUIDS=$(nvidia-smi -i "$BENCH_GPUS" --query-gpu=index,uuid --format=csv,noheader 2>&1)
+RC_UUID=$?
+if [ "$RC_UUID" -ne 0 ]; then
+  echo "PREFLIGHT_FAIL:nvidia-smi-uuid-query rc=$RC_UUID out=$UUIDS" >> "$LOG"; exit 7
 fi
 echo "TARGET_GPU_UUIDS:${UUIDS//$'\n'/;}" >> "$LOG"
 if [ "$ACTUAL" != "$EXPECTED" ]; then
@@ -37,8 +39,10 @@ fi
 echo "HASH_GATE_PASS" >> "$LOG"
 CLEAR=0
 for i in $(seq 1 "$PREFLIGHT_TRIES"); do
-  if ! APPS=$(nvidia-smi -i "$BENCH_GPUS" --query-compute-apps=pid --format=csv,noheader 2>&1); then
-    echo "PREFLIGHT_FAIL:nvidia-smi-apps-query rc=$? out=$APPS" >> "$LOG"; exit 7
+  APPS=$(nvidia-smi -i "$BENCH_GPUS" --query-compute-apps=pid --format=csv,noheader 2>&1)
+  RC_APPS=$?
+  if [ "$RC_APPS" -ne 0 ]; then
+    echo "PREFLIGHT_FAIL:nvidia-smi-apps-query rc=$RC_APPS out=$APPS" >> "$LOG"; exit 7
   fi
   FOREIGN=$(printf '%s' "$APPS" | grep -c '[0-9]' || true)
   if [ "$FOREIGN" -eq 0 ]; then CLEAR=1; break; fi
