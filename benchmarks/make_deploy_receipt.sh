@@ -31,12 +31,6 @@ DIRTY=$(git status --porcelain -- benchmarks)
 [ -z "$DIRTY" ] || { echo "RECEIPT_FAIL:benchmarks tree not clean vs HEAD (incl. untracked):"; echo "$DIRTY"; exit 2; }
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bash "$DIR/validate_manifest_sm90.sh" "$MREL" >/dev/null || { echo "RECEIPT_FAIL:manifest invalid"; exit 2; }
-if [ "$BINARY_BUILD_COMMIT" != "UNKNOWN" ]; then
-  echo "$BINARY_BUILD_COMMIT" | grep -qE '^[0-9a-f]{40}$' \
-    || { echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT must be full 40-hex or UNKNOWN"; exit 2; }
-  [ "$(git cat-file -t "$BINARY_BUILD_COMMIT" 2>/dev/null)" = "commit" ] \
-    || { echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT not resolvable in this repo"; exit 2; }
-fi
 SRC=$(git rev-parse HEAD)
 MSHA=$(sha256sum "$MREL" | cut -d' ' -f1)
 BLOB=$(git rev-parse "HEAD:$MREL")
@@ -53,11 +47,39 @@ HFILE=$(echo "$HMOD" | tr '.' '/').py
 HSHA=$(sha256sum "$HFILE" | cut -d' ' -f1)
 grep -q "^EXPECTED_HARNESS_SHA256=$HSHA$" "$MREL" || { echo "RECEIPT_FAIL:tree harness sha != manifest EXPECTED_HARNESS_SHA256"; exit 2; }
 SOSHA=$(grep '^EXPECTED_SO_SHA256=' "$MREL" | head -1 | cut -d= -f2)
+# Optional build-record binding (schema 2). When a record is supplied, the
+# commit is DERIVED from it - the operator cannot assert a different one - and
+# the manifest's expected SO must already agree with what was actually built.
+RSCHEMA=1; BRSHA=""
+if [ -n "${BUILD_RECORD:-}" ]; then
+  [ -f "$BUILD_RECORD" ] || { echo "RECEIPT_FAIL:BUILD_RECORD $BUILD_RECORD missing"; exit 2; }
+  bash "$DIR/validate_build_record_sm90.sh" "$BUILD_RECORD" --check-mode >/dev/null \
+    || { echo "RECEIPT_FAIL:BUILD_RECORD failed shared validator"; exit 2; }
+  BRSHA=$(sha256sum "$BUILD_RECORD" | cut -d' ' -f1)
+  REC_COMMIT=$(grep '^SOURCE_COMMIT=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
+  REC_SO=$(grep '^SO_SHA256=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)
+  [ "$REC_SO" = "$SOSHA" ] \
+    || { echo "RECEIPT_FAIL:manifest EXPECTED_SO_SHA256 $SOSHA != build record SO_SHA256 $REC_SO"; exit 2; }
+  if [ "$BINARY_BUILD_COMMIT" != "UNKNOWN" ] && [ "$BINARY_BUILD_COMMIT" != "$REC_COMMIT" ]; then
+    echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT $BINARY_BUILD_COMMIT != build record SOURCE_COMMIT $REC_COMMIT"; exit 2
+  fi
+  BINARY_BUILD_COMMIT=$REC_COMMIT
+  RSCHEMA=2
+fi
+# resolvability is checked AFTER the record binding: when a record is present
+# the commit is derived from it, and a disagreement must be reported as a
+# disagreement rather than as "not resolvable"
+if [ "$BINARY_BUILD_COMMIT" != "UNKNOWN" ]; then
+  echo "$BINARY_BUILD_COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+    || { echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT must be full 40-hex or UNKNOWN"; exit 2; }
+  [ "$(git cat-file -t "$BINARY_BUILD_COMMIT" 2>/dev/null)" = "commit" ] \
+    || { echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT not resolvable in this repo"; exit 2; }
+fi
 OUTDIR=$(dirname "$OUT")
 TMP=$(mktemp "$OUTDIR/.receipt.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 {
-  echo "RECEIPT_SCHEMA=1"
+  echo "RECEIPT_SCHEMA=$RSCHEMA"
   echo "SOURCE_TREE_COMMIT=$SRC"
   echo "HARNESS_COMMIT=$SRC"
   echo "BINARY_BUILD_COMMIT=$BINARY_BUILD_COMMIT"
@@ -69,6 +91,7 @@ trap 'rm -f "$TMP"' EXIT
   echo "IMAGE_ID=$IMAGE_ID"
   echo "IMAGE_REF=$IMAGE_REF"
   echo "IMAGE_REPO_DIGESTS=$IMAGE_REPO_DIGESTS"
+  [ "$RSCHEMA" = "2" ] && echo "BUILD_RECORD_SHA256=$BRSHA"
 } > "$TMP"
 chmod 444 "$TMP"
 # validate BEFORE publishing: a bad receipt must never reach $OUT, and must

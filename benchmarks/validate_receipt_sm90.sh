@@ -18,7 +18,17 @@ if [ "$CHECK_MODE" -eq 1 ]; then
   case "$RMODE" in *[2367]*) echo "RECEIPT_TRUST_FAIL:write bits set ($RMODE)"; exit 14 ;; esac
 fi
 RREQ="RECEIPT_SCHEMA SOURCE_TREE_COMMIT HARNESS_COMMIT BINARY_BUILD_COMMIT MANIFEST_FILE MANIFEST_SHA256 MANIFEST_GIT_BLOB HARNESS_SHA256 SO_SHA256 IMAGE_ID IMAGE_REF IMAGE_REPO_DIGESTS"
-head -1 "$REC" | grep -q '^RECEIPT_SCHEMA=1$' || { echo "RECEIPT_TRUST_FAIL:bad or missing schema version"; exit 14; }
+# schema 1: canary receipt, no build provenance - the contract the tiny9 chain
+#           runs under; semantics frozen, do not extend
+# schema 2: carries BUILD_RECORD_SHA256, binding this receipt to a build record
+#           produced on the build host. A schema-2 receipt asserts provenance,
+#           so BINARY_BUILD_COMMIT=UNKNOWN is a contradiction and is refused.
+RSCHEMA=$(head -1 "$REC" | sed -n 's/^RECEIPT_SCHEMA=//p')
+case "$RSCHEMA" in
+  1) : ;;
+  2) RREQ="$RREQ BUILD_RECORD_SHA256" ;;
+  *) echo "RECEIPT_TRUST_FAIL:bad or missing schema version"; exit 14 ;;
+esac
 for K in $RREQ; do
   N=$(grep -c "^$K=" "$REC" || true)
   [ "$N" -eq 1 ] || { echo "RECEIPT_TRUST_FAIL:key $K count=$N (need exactly 1)"; exit 14; }
@@ -41,6 +51,12 @@ done
 BB=$(rget BINARY_BUILD_COMMIT)
 { echo "$BB" | grep -qE '^[0-9a-f]{40}$' || [ "$BB" = "UNKNOWN" ]; } \
   || { echo "RECEIPT_TRUST_FAIL:BINARY_BUILD_COMMIT not 40-hex or UNKNOWN"; exit 14; }
+if [ "$RSCHEMA" = "2" ]; then
+  rget BUILD_RECORD_SHA256 | grep -qE '^[0-9a-f]{64}$' \
+    || { echo "RECEIPT_TRUST_FAIL:BUILD_RECORD_SHA256 not 64-hex"; exit 14; }
+  [ "$BB" != "UNKNOWN" ] \
+    || { echo "RECEIPT_TRUST_FAIL:schema 2 receipt with BINARY_BUILD_COMMIT=UNKNOWN (a record-bound receipt cannot disclaim its build)"; exit 14; }
+fi
 rget IMAGE_ID | grep -qE '^sha256:[0-9a-f]{64}$' || { echo "RECEIPT_TRUST_FAIL:IMAGE_ID malformed (want sha256:<64-hex>)"; exit 14; }
 # IMAGE_REPO_DIGESTS: literal NONE (local-only image) or a comma-separated
 # list of canonical repo@sha256:<64-hex> entries - a free-form string must

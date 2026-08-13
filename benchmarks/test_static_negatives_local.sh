@@ -195,7 +195,11 @@ rcase R3_empty_val   'sed "s|^IMAGE_REF=.*|IMAGE_REF=|" "$RECF"' 14 '^RECEIPT_TR
 rcase R4_missing_key 'grep -v "^HARNESS_COMMIT=" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:key HARNESS_COMMIT count=0 \(need exactly 1\)$'
 rcase R5_dup_key     'cat "$RECF"; echo "SO_SHA256='"$(H64 0)"'"' 14 '^RECEIPT_TRUST_FAIL:key SO_SHA256 count=2 \(need exactly 1\)$'
 rcase R6_short_commit 'sed "s|^SOURCE_TREE_COMMIT=.*|SOURCE_TREE_COMMIT=abc1234|" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:SOURCE_TREE_COMMIT not 40-hex$'
-rcase R7_bad_schema  'sed "s|^RECEIPT_SCHEMA=1|RECEIPT_SCHEMA=2|" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:bad or missing schema version$'
+# schema 2 is now a real schema (build-record binding), so an unknown version
+# must be used to test the version gate itself
+rcase R7_bad_schema  'sed "s|^RECEIPT_SCHEMA=1|RECEIPT_SCHEMA=3|" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:bad or missing schema version$'
+rcase R9_schema2_without_record 'sed "s|^RECEIPT_SCHEMA=1|RECEIPT_SCHEMA=2|" "$RECF"' 14 \
+  '^RECEIPT_TRUST_FAIL:key BUILD_RECORD_SHA256 count=0 \(need exactly 1\)$'
 rcase R8_bad_digests 'sed "s|^IMAGE_REPO_DIGESTS=.*|IMAGE_REPO_DIGESTS=some-free-form-string|" "$RECF"' 14 \
   '^RECEIPT_TRUST_FAIL:IMAGE_REPO_DIGESTS malformed \(want NONE or repo@sha256:<64-hex> list\)$'
 
@@ -395,7 +399,7 @@ set -u
 echo "  F4_non_ancestor rc=$R want=16"
 
 rm -rf "$TMPD"
-EXPECTED=67
+EXPECTED=68
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "STATIC_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "STATIC_NEGATIVES pass=$PASS fail=$FAIL"
