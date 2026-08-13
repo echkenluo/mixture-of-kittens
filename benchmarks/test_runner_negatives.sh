@@ -114,10 +114,15 @@ echo "  n4 rc=$RC want=10(SO_GATE_FAIL after hash+preflight pass)"
 # ---- expected-receipt gate (the trust anchor) ----
 CID=n5-$SUITE
 # env -u is mandatory: this suite REQUIRES EXPECTED_RECEIPT_SHA256 in its own
-# environment, and a plain child invocation would inherit it - the gate would
-# not fire and the launcher would start a real run instead of being rejected
+# environment, and a plain child invocation inherits it - the gate then never
+# fires and the launcher starts a REAL run instead of rejecting (observed on
+# GPU9 at 20:06:58Z, artifact n5-200526-2163-20260813T200658Z-3052). Every
+# other launcher-influencing variable is cleared too, so a case can never be
+# silently reconfigured by the caller's environment.
 set +e
-O=$(env -u EXPECTED_RECEIPT_SHA256 BENCH_TAG="$CID" bash "$DIR/host_launch_sm90.sh" "$CT" "$MOKDIR" "$MANI" "$RECEIPT" 2>&1); R=$?
+O=$(env -u EXPECTED_RECEIPT_SHA256 -u BENCH_MODE -u PREFLIGHT_TRIES -u BENCH_TIMEOUT \
+      -u BENCH_WAIT_SECS -u CLK_RUN_MIN_MHZ -u LOAD1_DELTA_MAX -u LOAD1_MAX_PRELAUNCH \
+      BENCH_TAG="$CID" bash "$DIR/host_launch_sm90.sh" "$CT" "$MOKDIR" "$MANI" "$RECEIPT" 2>&1); R=$?
 set -u
 [ "$R" -eq 14 ] && has1 "$O" '^RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 env missing or not 64-hex$' && no_json "$CID"; report 5_expected_env_missing $?
 echo "  n5 rc=$R want=14(EXPECTED_RECEIPT_SHA256 env missing)"

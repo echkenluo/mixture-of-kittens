@@ -49,6 +49,12 @@ mkreceipt() { # out manifest_sha [build_commit] [repo_digests]
 RECF=$TMPD/fixture.receipt
 mkreceipt "$RECF" "$MSHA"
 RSHA=$(sha256sum "$RECF" | cut -d' ' -f1)
+# Deliberately reproduce the remote runtime environment: a VALID expected hash
+# is exported for the whole suite. A merely malformed value would be useless
+# here - the gate rejects malformed and absent with the same message, so an
+# inherited-value bug would still look like a pass. With a valid value
+# exported, the 'prior absent' case can only pass if env -u really works.
+export EXPECTED_RECEIPT_SHA256="$RSHA"
 
 # ---- P0: shared validators accept the fixture (proves later failures are
 # caused by the mutation under test, not by a broken fixture) ----
@@ -70,10 +76,14 @@ lcase() { # name expected_sha mode want_rc reason-ERE -- launcher args...
   local O R
   set +e
   if [ "$EXP" = "__UNSET__" ]; then
-    # env -u, never a plain invocation: if the caller's environment happens to
-    # export EXPECTED_RECEIPT_SHA256 the child inherits it, the gate does not
-    # fire, and the launcher proceeds to start a real run
-    O=$(env -u EXPECTED_RECEIPT_SHA256 BENCH_TAG="$NAME" BENCH_MODE="$MODE" bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
+    # env -u, never a plain invocation: this suite deliberately runs with a
+    # VALID EXPECTED_RECEIPT_SHA256 exported (see below), so a plain child
+    # would inherit it, skip the gate and start a real run. Clearing only that
+    # one variable is not enough either - anything that reconfigures the
+    # launcher must be cleared so the case tests what it claims to test.
+    O=$(env -u EXPECTED_RECEIPT_SHA256 -u PREFLIGHT_TRIES -u BENCH_TIMEOUT \
+          -u BENCH_WAIT_SECS -u CLK_RUN_MIN_MHZ -u LOAD1_DELTA_MAX -u LOAD1_MAX_PRELAUNCH \
+          BENCH_TAG="$NAME" BENCH_MODE="$MODE" bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
   else
     O=$(BENCH_TAG="$NAME" BENCH_MODE="$MODE" EXPECTED_RECEIPT_SHA256="$EXP" \
         bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
