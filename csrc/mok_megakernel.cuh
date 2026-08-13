@@ -76,8 +76,12 @@ struct config {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
 #if defined(KITTENS_SM90)
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
+    // explicit stage requirements (codex smem review): each user of extern smem
+    static_assert(DYNAMIC_SHARED_MEMORY >= COMBINE_PIPE_DEPTH * COMBINE_Mb * COMBINE_Nb * 2, "combine token_chunks");
 #else
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
+    // explicit stage requirements (codex smem review): each user of extern smem
+    static_assert(DYNAMIC_SHARED_MEMORY >= COMBINE_PIPE_DEPTH * COMBINE_Mb * COMBINE_Nb * 2, "combine token_chunks");
 #endif
 };
 
@@ -1256,7 +1260,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     auto (&a_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<a_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem));
     auto (&b_smem2)[config::MLP_LOAD_PIPE_DEPTH]      = *reinterpret_cast<b_tile (*)[config::MLP_LOAD_PIPE_DEPTH]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_smem2));
     constexpr uint64_t MOK_AB_TOTAL = 2 * (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH;
-    static_assert(MOK_AB_TOTAL == 2 * (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH);
+    static_assert(MOK_AB_TOTAL + 3 * sizeof(mlp_sc_tile) * config::MLP_LOAD_PIPE_DEPTH
+                  + config::MLP_NUM_BF16_D_TILES * sizeof(mlp_bf16_d_tile) + 2048
+                  <= config::DYNAMIC_SHARED_MEMORY, "gemm ring + scales + d tiles");
 #else
     constexpr uint64_t MOK_AB_TOTAL = (sizeof(a_tile) + sizeof(b_tile)) * config::MLP_LOAD_PIPE_DEPTH;
 #endif
