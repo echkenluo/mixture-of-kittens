@@ -1,43 +1,74 @@
 #!/bin/bash
-# Host-side launcher (tracked, v3). All host observations go to a HOST-OWNED
-# sidecar ($LOG.host); the container-owned run log is never appended from the
-# host (root-owned, appends would fail silently). Hard failures throughout.
-#   - GPU identity: container UUIDs (from the runner log) are joined against
-#     host `nvidia-smi index,uuid` -> auditable container_idx->uuid->host_idx
-#     mapping; no hard-coded host GPU ids
-#   - process shape: full-cmdline classification distinguishes the timeout
-#     wrapper, the single torchrun parent, and exactly four rank workers
-#   - PID attribution: each target GPU UUID must carry exactly one compute
-#     pid, and that pid must be one of THIS run's worker host pids
-# Usage: BENCH_TAG=... [env] bash host_launch_sm90.sh <container> <host_mok_dir>
+# Host-side launcher v4 (tracked). The committed read-only manifest is the
+# SOLE prior for expected hashes and run config - the launcher never derives
+# an expected value at runtime. Flow:
+#   1. manifest schema gate (version, required keys complete/unique, no
+#      unknown keys)                                    -> exit 12 on violation
+#   2. host artifact checks vs manifest (harness sha256, exactly-one .so
+#      sha256)                                          -> exit 13 on drift
+#   3. per-run manifest copy + its sha256 recorded in the host sidecar
+#      BEFORE the runner starts (post-hoc tamper detection)
+#   4. docker exec runner with expecteds + config FROM the manifest
+#   5. launch verification: exact-path log, gates, 1 parent + 4 workers,
+#      lock held, docker-top capture, per-GPU PID attribution verdict
+# Usage: BENCH_TAG=... bash host_launch_sm90.sh <container> <host_mok_dir> <manifest>
 set -uo pipefail
 CT=${1:?container name}
 MOKDIR=${2:?host mok dir}
+MANIFEST=${3:?manifest path (committed, read-only)}
 TAG=${BENCH_TAG:?BENCH_TAG required}
-: "${MOK_FROZEN_COMMIT:?MOK_FROZEN_COMMIT required (non-empty)}"
+
+REQ_KEYS="MANIFEST_SCHEMA FROZEN_COMMIT EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256 BENCH_GPUS TIMING_SEMANTICS tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
+[ -f "$MANIFEST" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MANIFEST"; exit 12; }
+head -1 "$MANIFEST" | grep -q '^MANIFEST_SCHEMA=1$' || { echo "MANIFEST_SCHEMA_FAIL:bad or missing schema version"; exit 12; }
+for K in $REQ_KEYS; do
+  N=$(grep -c "^$K=" "$MANIFEST" || true)
+  [ "$N" -eq 1 ] || { echo "MANIFEST_SCHEMA_FAIL:key $K count=$N (need exactly 1)"; exit 12; }
+done
+while IFS= read -r LINE; do
+  [ -z "$LINE" ] && continue
+  K=${LINE%%=*}
+  echo " $REQ_KEYS " | grep -q " $K " || { echo "MANIFEST_SCHEMA_FAIL:unknown key $K"; exit 12; }
+done < "$MANIFEST"
+mget() { grep "^$1=" "$MANIFEST" | head -1 | cut -d= -f2-; }
+EXPECTED=$(mget EXPECTED_HARNESS_SHA256)
+EXPSO=$(mget EXPECTED_SO_SHA256)
+FROZEN=$(mget FROZEN_COMMIT)
+BGPUS=$(mget BENCH_GPUS)
+
+AH=$(sha256sum "$MOKDIR/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" | cut -d' ' -f1)
+[ "$AH" = "$EXPECTED" ] || { echo "HARNESS_DRIFT_FAIL expected=$EXPECTED actual=$AH"; exit 13; }
+SOG=("$MOKDIR"/mixture-of-kittens/mok/_C*.so)
+{ [ "${#SOG[@]}" -eq 1 ] && [ -f "${SOG[0]}" ]; } || { echo "SO_DRIFT_FAIL:need exactly one host .so, found ${#SOG[@]}"; exit 13; }
+ASO=$(sha256sum "${SOG[0]}" | cut -d' ' -f1)
+[ "$ASO" = "$EXPSO" ] || { echo "SO_DRIFT_FAIL expected=$EXPSO actual=$ASO"; exit 13; }
+
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
-SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host  # host-owned dir; container never touches it
+SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host
+MCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.manifest
 mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
 touch "$SIDE" 2>/dev/null
-if [ ! -w "$SIDE" ]; then
-  echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4
-fi
-echo "SIDECAR_START:$(date -u +%F_%T)" > "$SIDE"
-echo "RUN_ID:$RUN_ID" >> "$SIDE"
+[ -w "$SIDE" ] || { echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4; }
 side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
+cp "$MANIFEST" "$MCOPY" || { echo "LAUNCH_VERIFY_FAIL:manifest copy failed"; exit 4; }
+MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
+{ echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
+  echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
+  echo "IMAGE_DIGEST:$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)"; } > "$SIDE"
 
-EXPECTED=$(sha256sum "$MOKDIR/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" | cut -d' ' -f1)
-SOG=("$MOKDIR"/mixture-of-kittens/mok/_C*.so)
-{ [ "${#SOG[@]}" -eq 1 ] && [ -f "${SOG[0]}" ]; } || { echo "LAUNCH_VERIFY_FAIL:need exactly one host .so, found ${#SOG[@]}"; exit 7; }
-EXPSO=$(md5sum "${SOG[0]}" | cut -d' ' -f1)
-ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID" -e EXPECTED_HARNESS_SHA256="$EXPECTED" -e EXPECTED_SO_HASH="$EXPSO")
-for v in MOK_SM90_EXPERIMENTAL MOK_FROZEN_COMMIT NUM_LOCAL_TOKENS HIDDEN_DIM \
-         INTERMEDIATE_DIM NUM_EXPERTS TOPK MINIBATCH_SIZE MACROBATCH_SIZE \
-         BENCH_WARMUP BENCH_TIMEOUT BF16_FWD_COMM_SMS BENCH_GPUS PREFLIGHT_TRIES; do
-  [ -n "${!v:-}" ] && ENVARGS+=(-e "$v=${!v}")
-done
+ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
+         -e EXPECTED_HARNESS_SHA256="$EXPECTED" -e EXPECTED_SO_SHA256="$EXPSO"
+         -e MOK_FROZEN_COMMIT="$FROZEN" -e MOK_SM90_EXPERIMENTAL=1
+         -e BENCH_GPUS="$BGPUS"
+         -e NUM_LOCAL_TOKENS="$(mget tokens_per_rank)" -e HIDDEN_DIM="$(mget hidden)"
+         -e INTERMEDIATE_DIM="$(mget intermediate)" -e NUM_EXPERTS="$(mget experts)"
+         -e TOPK="$(mget topk)" -e MINIBATCH_SIZE="$(mget minibatch)"
+         -e MACROBATCH_SIZE="$(mget macrobatch)" -e BENCH_WARMUP="$(mget warmup_iters)"
+         -e BF16_FWD_COMM_SMS="$(mget comm_sms)")
+[ -n "${PREFLIGHT_TRIES:-}" ] && ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES")
+[ -n "${BENCH_TIMEOUT:-}" ] && ENVARGS+=(-e BENCH_TIMEOUT="$BENCH_TIMEOUT")
 docker exec -d "${ENVARGS[@]}" "$CT" bash /mok/mixture-of-kittens/benchmarks/run_bench_sm90.sh \
   || fail "docker exec failed" 7
 
@@ -46,8 +77,6 @@ for i in $(seq 1 12); do sleep 5; [ -f "$LOG" ] && grep -q "RUN_ID:$RUN_ID" "$LO
 if grep -qE "HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY|SO_GATE_FAIL" "$LOG"; then
   fail "runner gate rejected: $(grep -E 'HASH_GATE_FAIL|PREFLIGHT_FAIL|LOCK_BUSY|SO_GATE_FAIL' "$LOG" | head -1)" 8
 fi
-
-# --- GPU identity join (container UUIDs -> host indices) ---
 CUUIDS=$(grep '^TARGET_GPU_UUIDS:' "$LOG" | head -1 | cut -d: -f2- | tr ';' '\n' | awk -F', ' '{print $1","$2}')
 [ -n "$CUUIDS" ] || fail "no TARGET_GPU_UUIDS in runner log" 6
 HOSTMAP=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
@@ -63,8 +92,6 @@ while IFS=, read -r CIDX UUID; do
 done <<< "$CUUIDS"
 NT=$(echo $TUUIDS | wc -w)
 [ "$NT" -eq 4 ] || fail "expected 4 target GPUs, mapped $NT" 6
-
-# --- process shape (full-cmdline classification) ---
 WOK=0
 for i in $(seq 1 12); do
   PSOUT=$(docker exec "$CT" ps -eo pid,args 2>/dev/null | grep "benchmarks.bench_sm90_fwd" | grep -v grep || true)
@@ -78,8 +105,7 @@ side "PROC_SHAPE:timeout=$NTIMEOUT parent=$NPARENT workers=$NWORK"
 [ "$WOK" -eq 1 ] || fail "process shape wrong: parent=$NPARENT workers=$NWORK (want 1/4)" 6
 docker exec "$CT" sh -c "flock -n /mok/build.lock true" 2>/dev/null && fail "build lock not held" 6
 grep -q "RUN_START" "$LOG" || fail "no RUN_START in run log" 6
-
-# --- PID attribution: exactly one of THIS run's workers per target GPU ---
+side "HOST_TOP_CAPTURE:$(date -u +%F_%T)"
 TOPOUT=$(docker top "$CT" -eo pid,args 2>/dev/null | grep "benchmarks.bench_sm90_fwd" | grep -v "torch.distributed.run" | awk '$2!="timeout"' || true)
 WPIDS=$(printf '%s\n' "$TOPOUT" | awk '{print $1}' | sort -n | uniq)
 NW=$(echo $WPIDS | wc -w)
@@ -102,4 +128,4 @@ done
 side "PID_ATTRIBUTION_$ATTR"
 side "NVML_UUID_PID_PAIRS:$(printf '%s' "$PAIRS" | grep -f <(echo $TUUIDS | tr ' ' '\n') | tr '\n' ';')"
 [ "$ATTR" = PASS ] || fail "per-GPU worker attribution failed" 5
-echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE parent=1 workers=4 pid_attribution=PASS"
+echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE manifest_sha=$MSHA pid_attribution=PASS"

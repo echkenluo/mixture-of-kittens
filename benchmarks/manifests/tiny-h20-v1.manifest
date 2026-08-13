@@ -1,0 +1,17 @@
+MANIFEST_SCHEMA=1
+FROZEN_COMMIT=6df8bb7
+EXPECTED_SO_SHA256=42a35950930e56a1f45e019ae6b9bbdafce8e7ed4332229d8cbdc54e669d8143
+EXPECTED_HARNESS_SHA256=c39fddbaa23ba4554369379b8c91ae16e6c1b96a11d39eb9418112e7c3097b5e
+BENCH_GPUS=0,1,2,3
+TIMING_SEMANTICS=build_schedule+forward.v2
+tokens_per_rank=512
+hidden=256
+intermediate=256
+experts=4
+topk=1
+world_size=4
+comm_sms=24
+minibatch=256
+macrobatch=4096
+warmup_iters=20
+timed_iters=100

@@ -64,12 +64,12 @@ def _provenance():
     with open(os.path.abspath(__file__), "rb") as f:
         prov["harness_sha256"] = hashlib.sha256(f.read()).hexdigest()
     so = sorted(glob.glob(os.path.join(repo, "mok", "_C*.so")))
-    if so:
+    if len(so) == 1:
         with open(so[0], "rb") as f:
-            prov["so_md5"] = hashlib.md5(f.read()).hexdigest()
+            prov["so_sha256"] = hashlib.sha256(f.read()).hexdigest()
         prov["so_path"] = so[0]
     else:
-        prov["so_md5"] = "missing (metadata_invalid)"
+        prov["so_sha256"] = f"invalid ({len(so)} .so files, metadata_invalid)"
     return prov
 
 
@@ -83,6 +83,11 @@ def gpu_snapshot():
                            capture_output=True, text=True, timeout=15)
         out[key] = r.stdout.strip().splitlines()
     return out
+
+
+def _loadavg():
+    with open("/proc/loadavg") as f:
+        return f.read().strip()
 
 
 def main() -> None:
@@ -109,6 +114,8 @@ def main() -> None:
         config, dist.group.WORLD, device=x.device,
         num_local_tokens=x.shape[0], hidden_size=x.shape[1],
         topk=topk_experts.shape[1])
+    torch.cuda.synchronize()
+    t_setup_end = time.time()
 
     def run_fwd():
         schedule = functional.build_schedule(
@@ -141,12 +148,15 @@ def main() -> None:
             f"abs_max={abs_max:.6f} relative={relative:.6f} vs tolerance "
             f"(abs={absolute_tolerance}, rel={relative_tolerance})")
     del ref_out, out
-    init_wall_s = time.time() - wall0
+    t_correct_end = time.time()
     snap_start = gpu_snapshot() if rank == 0 else None
+    load_start = _loadavg()
 
-    # --- warmup (untimed) ---
+    # --- warmup incl. JIT (untimed) ---
     for _ in range(WARMUP):
         run_fwd()
+    torch.cuda.synchronize()
+    t_warmup_end = time.time()
 
     # --- timed region ---
     events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -159,6 +169,7 @@ def main() -> None:
         end.record()
     torch.cuda.synchronize()
     dist.barrier()
+    t_timed_end = time.time()
 
     # PID namespace note: inside the container /proc/self/status NSpid is a
     # single (container) value - the host PID is NOT visible from here. The
@@ -191,8 +202,17 @@ def main() -> None:
                 "macrobatch": MACROBATCH_SIZE, "input_seed_rank0": 1234,  # fixed in generate_inputs (1234+rank)
                 "warmup_iters": WARMUP, "timed_iters": TIMED_ITERS,
                 "timing_boundary": "build_schedule + forward per iteration; "
-                                   "init and correctness gate excluded (see init_wall_s)",
-                "init_wall_s": round(init_wall_s, 1),
+                                   "setup/correctness/warmup(JIT) phases excluded and "
+                                   "reported separately in wall_phases_s",
+                "wall_phases_s": {
+                    "setup": round(t_setup_end - wall0, 1),
+                    "correctness_gate": round(t_correct_end - t_setup_end, 1),
+                    "warmup_jit": round(t_warmup_end - t_correct_end, 1),
+                    "timed_region": round(t_timed_end - t_warmup_end, 1),
+                    "total": round(t_timed_end - wall0, 1),
+                },
+                "host_loadavg_start": load_start,
+                "host_loadavg_end": _loadavg(),
                 "correctness_gate": {"abs_mean": abs_mean, "abs_max": abs_max,
                                      "relative": relative,
                                      "tolerance_abs_rel": list(BF16_TOLERANCE)},
