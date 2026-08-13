@@ -16,8 +16,8 @@ MOKDIR=${2:?host mok dir}
 TAG=${BENCH_TAG:?BENCH_TAG required}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
-SIDE=$MOKDIR/runs/$TAG-$RUN_ID.host
-mkdir -p "$MOKDIR/runs" 2>/dev/null || true
+SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host  # host-owned dir; container never touches it
+mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
 touch "$SIDE" 2>/dev/null
 if [ ! -w "$SIDE" ]; then
   echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4

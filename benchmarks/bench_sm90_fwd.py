@@ -203,7 +203,9 @@ def main() -> None:
                 "gpu_snapshot_end": gpu_snapshot(),
                 "self_rank_pids_container_ns": sorted(self_pids),
                 "self_nspid_rank0": nspid,
-                "host_pid_mapping": "runner-level docker top capture (see run log)",
+                "host_pid_mapping": "host sidecar in host-runs/ (docker top capture)",
+                "run_id": os.environ.get("RUN_ID", "unset"),
+                "sidecar_basename": f'{os.environ.get("BENCH_TAG", "?")}-{os.environ.get("RUN_ID", "?")}.host',
                 "statistics_semantics": "p50/p95 over 100 per-launch rank-max "
                                         "samples; cross-launch aggregation is "
                                         "computed externally over >=5 launches",
