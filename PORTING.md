@@ -197,3 +197,16 @@ wgmma_quad passes vs torch.matmul: AB and ABt, K=256/4096, max_rel 0.39%,
 zero_frac 0. Codex P0-2 (quadrant loss) remedied and numerically certified.
 Next: step-B megakernel rewiring (producer loads both halves per stage,
 expect 2x, epilogue stitches quadrants), then honest-harness BF16 matrix.
+
+## Codex issue-3 remediation COMPLETE (gates real, proven)
+Public-API fail-fast on SM90: mxfp8_quantize raises before launch (verified
+by real call), fwd_mxfp8/bwd_mxfp8/bwd_bf16 carry _sm90_reject before any
+_C. launch (source-order check). Gate proof: tests/sm90_gate_check.py 5/5.
+The MXFP8 packing static_assert gating is now justified: unsafe paths are
+unreachable from the public API.
+
+## Quadrant worker numerics VERIFIED (R31)
+wgmma_quad passes vs torch.matmul on BOTH layouts: AB & ABt, K=256/4096,
+max_rel 0.39%, zero_frac 0. Next: step-B megakernel rewiring (producer loads
+both a-halves+b-halves per ring stage, expect_bytes 2x(A+B), consumer
+quadrant steps, epilogue drains stitched halves at {2x+h}).
