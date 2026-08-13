@@ -7,7 +7,7 @@
 #   PID_ATTRIBUTION_PASS. Prints VERIFY_PASS or VERIFY_FAIL:<reason>.
 # Usage: verify_run_sm90.sh <mokdir> <tag> <run_id> <expected_sha> <frozen_commit>
 set -uo pipefail
-M=${1:?}; T=${2:?}; R=${3:?}; SHA=${4:?}; FC=${5:?}
+M=${1:?}; T=${2:?}; R=${3:?}; SHA=${4:?}; FC=${5:?}; CT=${6:-}
 LOG=$M/runs/$T-$R.log; JSON=$M/runs/$T-$R.json; SIDE=$M/host-runs/$T-$R.host
 [ -f "$LOG" ] || { echo "VERIFY_FAIL:no log $LOG"; exit 1; }
 grep -q "^RUN_ID:$R$" "$LOG" || { echo "VERIFY_FAIL:log run_id mismatch"; exit 1; }
@@ -43,4 +43,12 @@ for ok, msg in checks:
         print(f"VERIFY_FAIL:{msg}"); sys.exit(1)
 print("VERIFY_JSON_OK")
 PY
+if [ -n "$CT" ]; then
+  REL=0
+  for i in $(seq 1 12); do
+    docker exec "$CT" sh -c 'flock -n /mok/build.lock true' 2>/dev/null && { REL=1; break; }
+    sleep 5
+  done
+  [ "$REL" -eq 1 ] || { echo "VERIFY_FAIL:lock not released after RUN_END"; exit 1; }
+fi
 echo "VERIFY_PASS"
