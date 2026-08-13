@@ -4,6 +4,16 @@ from . import _C
 
 
 @torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
+
+
+def _sm90_reject(op_name: str) -> None:
+    """SM90 port supports only the BF16 forward path; fail fast at the public
+    API for everything else (codex review: env opt-in alone is not a gate)."""
+    import torch
+    if torch.cuda.get_device_capability() == (9, 0):
+        raise NotImplementedError(
+            f"MoK SM90 port: {op_name} is not supported (BF16 forward only)")
+
 def all_gather_top_experts(
     top_experts: torch.Tensor,
     all_gather_top_experts_buffer: torch.Tensor,
@@ -164,6 +174,7 @@ def mxfp8_quantize(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
+    _sm90_reject("mxfp8_quantize")
     """Quantizes BF16 matrices to MXFP8 in normal and/or transposed layouts.
 
     Inputs:
@@ -230,6 +241,7 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     torch.Tensor,
     torch.Tensor,
 ]:
+    _sm90_reject("dispatch_mlp_swiglu_combine_fwd_mxfp8")
     """Runs the fused MXFP8 MoE forward pass.
 
     Inputs:
@@ -585,6 +597,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     torch.Tensor,
     torch.Tensor,
 ]:
+    _sm90_reject("dispatch_mlp_swiglu_combine_bwd_mxfp8")
     """Runs the fused MXFP8 MoE backward pass.
 
     Inputs:
@@ -862,6 +875,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     torch.Tensor,
     torch.Tensor,
 ]:
+    _sm90_reject("dispatch_mlp_swiglu_combine_bwd_bf16")
     """Runs the fused BF16 MoE backward pass.
 
     Inputs:
