@@ -1480,6 +1480,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             #pragma unroll 1
             for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
                 float2 tmp[16];
+                #if defined(KITTENS_SM90)
+                for (int j = 0; j < 16; ++j) tmp[j] = {0.f, 0.f}; // scaffold: tmem drain pending wgmma rewrite
+#else
                 asm volatile(R"(
                     tcgen05.ld.sync.aligned.32x32b.x32.b32
                     {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
@@ -1494,6 +1497,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                       "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
                       "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
                     : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16) + i * 32));
+#endif
                 tensor_load_wait();
                 bf16_2 d_reg[16];
                 #pragma unroll
