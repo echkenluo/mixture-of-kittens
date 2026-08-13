@@ -21,6 +21,12 @@ NAME=mok-sm90-make-v2
 # replaces, and it is recorded verbatim in the env manifest.
 ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV_SET=HOME=@ARTIFACT_HOME@
+# Keep compiler temporaries on the caller-selected artifact filesystem. The
+# H20 build container's overlay can be much smaller than the mounted evidence
+# volume; inheriting /tmp would make disk pressure, not the tracked contract,
+# decide whether nvcc can finish. The wrapper creates and records this exact
+# empty directory after validating that artifact_dir is a real directory.
+ENV_SET=TMPDIR=@ARTIFACT_TMP@
 ENV_SET=PYTHONNOUSERSITE=1
 ENV_SET=PYTHONPATH=
 ENV_SET=LANG=C.UTF-8

@@ -53,6 +53,7 @@ NONCE="nonce-$$-$(date -u +%s)"
   echo 'echo "SAW CPATH=${CPATH:-}"'
   echo 'echo "SAW PATH=${PATH:-}"'
   echo 'echo "SAW HOME=${HOME:-}"'
+  echo 'echo "SAW TMPDIR=${TMPDIR:-}"'
   echo "printf 'built %s\\n' \"$NONCE\" > mok/_Cfixture.so"; } > "$FIX/tools/fake_build.sh"
 chmod +x "$FIX/tools/fake_build.sh"
 { echo "BUILD_INPUT_SPEC=1"; echo "NAME=fixture-inputs-v1"; echo "PATH=Makefile"
@@ -63,7 +64,8 @@ chmod +x "$FIX/tools/fake_build.sh"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
   echo "ARGV=NVCC=/bin/echo -ccbin /bin/echo"
   echo "ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-  echo "ENV_SET=HOME=@ARTIFACT_HOME@"; echo "ENV_SET=PYTHONNOUSERSITE=1"
+  echo "ENV_SET=HOME=@ARTIFACT_HOME@"; echo "ENV_SET=TMPDIR=@ARTIFACT_TMP@"
+  echo "ENV_SET=PYTHONNOUSERSITE=1"
   echo "ENV_SET=PYTHONPATH="; echo "ENV_SET=TEST_EQ=a=b"
   echo "ENV_SET=LANG=C.UTF-8"; echo "TOOLCHAIN_ROOT=/usr"
   echo "ARGV=PYTHON_INCLUDES=-I/usr/include"
@@ -300,17 +302,50 @@ echo "  N7 rc=$R want=2(a probe failed; no record)"
 AD=$TMPD/art.reuse; mkdir -p "$AD"; : > "$AD/build.log"
 set +e
 O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
-     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$AD" "$TMPD/rec.reuse" 2>&1 ); R=$?
+     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$AD" 2>&1 ); R=$?
 set -u
 [ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:build log $AD/build\.log already exists or is not creatable\$"; report N8_log_must_be_exclusive $?
 echo "  N8 rc=$R want=2(build.log already present in the artifact dir)"
 ln -s "$TMPD" "$TMPD/art.symlink"
 set +e
 O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
-     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$TMPD/art.symlink" "$TMPD/rec.artsym" 2>&1 ); R=$?
+     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$TMPD/art.symlink" 2>&1 ); R=$?
 set -u
-[ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:artifact dir $TMPD/art\.symlink is a symlink\$"; report N9_artifact_dir_symlink_refused $?
-echo "  N9 rc=$R want=2(artifact dir is a symlink)"
+[ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:artifact dir $TMPD/art\.symlink is a symlink\$" \
+  && [ ! -e "$TMPD/build_home" ] && [ ! -e "$TMPD/build_tmp" ]; report N9_artifact_dir_symlink_refused $?
+echo "  N9 rc=$R want=2(symlink rejected before any write through it)"
+# A symlink at a run-owned child path must be rejected before either sibling is
+# created. `mkdir -p build_tmp` would otherwise follow it.
+ART=$(newart n21); LINK_TARGET=$TMPD/n21-link-target; mkdir -p "$LINK_TARGET"
+ln -s "$LINK_TARGET" "$ART/build_tmp"
+set +e
+O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
+     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:build TMPDIR path $ART/build_tmp already exists or is a symlink\$" \
+  && [ ! -e "$ART/build_home" ] && [ -z "$(ls -A "$LINK_TARGET")" ]; report N21_internal_symlink_not_followed $?
+echo "  N21 rc=$R want=2(internal TMPDIR symlink rejected before any sibling write)"
+# A missing artifact directory is input error, not permission to create a new
+# evidence location implicitly.
+MISSING_ART=$TMPD/art.missing
+set +e
+O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
+     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$MISSING_ART" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" "^BUILD_RECORD_FAIL:artifact dir $MISSING_ART is not a directory\$" \
+  && [ ! -e "$MISSING_ART" ]; report N19_missing_artifact_dir_not_created $?
+echo "  N19 rc=$R want=2(missing artifact dir remains absent)"
+# The public contract has exactly two arguments. Extra legacy output paths must
+# not be silently ignored, or callers can believe evidence was published where
+# it was not.
+ART=$(newart n20)
+set +e
+O=$( cd "$FIX" && TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 \
+     TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE bash "$FIXWRAP" "$FIX" "$ART" "$TMPD/legacy.record" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:expected exactly 2 arguments: <repo_dir> <artifact_dir>$' \
+  && [ -z "$(ls -A "$ART")" ]; report N20_extra_argument_refused $?
+echo "  N20 rc=$R want=2(extra legacy record path is not ignored)"
 # dirty closure and submodule drift still refused
 touch "$FIX/csrc/untracked.cu"
 set +e
@@ -391,6 +426,11 @@ echo "  P1b new wrapper rc=$R built under the spec's fixed PATH, not the caller'
 [ -d "$ART/build_home" ] && [ -z "$(ls -A "$ART/build_home")" ] \
   && grep -q "^SAW HOME=$ART/build_home\$" "$ART/build.log"; report P1c_home_is_empty_and_owned $?
 echo "  P1c HOME pointed at an empty directory this run created"
+[ -d "$ART/build_tmp" ] && [ -z "$(ls -A "$ART/build_tmp")" ] \
+  && grep -q "^SAW TMPDIR=$ART/build_tmp\$" "$ART/build.log" \
+  && printf '%s' "$(grep '^ENV_MANIFEST_B64=' "$REC" | cut -d= -f2-)" | base64 -d \
+     | grep -qx "TMPDIR=$ART/build_tmp"; report P1d_tmpdir_is_empty_recorded_and_owned $?
+echo "  P1d TMPDIR is an empty recorded directory on the artifact filesystem"
 # a pinned include path the toolchain does not report is refused
 BADPATH=$TMPD/badpath.cmdspec
 { echo "NAME=fixture-badpath"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
@@ -964,7 +1004,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=71
+EXPECTED=75
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

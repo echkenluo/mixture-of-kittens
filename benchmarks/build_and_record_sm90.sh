@@ -101,6 +101,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
       LIBRARY_PATH LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME \
       PYTHONSTARTUP CC CXX 2>/dev/null || true
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+[ "$#" -eq 2 ] \
+  || { echo "BUILD_RECORD_FAIL:expected exactly 2 arguments: <repo_dir> <artifact_dir>"; exit 2; }
 REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}
 : "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (unverified caller declaration)}"
 : "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (unverified caller declaration)}"
@@ -204,12 +206,36 @@ NVCC_PROBE=""
 for P in "${PROBES[@]}"; do case "$P" in nvcc\|*) NVCC_PROBE=${P#nvcc|}; NVCC_PROBE=${NVCC_PROBE%%|*} ;; esac; done
 [ "$NVCC_PROBE" = "$NVCC_CMD" ] \
   || fail "the nvcc probe measures $NVCC_PROBE but the command runs $NVCC_CMD"
+# Validate and canonicalise the artifact directory BEFORE the first write.
+# The previous order ran `mkdir -p "$ARTDIR/build_home"` first: a missing
+# artifact directory was silently created, and a symlink was followed and
+# written through before the later symlink check rejected it.
+[ -d "$ARTDIR" ] || fail "artifact dir $ARTDIR is not a directory"
+if [ -L "$ARTDIR" ]; then fail "artifact dir $ARTDIR is a symlink"; fi
+ARTDIR=$(cd "$ARTDIR" && pwd -P)
 # the environment the build will see: FIXED VALUES from the tracked spec, with
-# nothing taken from the caller. HOME points at an empty directory this run
-# creates, so tool/user configuration cannot reach the build either.
+# nothing taken from the caller. HOME and TMPDIR point at empty directories
+# this run creates on the already-validated artifact filesystem.
 BUILD_HOME=$ARTDIR/build_home
-mkdir -p "$BUILD_HOME" || fail "cannot create the build HOME under the artifact dir"
+BUILD_TMP=$ARTDIR/build_tmp
+BUILD_LOG_PATH=$ARTDIR/build.log
+PROBE_LOG_PATH=$ARTDIR/probe.log
+# Preflight every run-owned path before the first write. In particular,
+# `mkdir -p` follows a pre-planted build_home/build_tmp symlink. Requiring the
+# paths to be absent and using plain mkdir keeps an internal symlink from
+# redirecting compiler configuration or temporaries outside the evidence dir.
+[ ! -e "$BUILD_HOME" ] && [ ! -L "$BUILD_HOME" ] \
+  || fail "build HOME path $BUILD_HOME already exists or is a symlink"
+[ ! -e "$BUILD_TMP" ] && [ ! -L "$BUILD_TMP" ] \
+  || fail "build TMPDIR path $BUILD_TMP already exists or is a symlink"
+[ ! -e "$BUILD_LOG_PATH" ] && [ ! -L "$BUILD_LOG_PATH" ] \
+  || fail "build log $BUILD_LOG_PATH already exists or is not creatable"
+[ ! -e "$PROBE_LOG_PATH" ] && [ ! -L "$PROBE_LOG_PATH" ] \
+  || fail "probe log $PROBE_LOG_PATH already exists or is not creatable"
+mkdir "$BUILD_HOME" "$BUILD_TMP" \
+  || fail "cannot create build HOME/TMPDIR under the artifact dir"
 [ -z "$(ls -A "$BUILD_HOME" 2>/dev/null)" ] || fail "build HOME $BUILD_HOME is not empty"
+[ -z "$(ls -A "$BUILD_TMP" 2>/dev/null)" ] || fail "build TMPDIR $BUILD_TMP is not empty"
 # Defence in depth - the helper already refused a malformed spec, but this
 # wrapper is what actually builds the environment. `[A-Z_]*=*` only constrained
 # the FIRST character, so A-B=x, "A B=x" and A$=x all passed and became real
@@ -224,6 +250,7 @@ for E in "${ENV_SET[@]}"; do
   case "$ENVSEEN" in *" $EN "*) fail "ENV_SET defines $EN more than once" ;; esac
   ENVSEEN="$ENVSEEN $EN "
   E=${E//@ARTIFACT_HOME@/$BUILD_HOME}
+  E=${E//@ARTIFACT_TMP@/$BUILD_TMP}
   ENVARGS+=("$E")
 done
 # no trailing newline: a command substitution strips one, so the validator
@@ -245,12 +272,7 @@ OUTDIR_ABS=$(cd "$(dirname "$OUTPUT_PATH")" 2>/dev/null && pwd -P) \
   || fail "OUTPUT directory $(dirname "$OUTPUT_PATH") does not exist in the repo"
 case "$OUTDIR_ABS/" in "$REPO"/*) : ;; *) fail "OUTPUT resolves outside the repository: $OUTDIR_ABS" ;; esac
 if [ -L "$OUTPUT_PATH" ]; then fail "OUTPUT $OUTPUT_PATH is a symlink; refusing to follow it"; fi
-# --- artifact dir: real directory inside which logs are created exclusively ---
-[ -d "$ARTDIR" ] || fail "artifact dir $ARTDIR is not a directory"
-if [ -L "$ARTDIR" ]; then fail "artifact dir $ARTDIR is a symlink"; fi
-ARTDIR=$(cd "$ARTDIR" && pwd -P)
-BUILD_LOG_PATH=$ARTDIR/build.log
-PROBE_LOG_PATH=$ARTDIR/probe.log
+# --- logs are created exclusively inside the validated artifact directory ---
 set -o noclobber
 { : > "$BUILD_LOG_PATH"; } 2>/dev/null || fail "build log $BUILD_LOG_PATH already exists or is not creatable"
 { : > "$PROBE_LOG_PATH"; } 2>/dev/null || fail "probe log $PROBE_LOG_PATH already exists or is not creatable"
