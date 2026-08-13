@@ -3,7 +3,7 @@
 # would need, in one place, so the chain can be reviewed and tested before
 # anything is allowed to depend on it.
 #
-# NOT WIRED INTO THE LAUNCHER YET, ON PURPOSE. host_launch_sm90.sh still
+# NOT WIRED INTO THE LAUNCHER, AND IT CANNOT BE. host_launch_sm90.sh still
 # refuses formal mode unconditionally. Opening formal requires (a) a real new
 # build that produces a record on the build host, and (b) an independent
 # review of this chain at runtime. Until both exist, this script is contract
@@ -23,8 +23,16 @@
 #   6 deployed .so bytes                       == record.SO_SHA256
 #       -> the binary on the target not being the one that was built
 #
-#   any violation -> exit 18 FORMAL_BINDING_FAIL:<why>
-#   all agree     -> exit 0, prints FORMAL_BINDING_PASS:<so_sha256>
+# THERE IS NO FORMAL PASS PATH. Nothing in this chain verifies the container
+# image identity - it is a string the caller handed the wrapper - so a
+# fully-consistent chain still does not establish formal provenance. Emitting
+# FORMAL_BINDING_PASS would invite a future integrator to wire it up on the
+# strength of a check that only proves internal consistency. The success path
+# is therefore LOCAL_BINDING_PASS, and formal is refused unconditionally
+# unless the caller explicitly asks for the local-consistency check only.
+#   any violation             -> exit 18 FORMAL_BINDING_FAIL:<why>
+#   formal requested          -> exit 18, always
+#   LOCAL_BINDING_ONLY=1 + ok -> exit 0, prints LOCAL_BINDING_PASS:<so_sha256>
 # Usage: EXPECTED_RECEIPT_SHA256=... [EXPECTED_BUILD_RECORD_SHA256=...] \
 #          check_formal_binding_sm90.sh <receipt> <record> <manifest> <so_dir>
 set -uo pipefail
@@ -91,4 +99,7 @@ DBYTES=$(stat -c %s "${SOG[0]}")
 DSHA=$(sha256sum "${SOG[0]}" | cut -d' ' -f1)
 [ "$DSHA" = "$(brget SO_SHA256)" ] \
   || fb "deployed so sha256 $DSHA != record SO_SHA256 $(brget SO_SHA256)"
-echo "FORMAL_BINDING_PASS:$DSHA"
+# the last gate: internal consistency is not attestation
+[ "${LOCAL_BINDING_ONLY:-0}" = "1" ] \
+  || fb "trusted toolchain image attestation not implemented (the image identity is a caller declaration); set LOCAL_BINDING_ONLY=1 for a consistency-only check"
+echo "LOCAL_BINDING_PASS:$DSHA"

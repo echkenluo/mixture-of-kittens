@@ -51,6 +51,8 @@ NONCE="nonce-$$-$(date -u +%s)"
   echo 'echo "SAW MAKEFILES=${MAKEFILES:-}"'
   echo 'echo "SAW NVCC_CCBIN=${NVCC_CCBIN:-}"'
   echo 'echo "SAW CPATH=${CPATH:-}"'
+  echo 'echo "SAW PATH=${PATH:-}"'
+  echo 'echo "SAW HOME=${HOME:-}"'
   echo "printf 'built %s\\n' \"$NONCE\" > mok/_Cfixture.so"; } > "$FIX/tools/fake_build.sh"
 chmod +x "$FIX/tools/fake_build.sh"
 { echo "BUILD_INPUT_SPEC=1"; echo "NAME=fixture-inputs-v1"; echo "PATH=Makefile"
@@ -60,12 +62,20 @@ chmod +x "$FIX/tools/fake_build.sh"
   echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
   echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
-  echo "ENV_PASS=PATH"; echo "ENV_PASS=HOME"
+  echo "ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  echo "ENV_SET=HOME=@ARTIFACT_HOME@"; echo "ENV_SET=PYTHONNOUSERSITE=1"
+  echo "ENV_SET=LANG=C.UTF-8"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"
   echo "PROBE=nvcc|printf|release 13.0, V13.0.88"
   echo "PROBE=hostcc|/bin/echo|(fixture host compiler) 12.3.0"
   echo "PROBE=python|printf|Python 3.12.3"
   echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"
-  echo "PROBE=ext_suffix|printf|fixture.so"; } > "$FIX/benchmarks/build_command_spec.v1"
+  echo "PROBE=ext_suffix|printf|fixture.so"
+  echo "PROBE=py_include|printf|-I/usr/include"
+  echo "PROBE=torch_include|printf|-I/usr/include"
+  echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$FIX/benchmarks/build_command_spec.v1"
 for T in build_and_record_sm90.sh compute_build_inputs_sm90.sh validate_build_record_sm90.sh; do
   cp "$DIR/$T" "$FIX/benchmarks/$T"
 done
@@ -166,7 +176,7 @@ RECSHA=$(sha256sum "$REC_OK" 2>/dev/null | cut -d' ' -f1)
 echo "  N1 rc=$R want=0(production record published)"
 grep -q "$NONCE" "$FIX/mok/_Cfixture.so" 2>/dev/null \
   && [ "$(grep '^SO_SHA256=' "$REC_OK" | cut -d= -f2)" = "$(sha256sum "$FIX/mok/_Cfixture.so" | cut -d' ' -f1)" ] \
-  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC_OK" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo" ] \
+  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC_OK" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo PYTHON_INCLUDES=-I/usr/include PYTORCH_INCLUDES=-I/usr/include PYTORCH_LIBDIR=-L/usr/lib" ] \
   && [ "$(grep '^TARGET_ARCH=' "$REC_OK" | cut -d= -f2)" = "SM90" ]; report N2_argv_and_output_from_tracked_spec $?
 echo "  N2 argv, ARCH and output all come from the tracked command spec"
 GOODSO=$TMPD/built.so; cp "$FIX/mok/_Cfixture.so" "$GOODSO"
@@ -181,7 +191,7 @@ O=$(SRC=/evil.cu NVCC=/evil-nvcc PYTHON=/evil-python THUNDERKITTENS_ROOT=/evil A
 REC=$ART/build_record.v3
 set -u
 [ "$R" -eq 0 ] \
-  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo" ] \
+  && [ "$(grep '^BUILD_COMMAND_ARGV_JOINED=' "$REC" | cut -d= -f2-)" = "bash tools/fake_build.sh ARCH=SM90 NVCC=nvcc -ccbin /bin/echo PYTHON_INCLUDES=-I/usr/include PYTORCH_INCLUDES=-I/usr/include PYTORCH_LIBDIR=-L/usr/lib" ] \
   && [ "$(grep '^TARGET_ARCH=' "$REC" | cut -d= -f2)" = "SM90" ] \
   && [ ! -f /tmp/escaped.so ]; report N3_make_vars_not_injectable $?
 echo "  N3 rc=$R SRC/NVCC/PYTHON/TK/ARCH/OUT from the environment changed nothing"
@@ -218,12 +228,23 @@ cp "$TMPD/cbi.bak" "$FIX/benchmarks/compute_build_inputs_sm90.sh"
 echo "  N4 rc=$R want=2(helper modified in the worktree)"
 # fixture mode is labelled and isolated
 FIXCMD=$TMPD/fixture.cmdspec
-{ echo "NAME=fixture-arbitrary"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
+{ echo "NAME=fixture-arbitrary"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
   echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
   echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc 12.3.0"
   echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0+cu130\\n13.0\\n"
-  echo "PROBE=ext_suffix|printf|fixture.so"; } > "$FIXCMD"
+  echo "PROBE=ext_suffix|printf|fixture.so"
+  echo "PROBE=py_include|printf|-I/usr/include"; echo "PROBE=torch_include|printf|-I/usr/include"
+  echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$FIXCMD"
 set +e
 ART=$(newart n5); FIXREC=$ART/build_record.v3
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$FIXCMD" \
@@ -235,11 +256,16 @@ set -u
 echo "  N5 rc=$R want=0(fixture record carries RECORD_MODE=fixture)"
 # output symlink
 SYMCMD=$TMPD/sym.cmdspec
-{ echo "NAME=fixture-symlink"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
+{ echo "NAME=fixture-symlink"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"; echo "ENV_PASS=PATH"
   echo "ARGV=bash"; echo "ARGV=-c"; echo "ARGV=ln -s $TMPD/old_prebuilt.so mok/_Cfixture.so"
   echo "ARGV=ARCH=SM90"; echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
   echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc"; echo "PROBE=python|printf|Python 3"
-  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"; } > "$SYMCMD"
+  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"
+  echo "PROBE=py_include|printf|-I/usr/include"; echo "PROBE=torch_include|printf|-I/usr/include"
+  echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$SYMCMD"
 ART6=$(newart n6); SYMREC=$ART6/build_record.v3
 set +e
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$SYMCMD" \
@@ -252,11 +278,16 @@ rm -f "$FIX/mok/_Cfixture.so"
 echo "  N6 rc=$R want=2(output created as a symlink to an old binary)"
 # probe failure
 BADPROBE=$TMPD/badprobe.cmdspec
-{ echo "NAME=fixture-badprobe"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"
+{ echo "NAME=fixture-badprobe"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"
+  echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"; echo "ENV_PASS=PATH"
   echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
   echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
   echo "PROBE=nvcc|false"; echo "PROBE=hostcc|/bin/echo|gcc"; echo "PROBE=python|printf|Python 3"
-  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"; } > "$BADPROBE"
+  echo "PROBE=torch|printf|2.11.0\\n13.0\\n"; echo "PROBE=ext_suffix|printf|fixture.so"
+  echo "PROBE=py_include|printf|-I/usr/include"; echo "PROBE=torch_include|printf|-I/usr/include"
+  echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$BADPROBE"
 ART7=$(newart n7); PROBEREC=$ART7/build_record.v3
 set +e
 O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$BADPROBE" \
@@ -302,6 +333,84 @@ set -u
 [ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:submodule third_party/tk drifted or uninitialized:$'; report N11_submodule_drift $?
 echo "  N11 rc=$R want=2(submodule off its recorded gitlink)"
 ( cd "$FIX" && $GIT submodule update -q --checkout --force third_party/tk ) >/dev/null 2>&1
+
+# ---------- P: PATH hijack, the bypass ENV_PASS left open ----------
+# A fake `make` earlier in PATH is enough: the old design forwarded the
+# CALLER's PATH into the build, so the command resolved to the attacker's
+# binary while the record still said production and stayed internally green.
+OLD2=$TMPD/old2
+mkdir -p "$OLD2"
+git -C "$REPO" archive 013d927 benchmarks 2>/dev/null | tar x -C "$OLD2" || true
+OLD2WRAP=$OLD2/benchmarks/build_and_record_sm90.sh
+FAKEBIN=$TMPD/fakebin
+mkdir -p "$FAKEBIN"
+{ echo '#!/bin/bash'; echo 'echo "fake make running"'
+  echo "cp $TMPD/old_prebuilt.so mok/_Cfixture.so"; } > "$FAKEBIN/make"
+chmod +x "$FAKEBIN/make"
+if [ -f "$OLD2WRAP" ]; then
+  FIXOLD=$TMPD/buildhost_old
+  cp -r "$FIX" "$FIXOLD" 2>/dev/null
+  rm -rf "$FIXOLD/.git"
+  cp "$OLD2/benchmarks/build_and_record_sm90.sh" "$OLD2/benchmarks/compute_build_inputs_sm90.sh" \
+     "$OLD2/benchmarks/validate_build_record_sm90.sh" "$FIXOLD/benchmarks/" 2>/dev/null
+  { echo "BUILD_COMMAND_SPEC=1"; echo "NAME=old-style"; echo "OUTPUT=mok/_Cfixture.so"
+    echo "HOST_COMPILER=/bin/echo"; echo "ENV_PASS=PATH"; echo "ENV_PASS=HOME"
+    echo "ARGV=make"; echo "ARGV=ARCH=SM90"; echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+    echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc"
+    echo "PROBE=python|printf|Python 3.12.3"; echo "PROBE=torch|printf|2.11.0\\n13.0\\n"
+    echo "PROBE=ext_suffix|printf|fixture.so"; } > "$FIXOLD/benchmarks/build_command_spec.v1"
+  rm -rf "$FIXOLD/third_party"
+  { echo "BUILD_INPUT_SPEC=1"; echo "NAME=old-inputs"; echo "PATH=Makefile"; echo "PATH=csrc"; } \
+    > "$FIXOLD/benchmarks/build_input_spec.v1"
+  ( cd "$FIXOLD" && $GIT init -q && $GIT add -A && $GIT commit -qm old ) >/dev/null 2>&1
+  OLDART2=$TMPD/art.oldpath; mkdir -p "$OLDART2"
+  set +e
+  OLDOUT=$( cd "$FIXOLD" && PATH="$FAKEBIN:$PATH" TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" \
+      TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+      bash "$FIXOLD/benchmarks/build_and_record_sm90.sh" "$FIXOLD" "$OLDART2" 2>&1 ); OLDRC=$?
+  set -u
+  STALESHA=$(sha256sum "$TMPD/old_prebuilt.so" | cut -d' ' -f1)
+  [ "$OLDRC" -eq 0 ] && grep -q "^SO_SHA256=$STALESHA\$" "$OLDART2/build_record.v3" 2>/dev/null \
+    && grep -q '^RECORD_MODE=production$' "$OLDART2/build_record.v3" 2>/dev/null; report P1a_old_path_hijack_succeeded $?
+  echo "  P1a old wrapper rc=$OLDRC produced a PRODUCTION record whose SO is the attacker's file"
+else
+  report P1a_old_path_hijack_succeeded 1
+  echo "  P1a could not extract 013d927 for the comparison"
+fi
+ART=$(newart p1new)
+set +e
+O=$( cd "$FIX" && PATH="$FAKEBIN:$PATH" TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" \
+    TOOLCHAIN_IMAGE_REF="build:cu130" TOOLCHAIN_IMAGE_REPO_DIGESTS="registry.local/build@sha256:$(H64 3)" \
+    bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+REC=$ART/build_record.v3
+NEWSO=$(grep '^SO_SHA256=' "$REC" 2>/dev/null | cut -d= -f2)
+[ "$R" -eq 0 ] && [ "$NEWSO" != "$(sha256sum "$TMPD/old_prebuilt.so" | cut -d' ' -f1)" ] \
+  && grep -q '^SAW PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin$' "$ART/build.log"; report P1b_new_path_is_fixed $?
+echo "  P1b new wrapper rc=$R built under the spec's fixed PATH, not the caller's"
+[ -d "$ART/build_home" ] && [ -z "$(ls -A "$ART/build_home")" ] \
+  && grep -q "^SAW HOME=$ART/build_home\$" "$ART/build.log"; report P1c_home_is_empty_and_owned $?
+echo "  P1c HOME pointed at an empty directory this run created"
+# a pinned include path the toolchain does not report is refused
+BADPATH=$TMPD/badpath.cmdspec
+{ echo "NAME=fixture-badpath"; echo "OUTPUT=mok/_Cfixture.so"; echo "HOST_COMPILER=/bin/echo"
+  echo "ENV_SET=PATH=/usr/bin:/bin"; echo "TOOLCHAIN_ROOT=/usr"
+  echo "ARGV=bash"; echo "ARGV=tools/fake_build.sh"; echo "ARGV=ARCH=SM90"
+  echo "ARGV=NVCC=nvcc -ccbin /bin/echo"
+  echo "ARGV=PYTHON_INCLUDES=-I/usr/include/python-does-not-exist"
+  echo "ARGV=PYTORCH_INCLUDES=-I/usr/include"; echo "ARGV=PYTORCH_LIBDIR=-L/usr/lib"
+  echo "PROBE=nvcc|printf|release 13.0"; echo "PROBE=hostcc|/bin/echo|gcc"
+  echo "PROBE=python|printf|Python 3"; echo "PROBE=torch|printf|2.11.0\\n13.0\\n"
+  echo "PROBE=ext_suffix|printf|fixture.so"; echo "PROBE=py_include|printf|-I/usr/include"
+  echo "PROBE=torch_include|printf|-I/usr/include"; echo "PROBE=torch_libdir|printf|-L/usr/lib"; } > "$BADPATH"
+ART=$(newart p2); set +e
+O=$( cd "$FIX" && BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC="$BADPATH" \
+     TOOLCHAIN_IMAGE_ID="sha256:$(H64 2)" TOOLCHAIN_IMAGE_REF=b:1 TOOLCHAIN_IMAGE_REPO_DIGESTS=NONE \
+     bash "$FIXWRAP" "$FIX" "$ART" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" '^BUILD_RECORD_FAIL:PYTHON_INCLUDES pinned as \[-I/usr/include/python-does-not-exist\] but the toolchain reports \[-I/usr/include\]$' \
+  && [ ! -f "$ART/build_record.v3" ]; report P2_pinned_path_must_match_toolchain $?
+echo "  P2 rc=$R want=2(pinned include path is not what the toolchain reports)"
 
 # ---------- S: spec strictness (compute helper, from git objects) ----------
 scase() { # name spec-body want-reason-ERE
@@ -379,6 +488,59 @@ O=$(EXPECTED_RECEIPT_SHA256=$(sha256sum "$RCPT2" | cut -d' ' -f1) \
 set -u
 [ "$R" -eq 18 ] && has1 "$O" '^FORMAL_BINDING_FAIL:toolchain image has no repo digest \(NONE\); formal requires registry provenance$'; report F2_none_digest_refused $?
 echo "  F2 rc=$R want=18(NONE repo digest cannot satisfy formal)"
+# THE dangerous branch: a production record, a non-NONE digest and a fully
+# consistent chain. Everything internal agrees - and it must STILL be refused,
+# because nothing verified the image identity. Without this case the suite
+# would only ever have exercised fixture/NONE rejections.
+PRODREC=$GOODREC
+PSO=$(grep '^SO_SHA256=' "$PRODREC" | cut -d= -f2)
+PMAN=$TMPD/prod.manifest
+sed -e "s|^EXPECTED_SO_SHA256=.*|EXPECTED_SO_SHA256=$PSO|" "$DIR/manifests/tiny-h20-v1.manifest" > "$PMAN"
+PRCPT=$TMPD/prod.receipt
+{ echo "RECEIPT_SCHEMA=2"; echo "SOURCE_TREE_COMMIT=$(H40 0)"; echo "HARNESS_COMMIT=$(H40 0)"
+  echo "BINARY_BUILD_COMMIT=$(grep '^SOURCE_COMMIT=' "$PRODREC" | cut -d= -f2)"
+  echo "MANIFEST_FILE=prod.manifest"; echo "MANIFEST_SHA256=$(sha256sum "$PMAN" | cut -d' ' -f1)"
+  echo "MANIFEST_GIT_BLOB=$(H40 0)"
+  echo "HARNESS_SHA256=$(grep '^EXPECTED_HARNESS_SHA256=' "$PMAN" | cut -d= -f2)"
+  echo "SO_SHA256=$PSO"; echo "IMAGE_ID=sha256:$(H64 1)"; echo "IMAGE_REF=x:1"
+  echo "IMAGE_REPO_DIGESTS=registry.local/mok@sha256:$(H64 9)"
+  echo "BUILD_RECORD_SHA256=$(sha256sum "$PRODREC" | cut -d' ' -f1)"; } > "$PRCPT"
+chmod 444 "$PRCPT"
+PSODIR=$TMPD/prod_deployed; mkdir -p "$PSODIR"; cp "$GOODSO" "$PSODIR/_Cfixture.so"
+set +e
+O=$(EXPECTED_RECEIPT_SHA256=$(sha256sum "$PRCPT" | cut -d' ' -f1) \
+    bash "$BIND" "$PRCPT" "$PRODREC" "$PMAN" "$PSODIR" 2>&1); R=$?
+set -u
+[ "$R" -eq 18 ] && has1 "$O" '^FORMAL_BINDING_FAIL:trusted toolchain image attestation not implemented' \
+  && [ "$(printf '%s\n' "$O" | grep -c 'FORMAL_BINDING_PASS')" -eq 0 ]; report F0_full_positive_still_refused $?
+echo "  F0 rc=$R want=18(everything agrees; the image identity is still unverified)"
+# the consistency-only path is available but named for what it proves
+set +e
+O=$(LOCAL_BINDING_ONLY=1 EXPECTED_RECEIPT_SHA256=$(sha256sum "$PRCPT" | cut -d' ' -f1) \
+    bash "$BIND" "$PRCPT" "$PRODREC" "$PMAN" "$PSODIR" 2>&1); R=$?
+set -u
+[ "$R" -eq 0 ] && has1 "$O" "^LOCAL_BINDING_PASS:$PSO\$" \
+  && [ "$(printf '%s\n' "$O" | grep -c 'FORMAL_BINDING_PASS')" -eq 0 ]; report F0b_local_only_path_is_labelled $?
+echo "  F0b rc=$R want=0(LOCAL_BINDING_PASS, never FORMAL_BINDING_PASS)"
+# packaging refuses to bind a production record for the same reason
+PKG=$TMPD/pkg
+mkdir -p "$PKG/benchmarks/manifests"
+cp "$DIR/validate_manifest_sm90.sh" "$DIR/validate_receipt_sm90.sh" \
+   "$DIR/validate_build_record_sm90.sh" "$DIR/compute_build_inputs_sm90.sh" \
+   "$DIR/make_deploy_receipt.sh" "$DIR/bench_sm90_fwd.py" "$PKG/benchmarks/"
+PKGH=$(sha256sum "$PKG/benchmarks/bench_sm90_fwd.py" | cut -d' ' -f1)
+sed -e "s|^EXPECTED_SO_SHA256=.*|EXPECTED_SO_SHA256=$PSO|" \
+    -e "s|^EXPECTED_HARNESS_SHA256=.*|EXPECTED_HARNESS_SHA256=$PKGH|" \
+    "$DIR/manifests/tiny-h20-v1.manifest" > "$PKG/benchmarks/manifests/fix.manifest"
+( cd "$PKG" && $GIT init -q && $GIT add -A && $GIT commit -qm pkg ) >/dev/null 2>&1
+set +e
+O=$( cd "$PKG" && IMAGE_ID="sha256:$(H64 1)" IMAGE_REF="x:1" \
+     IMAGE_REPO_DIGESTS="registry.local/mok@sha256:$(H64 9)" BINARY_BUILD_COMMIT=UNKNOWN \
+     BUILD_RECORD="$PRODREC" bash benchmarks/make_deploy_receipt.sh "$PKG" \
+     benchmarks/manifests/fix.manifest "$TMPD/prod.pkg.receipt" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 2 ] && has1 "$O" '^RECEIPT_FAIL:binding a production build record requires a trusted toolchain image attestation, which is not implemented$'; report F0c_packaging_refuses_production_binding $?
+echo "  F0c rc=$R want=2(packaging will not launder a caller declaration)"
 set +e
 O=$(bash "$VALB" "$FIXREC" --check-mode 2>&1); R=$?
 set -u
@@ -404,7 +566,7 @@ set -u
 echo "  F5 rc=$R want=14(launcher still refuses formal)"
 
 [ "${BR_KEEP_TMPD:-0}" = "1" ] && echo "BR_TMPD_KEPT:$TMPD" || rm -rf "$TMPD"
-EXPECTED=32
+EXPECTED=39
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "BR_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "BUILD_RECORD_TESTS pass=$PASS fail=$FAIL"

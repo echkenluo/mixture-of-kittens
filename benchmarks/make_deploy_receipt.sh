@@ -55,6 +55,11 @@ if [ -n "${BUILD_RECORD:-}" ]; then
   [ -f "$BUILD_RECORD" ] || { echo "RECEIPT_FAIL:BUILD_RECORD $BUILD_RECORD missing"; exit 2; }
   bash "$DIR/validate_build_record_sm90.sh" "$BUILD_RECORD" --check-mode >/dev/null \
     || { echo "RECEIPT_FAIL:BUILD_RECORD failed shared validator"; exit 2; }
+  # the receipt's IMAGE_* fields are unlabelled, so binding a production record
+  # here would launder a caller declaration into something that reads as
+  # verified. Refused until a trusted attestation artifact exists.
+  [ "${ALLOW_UNVERIFIED_IMAGE_BINDING:-0}" = "1" ] \
+    || { echo "RECEIPT_FAIL:binding a production build record requires a trusted toolchain image attestation, which is not implemented"; exit 2; }
   [ "$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-)" = "production" ] \
     || { echo "RECEIPT_FAIL:BUILD_RECORD is not a production record (RECORD_MODE=$(grep '^RECORD_MODE=' "$BUILD_RECORD" | head -1 | cut -d= -f2-))"; exit 2; }
   BRSHA=$(sha256sum "$BUILD_RECORD" | cut -d' ' -f1)
@@ -76,7 +81,7 @@ if [ -n "${BUILD_RECORD:-}" ]; then
   # had, must not be bindable
   for K in BUILD_INPUT_SPEC_NAME BUILD_INPUT_SPEC_SHA256 SOURCE_TREE_GIT_OID \
            BUILD_INPUT_FILE_COUNT BUILD_INPUT_LIST_SHA256 BUILD_INPUT_CONTENT_SHA256 \
-           SUBMODULE_COUNT SUBMODULE_LIST_SHA256 TOOLING_FILE_COUNT TOOLING_LIST_SHA256 \
+           SUBMODULE_COUNT SUBMODULE_LIST_SHA256 BUILD_SIDE_TOOLING_FILE_COUNT BUILD_SIDE_TOOLING_LIST_SHA256 \
            BUILD_COMMAND_SPEC_NAME BUILD_COMMAND_SPEC_SHA256; do
     RECV=$(grep "^$K=" "$BUILD_RECORD" | head -1 | cut -d= -f2-)
     CALC=$(printf '%s\n' "$IDENT" | grep "^$K=" | head -1 | cut -d= -f2-)

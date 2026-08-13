@@ -11,6 +11,13 @@
 #     file to swap, and the argv identity is the spec blob.
 #   - "no environment variable can narrow the closure" was FALSE: this script
 #     itself had added BUILD_INPUT_SPEC_PATH. That override is gone.
+#   - "the build environment is closed" was FALSE while ENV_PASS forwarded the
+#     caller's PATH/HOME: make, nvcc and python3 were resolved under a
+#     caller-controlled PATH, so a fake `make` could copy an old .so and a fake
+#     `nvcc`/`python3` could print exactly the versions the record wanted. The
+#     control plane (git, sha256sum, readlink, stat) resolved the same way.
+#     ENV_SET now fixes every value in the tracked spec and this script
+#     normalises its own PATH and clears Git/Make/compiler overrides first.
 #   - "the Make variables that decide what gets compiled are pinned" was FALSE
 #     too: PYTHON_INCLUDES, PYTORCH_INCLUDES and PYTORCH_LIBDIR are ?= in the
 #     Makefile and were still inheritable, and nothing stopped MAKEFILES,
@@ -41,6 +48,21 @@
 # Required env: TOOLCHAIN_IMAGE_ID TOOLCHAIN_IMAGE_REF TOOLCHAIN_IMAGE_REPO_DIGESTS
 # Fixture-only env: BUILD_RECORD_FIXTURE_MODE=1 BUILD_FIXTURE_COMMAND_SPEC=<file>
 set -euo pipefail
+# CONTROL-PLANE HARDENING, before anything else runs. Everything below - git,
+# sha256sum, readlink, stat, env - would otherwise be resolved through the
+# CALLER's PATH, and git would honour the caller's GIT_* overrides. A fake
+# `git` or `sha256sum` defeats every check in this file, so the environment is
+# normalised here rather than trusted.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL \
+      GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXEC_PATH \
+      GIT_TEMPLATE_DIR GIT_ATTR_NOSYSTEM GIT_CEILING_DIRECTORIES \
+      MAKEFILES MAKEFLAGS GNUMAKEFLAGS MFLAGS \
+      NVCC_CCBIN CUDAHOSTCXX CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH \
+      LIBRARY_PATH LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME \
+      PYTHONSTARTUP CC CXX 2>/dev/null || true
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 REPO=${1:?repo dir}; ARTDIR=${2:?artifact dir}
 : "${TOOLCHAIN_IMAGE_ID:?TOOLCHAIN_IMAGE_ID required (attested)}"
 : "${TOOLCHAIN_IMAGE_REF:?TOOLCHAIN_IMAGE_REF required (attested)}"
@@ -113,8 +135,10 @@ OUTPUT_PATH=$(printf '%s\n' "$CMDSPEC" | grep '^OUTPUT=' | head -1 | cut -d= -f2
 [ -n "$OUTPUT_PATH" ] || fail "command spec has no OUTPUT"
 mapfile -t PROBES < <(printf '%s\n' "$CMDSPEC" | grep '^PROBE=' | cut -d= -f2-)
 [ "${#PROBES[@]}" -gt 0 ] || fail "command spec lists no PROBE entries"
-mapfile -t ENV_PASS < <(printf '%s\n' "$CMDSPEC" | grep '^ENV_PASS=' | cut -d= -f2-)
-[ "${#ENV_PASS[@]}" -gt 0 ] || fail "command spec declares no ENV_PASS allowlist"
+mapfile -t ENV_SET < <(printf '%s\n' "$CMDSPEC" | grep '^ENV_SET=' | cut -d= -f2-)
+[ "${#ENV_SET[@]}" -gt 0 ] || fail "command spec declares no ENV_SET environment"
+mapfile -t TOOLCHAIN_ROOTS < <(printf '%s\n' "$CMDSPEC" | grep '^TOOLCHAIN_ROOT=' | cut -d= -f2-)
+[ "${#TOOLCHAIN_ROOTS[@]}" -gt 0 ] || fail "command spec declares no TOOLCHAIN_ROOT"
 HOST_COMPILER=$(printf '%s\n' "$CMDSPEC" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
 [ -n "$HOST_COMPILER" ] || fail "command spec does not pin HOST_COMPILER"
 case "$HOST_COMPILER" in /*) : ;; *) fail "HOST_COMPILER must be an absolute path: $HOST_COMPILER" ;; esac
@@ -126,19 +150,25 @@ for A in "${ARGV[@]}"; do
 done
 [ "$CCBIN_OK" -eq 1 ] \
   || fail "no ARGV element routes -ccbin $HOST_COMPILER into NVCC; the host compiler would be chosen by search"
-# the environment the build will see, built from the allowlist only
-ENVARGS=(); ENV_APPLIED=""
-for N in "${ENV_PASS[@]}"; do
-  case "$N" in
-    [A-Z_]*) : ;;
-    *) fail "ENV_PASS name is not an environment variable name: $N" ;;
+# the environment the build will see: FIXED VALUES from the tracked spec, with
+# nothing taken from the caller. HOME points at an empty directory this run
+# creates, so tool/user configuration cannot reach the build either.
+BUILD_HOME=$ARTDIR/build_home
+mkdir -p "$BUILD_HOME" || fail "cannot create the build HOME under the artifact dir"
+[ -z "$(ls -A "$BUILD_HOME" 2>/dev/null)" ] || fail "build HOME $BUILD_HOME is not empty"
+ENVARGS=()
+for E in "${ENV_SET[@]}"; do
+  case "$E" in
+    [A-Z_]*=*) : ;;
+    *) fail "ENV_SET entry is not NAME=value: $E" ;;
   esac
-  V=$(printenv "$N" || true)
-  ENVARGS+=("$N=$V")
-  ENV_APPLIED="$ENV_APPLIED$N=$V
-"
+  E=${E//@ARTIFACT_HOME@/$BUILD_HOME}
+  ENVARGS+=("$E")
 done
-ENV_PASS_NAMES=$(printf '%s,' "${ENV_PASS[@]}" | sed 's/,$//')
+# no trailing newline: a command substitution strips one, so the validator
+# would otherwise hash a different string than the one encoded here
+ENV_APPLIED=$(printf '%s\n' "${ENVARGS[@]}")
+ENV_MANIFEST_B64=$(printf '%s' "$ENV_APPLIED" | base64 -w0)
 ENV_APPLIED_SHA256=$(printf '%s' "$ENV_APPLIED" | sha256sum | cut -d' ' -f1)
 # TARGET_ARCH is derived from the command, not asserted alongside it
 TARGET_ARCH=""
@@ -177,7 +207,7 @@ START_EPOCH=$(date -u +%s)
   echo "### source_commit $SOURCE_COMMIT"
   echo "### record_mode $RECORD_MODE"
   echo "### argv $BUILD_COMMAND_ARGV_JOINED"
-  echo "### env_pass $ENV_PASS_NAMES"
+  echo "### env_manifest_b64 $ENV_MANIFEST_B64"
   echo "### env_applied_sha256 $ENV_APPLIED_SHA256"
   echo "### start $BUILD_START_UTC"; } > "$BUILD_LOG_PATH"
 set +e
@@ -229,6 +259,30 @@ MEASURED_PYTHON_VERSION=$(probe_line python 1)
 MEASURED_TORCH_VERSION=$(probe_line torch 1)
 MEASURED_CUDA_VERSION=$(probe_line torch 2)
 MEASURED_EXT_SUFFIX=$(probe_line ext_suffix 1)
+MEASURED_PY_INCLUDE=$(probe_line py_include 1)
+MEASURED_TORCH_INCLUDE=$(probe_line torch_include 1)
+MEASURED_TORCH_LIBDIR=$(probe_line torch_libdir 1)
+# a pinned include/lib path that the real interpreter and torch do not report
+# is a fiction: it may not exist, or may point at another installation
+argv_value() { for A in "${ARGV[@]}"; do case "$A" in "$1="*) printf '%s' "${A#$1=}"; return ;; esac; done; }
+for PAIR in "PYTHON_INCLUDES:$MEASURED_PY_INCLUDE" \
+            "PYTORCH_INCLUDES:$MEASURED_TORCH_INCLUDE" \
+            "PYTORCH_LIBDIR:$MEASURED_TORCH_LIBDIR"; do
+  K=${PAIR%%:*}; MEAS=${PAIR#*:}
+  PINNED=$(argv_value "$K")
+  [ -n "$PINNED" ] || fail "command spec does not pin $K"
+  [ -n "$MEAS" ] || fail "$K could not be derived from the toolchain"
+  [ "$PINNED" = "$MEAS" ] \
+    || fail "$K pinned as [$PINNED] but the toolchain reports [$MEAS]"
+  # and every path in it must exist under an allowed toolchain root
+  for TOK in $MEAS; do
+    D=${TOK#-I}; D=${D#-L}
+    [ -d "$D" ] || fail "$K path $D does not exist"
+    OK=0
+    for R in "${TOOLCHAIN_ROOTS[@]}"; do case "$D/" in "$R"/*) OK=1 ;; esac; done
+    [ "$OK" -eq 1 ] || fail "$K path $D is outside the declared toolchain roots"
+  done
+done
 # ABI check: a python 3.11 image can compile something and still leave a file
 # named cp312. The OUTPUT basename must match what this interpreter reports.
 [ -n "$MEASURED_EXT_SUFFIX" ] || fail "ext_suffix could not be measured"
@@ -236,7 +290,8 @@ EXPECT_BASENAME=_C$MEASURED_EXT_SUFFIX
 [ "$(basename "$OUTPUT_PATH")" = "$EXPECT_BASENAME" ] \
   || fail "OUTPUT basename $(basename "$OUTPUT_PATH") != _C\$EXT_SUFFIX ($EXPECT_BASENAME) reported by the interpreter"
 for V in MEASURED_NVCC_VERSION MEASURED_HOST_COMPILER_VERSION MEASURED_PYTHON_VERSION \
-         MEASURED_TORCH_VERSION MEASURED_CUDA_VERSION MEASURED_EXT_SUFFIX; do
+         MEASURED_TORCH_VERSION MEASURED_CUDA_VERSION MEASURED_EXT_SUFFIX \
+         MEASURED_PY_INCLUDE MEASURED_TORCH_INCLUDE MEASURED_TORCH_LIBDIR; do
   [ -n "${!V}" ] || fail "$V could not be measured from the probe output; no record is published"
 done
 PROBE_LOG_BYTES=$(stat -c %s "$PROBE_LOG_PATH")
@@ -249,7 +304,7 @@ trap 'rm -f "$TMP"' EXIT
 {
   echo "BUILD_RECORD_SCHEMA=3"
   echo "RECORD_MODE=$RECORD_MODE"
-  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,tooling,command,env,output,logs,versions;declared_unverified:toolchain_image"
+  echo "PROVENANCE_CLASS=measured:source,inputs,submodules,build_side_tooling,command,env,toolchain_paths,output,logs,versions;declared_unverified:toolchain_image"
   echo "BUILD_START_UTC=$BUILD_START_UTC"
   echo "BUILD_END_UTC=$BUILD_END_UTC"
   echo "BUILD_EXIT_CODE=$BUILD_EXIT_CODE"
@@ -262,8 +317,8 @@ trap 'rm -f "$TMP"' EXIT
   echo "BUILD_INPUT_CONTENT_SHA256=$(iget BUILD_INPUT_CONTENT_SHA256)"
   echo "SUBMODULE_COUNT=$(iget SUBMODULE_COUNT)"
   echo "SUBMODULE_LIST_SHA256=$(iget SUBMODULE_LIST_SHA256)"
-  echo "TOOLING_FILE_COUNT=$(iget TOOLING_FILE_COUNT)"
-  echo "TOOLING_LIST_SHA256=$(iget TOOLING_LIST_SHA256)"
+  echo "BUILD_SIDE_TOOLING_FILE_COUNT=$(iget BUILD_SIDE_TOOLING_FILE_COUNT)"
+  echo "BUILD_SIDE_TOOLING_LIST_SHA256=$(iget BUILD_SIDE_TOOLING_LIST_SHA256)"
   echo "BUILD_COMMAND_SPEC_NAME=$BUILD_COMMAND_SPEC_NAME"
   echo "BUILD_COMMAND_SPEC_SHA256=$BUILD_COMMAND_SPEC_SHA256"
   echo "BUILD_COMMAND_ARGV_JOINED=$BUILD_COMMAND_ARGV_JOINED"
@@ -276,8 +331,11 @@ trap 'rm -f "$TMP"' EXIT
   echo "MEASURED_PYTHON_VERSION=$MEASURED_PYTHON_VERSION"
   echo "MEASURED_TORCH_VERSION=$MEASURED_TORCH_VERSION"
   echo "MEASURED_EXT_SUFFIX=$MEASURED_EXT_SUFFIX"
+  echo "MEASURED_PY_INCLUDE=$MEASURED_PY_INCLUDE"
+  echo "MEASURED_TORCH_INCLUDE=$MEASURED_TORCH_INCLUDE"
+  echo "MEASURED_TORCH_LIBDIR=$MEASURED_TORCH_LIBDIR"
   echo "MEASURED_HOST_COMPILER_PATH=$HOST_COMPILER"
-  echo "ENV_PASS_NAMES=$ENV_PASS_NAMES"
+  echo "ENV_MANIFEST_B64=$ENV_MANIFEST_B64"
   echo "ENV_APPLIED_SHA256=$ENV_APPLIED_SHA256"
   echo "PROBE_LOG_SHA256=$PROBE_LOG_SHA256"
   echo "PROBE_LOG_BYTES=$PROBE_LOG_BYTES"
@@ -289,8 +347,8 @@ trap 'rm -f "$TMP"' EXIT
   echo "BUILD_LOG_BYTES=$BUILD_LOG_BYTES"
 } > "$TMP"
 chmod 444 "$TMP"
-bash "$REPO/benchmarks/validate_build_record_sm90.sh" "$TMP" --check-mode >/dev/null \
-  || fail "generated record failed self-validation (not published)"
+VOUT=$(bash "$REPO/benchmarks/validate_build_record_sm90.sh" "$TMP" --check-mode 2>&1) \
+  || fail "generated record failed self-validation (not published): $(printf '%s' "$VOUT" | tail -1)"
 # publish by hard link inside the same directory: link fails if the target
 # exists, so a concurrent or repeated run can never clobber a good record
 ln "$TMP" "$OUT" 2>/dev/null || fail "could not publish record to $OUT (already exists?)"

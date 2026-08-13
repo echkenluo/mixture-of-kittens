@@ -13,9 +13,10 @@
 # controlled: a narrower spec means a record that covers less than what was
 # compiled while still validating.
 #
-# It also emits the TOOLING identity - the wrapper, this helper, the
-# validators and both spec files as they exist at that commit - so that
-# "which code produced this record" is itself recomputable rather than assumed.
+# It also emits the BUILD-SIDE TOOLING identity - the wrapper, this helper,
+# the build-record validator and both spec files at that commit - so that
+# "which code produced this record" is recomputable. The packaging and
+# verification scripts are NOT in that set.
 #
 #   failure -> exit 19 BUILD_INPUTS_FAIL:<why>
 #   success -> exit 0, prints KEY=VALUE lines
@@ -24,7 +25,7 @@ set -uo pipefail
 REPO=${1:?repo dir}; COMMIT=${2:?commit}
 SPEC_PATH=benchmarks/build_input_spec.v1
 CMD_SPEC_PATH=benchmarks/build_command_spec.v1
-TOOLING_PATHS="benchmarks/build_and_record_sm90.sh benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh benchmarks/build_input_spec.v1 benchmarks/build_command_spec.v1"
+BUILD_SIDE_TOOLING_PATHS="benchmarks/build_and_record_sm90.sh benchmarks/compute_build_inputs_sm90.sh benchmarks/validate_build_record_sm90.sh benchmarks/build_input_spec.v1 benchmarks/build_command_spec.v1"
 bf() { echo "BUILD_INPUTS_FAIL:$1"; exit 19; }
 [ "$(git -C "$REPO" cat-file -t "$COMMIT" 2>/dev/null)" = "commit" ] \
   || bf "commit $COMMIT does not exist in this repository"
@@ -80,7 +81,7 @@ CMD_SHA=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH" | sha256sum | cu
 CMD=$(git -C "$REPO" cat-file blob "$COMMIT:$CMD_SPEC_PATH")
 printf '%s\n' "$CMD" | head -1 | grep -q '^BUILD_COMMAND_SPEC=1$' \
   || bf "build command spec at $COMMIT has a bad schema line"
-strict_parse "$CMD" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER ARGV PROBE ENV_PASS" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER" "build command spec"
+strict_parse "$CMD" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER ARGV PROBE ENV_SET TOOLCHAIN_ROOT" "BUILD_COMMAND_SPEC NAME OUTPUT HOST_COMPILER" "build command spec"
 CMD_NAME=$(printf '%s\n' "$CMD" | grep '^NAME=' | head -1 | cut -d= -f2-)
 CMD_OUTPUT=$(printf '%s\n' "$CMD" | grep '^OUTPUT=' | head -1 | cut -d= -f2-)
 safe_rel "$CMD_OUTPUT" "build command spec OUTPUT"
@@ -88,8 +89,13 @@ NARGV=$(printf '%s\n' "$CMD" | grep -c '^ARGV=' || true)
 [ "$NARGV" -gt 0 ] || bf "build command spec lists no ARGV entries"
 NPROBE=$(printf '%s\n' "$CMD" | grep -c '^PROBE=' || true)
 [ "$NPROBE" -gt 0 ] || bf "build command spec lists no PROBE entries"
-NENV=$(printf '%s\n' "$CMD" | grep -c '^ENV_PASS=' || true)
-[ "$NENV" -gt 0 ] || bf "build command spec declares no ENV_PASS allowlist"
+NENV=$(printf '%s\n' "$CMD" | grep -c '^ENV_SET=' || true)
+[ "$NENV" -gt 0 ] || bf "build command spec declares no ENV_SET environment"
+while IFS= read -r E; do
+  case "$E" in [A-Z_]*=*) : ;; *) bf "build command spec: ENV_SET entry is not NAME=value: $E" ;; esac
+done < <(printf '%s\n' "$CMD" | grep '^ENV_SET=' | cut -d= -f2-)
+NROOT=$(printf '%s\n' "$CMD" | grep -c '^TOOLCHAIN_ROOT=' || true)
+[ "$NROOT" -gt 0 ] || bf "build command spec declares no TOOLCHAIN_ROOT"
 CMD_HOSTCC=$(printf '%s\n' "$CMD" | grep '^HOST_COMPILER=' | head -1 | cut -d= -f2-)
 case "$CMD_HOSTCC" in /*) : ;; *) bf "build command spec HOST_COMPILER must be absolute: $CMD_HOSTCC" ;; esac
 
@@ -114,9 +120,13 @@ fi
 SUBCOUNT=$(printf '%s\n' "$SUBLIST" | grep -c . || true)
 SUBSHA=$(printf '%s\n' "$SUBLIST" | sha256sum | cut -d' ' -f1)
 
-# --- tooling identity: the code that produces and checks records ---
+# --- BUILD-SIDE tooling identity: the five files that produce a record. This
+# does NOT cover the packaging or verification side (make_deploy_receipt.sh,
+# validate_receipt_sm90.sh, validate_manifest_sm90.sh,
+# check_formal_binding_sm90.sh) - claiming otherwise would overstate the
+# evidence, so the field is named for what it actually binds. ---
 TOOLLIST=""
-for T in $TOOLING_PATHS; do
+for T in $BUILD_SIDE_TOOLING_PATHS; do
   git -C "$REPO" cat-file -e "$COMMIT:$T" 2>/dev/null || bf "tooling file $T does not exist at $COMMIT"
   O=$(git -C "$REPO" rev-parse "$COMMIT:$T")
   TOOLLIST="$TOOLLIST$T	$O
@@ -136,5 +146,5 @@ echo "BUILD_INPUT_LIST_SHA256=$LIST_SHA"
 echo "BUILD_INPUT_CONTENT_SHA256=$CONTENT_SHA"
 echo "SUBMODULE_COUNT=$SUBCOUNT"
 echo "SUBMODULE_LIST_SHA256=$SUBSHA"
-echo "TOOLING_FILE_COUNT=$TOOLCOUNT"
-echo "TOOLING_LIST_SHA256=$TOOLSHA"
+echo "BUILD_SIDE_TOOLING_FILE_COUNT=$TOOLCOUNT"
+echo "BUILD_SIDE_TOOLING_LIST_SHA256=$TOOLSHA"
