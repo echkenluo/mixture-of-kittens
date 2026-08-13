@@ -70,7 +70,10 @@ lcase() { # name expected_sha mode want_rc reason-ERE -- launcher args...
   local O R
   set +e
   if [ "$EXP" = "__UNSET__" ]; then
-    O=$(BENCH_TAG="$NAME" BENCH_MODE="$MODE" bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
+    # env -u, never a plain invocation: if the caller's environment happens to
+    # export EXPECTED_RECEIPT_SHA256 the child inherits it, the gate does not
+    # fire, and the launcher proceeds to start a real run
+    O=$(env -u EXPECTED_RECEIPT_SHA256 BENCH_TAG="$NAME" BENCH_MODE="$MODE" bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
   else
     O=$(BENCH_TAG="$NAME" BENCH_MODE="$MODE" EXPECTED_RECEIPT_SHA256="$EXP" \
         bash "$DIR/host_launch_sm90.sh" "$@" 2>&1)
