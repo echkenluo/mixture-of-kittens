@@ -38,6 +38,12 @@ done
 for K in EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256; do
   mget "$K" | grep -qE '^[0-9a-f]{64}$' || { echo "MANIFEST_SCHEMA_FAIL:$K not 64-hex"; exit 12; }
 done
+# FROZEN_COMMIT is the full-40-hex contract freeze reference for this
+# manifest's expected hashes and shape; it is NOT binary build lineage
+# (that lives only in the deployment receipt's BINARY_BUILD_COMMIT)
+mget FROZEN_COMMIT | grep -qE '^[0-9a-f]{40}$' || { echo "MANIFEST_SCHEMA_FAIL:FROZEN_COMMIT not 40-hex"; exit 12; }
+[ "$(mget TIMING_SEMANTICS)" = "build_schedule+forward.v2" ] \
+  || { echo "MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set {build_schedule+forward.v2}"; exit 12; }
 for K in $INT_KEYS; do
   V=$(mget "$K")
   echo "$V" | grep -qE '^[0-9]+$' && [ "$V" -gt 0 ] || { echo "MANIFEST_SCHEMA_FAIL:$K not positive int"; exit 12; }
@@ -51,6 +57,20 @@ NLINES=$(printf '%s\n' "$GIDS" | grep -c . || true)
 NUNIQ=$(printf '%s\n' "$GIDS" | sort -u | grep -c . || true)
 [ "$NUNIQ" -eq "$NGID" ] || { echo "MANIFEST_SCHEMA_FAIL:BENCH_GPUS ids not unique"; exit 12; }
 [ "$NGID" -eq "$WS" ] || { echo "MANIFEST_SCHEMA_FAIL:BENCH_GPUS count $NGID != world_size $WS"; exit 12; }
+# plausibility ranges + cross-field constraints
+rng() { local V; V=$(mget "$1"); { [ "$V" -ge "$2" ] && [ "$V" -le "$3" ]; } \
+  || { echo "MANIFEST_SCHEMA_FAIL:$1=$V outside [$2,$3]"; exit 12; }; }
+rng tokens_per_rank 1 1048576
+rng hidden 1 65536
+rng intermediate 1 65536
+rng experts 1 4096
+rng topk 1 64
+rng comm_sms 1 132
+rng warmup_iters 1 100000
+rng timed_iters 1 1000000
+[ "$(mget topk)" -le "$(mget experts)" ] || { echo "MANIFEST_SCHEMA_FAIL:topk > experts"; exit 12; }
+[ "$(mget minibatch)" -le "$(mget macrobatch)" ] || { echo "MANIFEST_SCHEMA_FAIL:minibatch > macrobatch"; exit 12; }
+[ $(( $(mget macrobatch) % $(mget minibatch) )) -eq 0 ] || { echo "MANIFEST_SCHEMA_FAIL:macrobatch not a multiple of minibatch"; exit 12; }
 if [ -n "$HARNESS" ]; then
   AH=$(sha256sum "$HARNESS" 2>/dev/null | cut -d' ' -f1)
   [ "$AH" = "$(mget EXPECTED_HARNESS_SHA256)" ] || { echo "HARNESS_DRIFT_FAIL expected=$(mget EXPECTED_HARNESS_SHA256) actual=${AH:-unreadable}"; exit 13; }

@@ -1,27 +1,39 @@
 #!/bin/bash
-# Host-side launcher v5 (tracked). Trust model: a deployment receipt generated
-# on the trusted packaging host (make_deploy_receipt.sh) is the SOLE trust
-# anchor. The verified end never self-signs: no git lookups here, and there is
-# no untrusted-manifest bypass (schema-mutation negatives use the validate-only
-# surface in validate_manifest_sm90.sh instead of a launcher backdoor). Flow:
-#   1. receipt trust gate: read-only, schema, hex fields          -> exit 14
-#   2. manifest present -> exit 12; content-bound to receipt
-#      (sha256 equality) and read-only                            -> exit 14
-#   3. shared full semantic validation + harness/SO drift         -> exit 12/13
-#   4. receipt<->manifest expected-hash agreement                 -> exit 14
-#   5. container image identity: id/ref/RepoDigests vs receipt    -> exit 14
-#   6. sidecar + per-run manifest copy + hashes BEFORE the runner -> exit 4
-#   7. prelaunch telemetry BEFORE docker exec: GPU mapping for
-#      BENCH_GPUS only, occupancy wait, clocks/power/load/vmstat  -> exit 6/15
-#   8. docker exec runner; launch verification (exact log path,
-#      runner gates, uuid set equality, 1 parent + 4 workers,
-#      lock held, docker-top, per-GPU PID attribution, running
-#      clock floor)                                               -> exit 5-8/15
-#   9. completion wait: RUN_END + exactly one RUN_REAL_EXIT:0 +
-#      parseable JSON                                             -> exit 15
-#  10. end telemetry gates: zero foreign occupancy, load1 delta;
-#      sidecar finalized (TELEMETRY_FINAL_PASS + SIDECAR_END)     -> exit 15
-# Usage: BENCH_TAG=... bash host_launch_sm90.sh <container> <host_mok_dir> <manifest> <receipt>
+# Host-side launcher v6 (tracked). Trust model: the deployment receipt is
+# generated on the trusted packaging host (make_deploy_receipt.sh) and its
+# hash travels out-of-band as EXPECTED_RECEIPT_SHA256. The FIRST gate is the
+# exact comparison of the receipt bytes against that external prior - a
+# read-only bit or schema validity establishes nothing by itself, and a
+# self-consistent rewrite of manifest+receipt still fails here. The verified
+# end never self-signs and performs no git lookups. Gate order:
+#   0. EXPECTED_RECEIPT_SHA256 env present + 64-hex                -> exit 14
+#   1. sha256(receipt) == EXPECTED_RECEIPT_SHA256 (exact)          -> exit 14
+#   2. receipt well-formed + read-only (shared validate_receipt)   -> exit 14
+#   3. BENCH_MODE gate: formal refuses BINARY_BUILD_COMMIT=UNKNOWN
+#      and IMAGE_REPO_DIGESTS=NONE; canary runs are labeled
+#      INVALID_FOR_FORMAL in sidecar+log                           -> exit 14
+#   4. manifest present -> exit 12; content-bound to receipt and
+#      read-only                                                   -> exit 14
+#   5. shared manifest validation + harness/SO drift               -> exit 12/13
+#   6. receipt<->manifest expected-hash agreement                  -> exit 14
+#   7. live image id/ref/RepoDigests == receipt                    -> exit 14
+#   8. sidecar (atomic header) + per-run manifest AND receipt
+#      copies BEFORE the runner                                    -> exit 4
+#   9. prelaunch telemetry BEFORE docker exec: mapping, occupancy
+#      wait, clocks/load/vmstat snapshot                           -> exit 6/15
+#  10. docker exec runner; launch verification (exact log path,
+#      runner gates, uuid set equality, 1 parent + 4 workers, lock
+#      held, docker-top, per-GPU PID attribution, running clock
+#      floor)                                                      -> exit 5-8/15
+#  11. completion wait with PERIODIC foreign-process sampling on
+#      the target GPUs; RUN_END + exactly one RUN_REAL_EXIT:0 +
+#      parseable JSON                                              -> exit 15
+#  12. end telemetry gates: zero foreign occupancy, zero midrun
+#      foreign hits, load1 delta; sidecar finalized                -> exit 15
+# Gated quantities: occupancy (pre/mid/end), running SM clock floor, load1
+# delta. Power draw and vmstat are RECORD-ONLY disclosures, not gates.
+# Usage: BENCH_TAG=... EXPECTED_RECEIPT_SHA256=... [BENCH_MODE=formal|canary] \
+#          bash host_launch_sm90.sh <container> <host_mok_dir> <manifest> <receipt>
 set -uo pipefail
 CT=${1:?container name}
 MOKDIR=${2:?host mok dir}
@@ -30,31 +42,24 @@ RECEIPT=${4:?deployment receipt path (packaging-generated, read-only)}
 TAG=${BENCH_TAG:?BENCH_TAG required}
 DIR=$(cd "$(dirname "$0")" && pwd)
 
-RREQ="RECEIPT_SCHEMA SOURCE_TREE_COMMIT HARNESS_COMMIT BINARY_BUILD_COMMIT MANIFEST_FILE MANIFEST_SHA256 MANIFEST_GIT_BLOB HARNESS_SHA256 SO_SHA256 IMAGE_ID IMAGE_REF IMAGE_REPO_DIGESTS"
+EXPR_SHA=${EXPECTED_RECEIPT_SHA256:-}
+echo "$EXPR_SHA" | grep -qE '^[0-9a-f]{64}$' \
+  || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 env missing or not 64-hex"; exit 14; }
 [ -f "$RECEIPT" ] || { echo "RECEIPT_TRUST_FAIL:missing receipt $RECEIPT"; exit 14; }
-RMODE=$(stat -c %a "$RECEIPT")
-case "$RMODE" in *[2367]*) echo "RECEIPT_TRUST_FAIL:write bits set ($RMODE)"; exit 14 ;; esac
-head -1 "$RECEIPT" | grep -q '^RECEIPT_SCHEMA=1$' || { echo "RECEIPT_TRUST_FAIL:bad or missing schema version"; exit 14; }
-for K in $RREQ; do
-  N=$(grep -c "^$K=" "$RECEIPT" || true)
-  [ "$N" -eq 1 ] || { echo "RECEIPT_TRUST_FAIL:key $K count=$N (need exactly 1)"; exit 14; }
-done
-while IFS= read -r LINE; do
-  [ -z "$LINE" ] && continue
-  K=${LINE%%=*}
-  echo " $RREQ " | grep -q " $K " || { echo "RECEIPT_TRUST_FAIL:unknown key $K"; exit 14; }
-done < "$RECEIPT"
-rget() { grep "^$1=" "$RECEIPT" | head -1 | cut -d= -f2-; }
-for K in $RREQ; do
-  [ -n "$(rget "$K")" ] || { echo "RECEIPT_TRUST_FAIL:key $K empty"; exit 14; }
-done
-for K in MANIFEST_SHA256 HARNESS_SHA256 SO_SHA256; do
-  rget "$K" | grep -qE '^[0-9a-f]{64}$' || { echo "RECEIPT_TRUST_FAIL:$K not 64-hex"; exit 14; }
-done
-for K in SOURCE_TREE_COMMIT HARNESS_COMMIT MANIFEST_GIT_BLOB; do
-  rget "$K" | grep -qE '^[0-9a-f]{40}$' || { echo "RECEIPT_TRUST_FAIL:$K not 40-hex"; exit 14; }
-done
 RSHA=$(sha256sum "$RECEIPT" | cut -d' ' -f1)
+[ "$RSHA" = "$EXPR_SHA" ] || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch (actual $RSHA expected $EXPR_SHA)"; exit 14; }
+bash "$DIR/validate_receipt_sm90.sh" "$RECEIPT" --check-mode || exit 14
+rget() { grep "^$1=" "$RECEIPT" | head -1 | cut -d= -f2-; }
+
+BMODE=${BENCH_MODE:-canary}
+case "$BMODE" in formal|canary) : ;; *) echo "MODE_FAIL:BENCH_MODE must be formal or canary (got $BMODE)"; exit 14 ;; esac
+if [ "$BMODE" = "formal" ]; then
+  [ "$(rget BINARY_BUILD_COMMIT)" != "UNKNOWN" ] || { echo "FORMAL_MODE_FAIL:BINARY_BUILD_COMMIT UNKNOWN (no build record; formal forbidden)"; exit 14; }
+  [ "$(rget IMAGE_REPO_DIGESTS)" != "NONE" ] || { echo "FORMAL_MODE_FAIL:IMAGE_REPO_DIGESTS NONE (local-only image; formal forbidden)"; exit 14; }
+  FORMAL_VALIDITY=VALID_FOR_FORMAL
+else
+  FORMAL_VALIDITY=INVALID_FOR_FORMAL
+fi
 
 [ -f "$MANIFEST" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MANIFEST"; exit 12; }
 MSHA_ACT=$(sha256sum "$MANIFEST" | cut -d' ' -f1)
@@ -88,20 +93,29 @@ LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
 JSONF=$MOKDIR/runs/$TAG-$RUN_ID.json
 SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host
 MCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.manifest
+RCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.receipt
 mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
 touch "$SIDE" 2>/dev/null
 [ -w "$SIDE" ] || { echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4; }
 side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
 cp "$MANIFEST" "$MCOPY" || { echo "LAUNCH_VERIFY_FAIL:manifest copy failed"; exit 4; }
+cp "$RECEIPT" "$RCOPY" || { echo "LAUNCH_VERIFY_FAIL:receipt copy failed"; exit 4; }
 MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
-{ echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
-  echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
-  echo "RECEIPT_FILE:$(basename "$RECEIPT")"; echo "RECEIPT_SHA256:$RSHA"
-  echo "IMAGE_ID:$IMGID"; echo "IMAGE_REF:$IMGREF"; echo "IMAGE_REPO_DIGESTS:$IMGRD"; } > "$SIDE"
+HTMP=$SIDE.hdr.$$
+if ! { echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
+       echo "BENCH_MODE:$BMODE"; echo "FORMAL_VALIDITY:$FORMAL_VALIDITY"
+       echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
+       echo "RECEIPT_FILE:$(basename "$RECEIPT")"; echo "RECEIPT_SHA256:$RSHA"
+       echo "RECEIPT_COPY:$(basename "$RCOPY")"
+       echo "IMAGE_ID:$IMGID"; echo "IMAGE_REF:$IMGREF"; echo "IMAGE_REPO_DIGESTS:$IMGRD"; } > "$HTMP"; then
+  echo "LAUNCH_VERIFY_FAIL:sidecar header write failed"; exit 4
+fi
+mv -f "$HTMP" "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar header rename failed"; exit 4; }
 
 # prelaunch telemetry: container->host GPU mapping for BENCH_GPUS only,
-# occupancy wait, clocks/power/load snapshot - all BEFORE docker exec
+# occupancy wait, clocks/power/load snapshot - all BEFORE docker exec.
+# power.draw and vmstat lines are record-only disclosures, not gates.
 CMAP=$(docker exec "$CT" nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
 [ -n "$CMAP" ] || fail "container gpu uuid query failed" 6
 HOSTMAP=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
@@ -137,7 +151,7 @@ side "TELEMETRY_PRELAUNCH_END:$(date -u +%F_%T)"
 ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
          -e EXPECTED_HARNESS_SHA256="$EXPECTED" -e EXPECTED_SO_SHA256="$EXPSO"
          -e MOK_FROZEN_COMMIT="$FROZEN" -e MANIFEST_SHA256="$MSHA"
-         -e RECEIPT_SHA256="$RSHA" -e MOK_SM90_EXPERIMENTAL=1
+         -e RECEIPT_SHA256="$RSHA" -e BENCH_MODE="$BMODE" -e MOK_SM90_EXPERIMENTAL=1
          -e BENCH_GPUS="$BGPUS"
          -e NUM_LOCAL_TOKENS="$(mget tokens_per_rank)" -e HIDDEN_DIM="$(mget hidden)"
          -e INTERMEDIATE_DIM="$(mget intermediate)" -e NUM_EXPERTS="$(mget experts)"
@@ -206,12 +220,25 @@ side "RUNNING_CLOCK_GATE:min=${CLK_RUN_MIN_MHZ}MHz low=$LOWCLK"
 [ "$LOWCLK" -eq 0 ] || fail "TELEMETRY_GATE_FAIL:running sm clock below ${CLK_RUN_MIN_MHZ}MHz" 15
 echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE manifest_sha=$MSHA receipt_sha=$RSHA pid_attribution=PASS"
 
-# completion wait + end telemetry (the head/tail gate is only complete once
-# the benchmark has really finished and the target GPUs are clean again)
+# completion wait with periodic foreign-process sampling: every poll tick,
+# any NVML compute pid on a target GPU that is not one of our 4 workers
+# counts as a foreign hit (gated to zero)
 WAIT=${BENCH_WAIT_SECS:-900}
-DONE=0
-for i in $(seq 1 $((WAIT/10))); do grep -q '^RUN_END:' "$LOG" && { DONE=1; break; }; sleep 10; done
+DONE=0; NSAMP=0; NFOREIGN=0
+for i in $(seq 1 $((WAIT/10))); do
+  PAIRSM=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>/dev/null | tr -d ' ')
+  NSAMP=$((NSAMP+1))
+  for U in $TUUIDS; do
+    for P in $(printf '%s\n' "$PAIRSM" | grep "^$U," | cut -d, -f2); do
+      echo "$WPIDS" | tr ' ' '\n' | grep -qx "$P" || NFOREIGN=$((NFOREIGN+1))
+    done
+  done
+  grep -q '^RUN_END:' "$LOG" && { DONE=1; break; }
+  sleep 10
+done
+side "MIDRUN_FOREIGN_SAMPLES:samples=$NSAMP hits=$NFOREIGN"
 [ "$DONE" -eq 1 ] || fail "COMPLETION_FAIL:no RUN_END within ${WAIT}s" 15
+[ "$NFOREIGN" -eq 0 ] || fail "TELEMETRY_GATE_FAIL:midrun foreign compute pids on target GPUs (hits=$NFOREIGN)" 15
 [ "$(grep -c '^RUN_REAL_EXIT:0$' "$LOG")" -eq 1 ] || fail "COMPLETION_FAIL:run_real_exit=$(grep '^RUN_REAL_EXIT:' "$LOG" | head -1 | cut -d: -f2-)" 15
 python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$JSONF" 2>/dev/null \
   || fail "COMPLETION_FAIL:json missing or unparseable at $JSONF" 15
@@ -231,4 +258,4 @@ side "LOAD1_DELTA_GATE:start=$L1S end=$L1E max=+$LOAD1_DELTA_MAX ok=${DELTA_OK:-
 [ "${DELTA_OK:-0}" = "1" ] || fail "TELEMETRY_GATE_FAIL:load1 rose $L1S -> $L1E (> +$LOAD1_DELTA_MAX)" 15
 side "TELEMETRY_FINAL_PASS"
 side "SIDECAR_END:$(date -u +%F_%T)"
-echo "LAUNCH_COMPLETE run_id=$RUN_ID log=$LOG json=$JSONF sidecar=$SIDE manifest_sha=$MSHA receipt_sha=$RSHA run_real_exit=0 telemetry=PASS"
+echo "LAUNCH_COMPLETE run_id=$RUN_ID log=$LOG json=$JSONF sidecar=$SIDE manifest_sha=$MSHA receipt_sha=$RSHA mode=$BMODE formal_validity=$FORMAL_VALIDITY run_real_exit=0 telemetry=PASS"
