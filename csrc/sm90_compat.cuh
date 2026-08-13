@@ -34,7 +34,7 @@ __device__ static inline void schedule(handle &h, semaphore &sem) {
     uint32_t bytes = sizeof(handle);
     uint32_t bar = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
     #pragma unroll
-    for (uint32_t cta = 0; cta < 2; cta++) { // MoK config::CLUSTER_SIZE == 2
+    for (uint32_t cta = 0; cta < 1; cta++) { // SM90 CLUSTER_SIZE == 1
         uint32_t remote_bar;
         asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n"
             : "=r"(remote_bar) : "r"(bar), "r"(cta));

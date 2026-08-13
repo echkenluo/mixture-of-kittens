@@ -23,8 +23,13 @@ static constexpr bool USE_MXFP8 = ROUTED_PRECISION == utils::RoutedPrecision::MX
 
 struct config {
     // Grouped GEMM
+#if defined(KITTENS_SM90)
+    static constexpr int MLP_Mb = 128; // SM90: quarter tile, single-CTA ownership
+    static constexpr int MLP_Nb = 128;
+#else
     static constexpr int MLP_Mb = 256;
     static constexpr int MLP_Nb = 256;
+#endif
     static constexpr int MLP_FP8_Kb = 128;
     static constexpr int MLP_BF16_Kb = 64;
     static constexpr int MLP_SUPERGROUP_SIZE = 8;
@@ -56,7 +61,11 @@ struct config {
     // Kernel launch
     static constexpr int CLC_PIPE_DEPTH = 1;
     static constexpr int CLC_DRAIN_PIPE_DEPTH = 8; // roughly a good number, but variance is low
+#if defined(KITTENS_SM90)
+    static constexpr int CLUSTER_SIZE = 1; // SM90: no cross-CTA mbarrier semantics
+#else
     static constexpr int CLUSTER_SIZE = 2;
+#endif
     static constexpr int NUM_CONSUMERS = 1;
     static constexpr int NUM_PRODUCERS = 1;
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8
