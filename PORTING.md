@@ -98,3 +98,11 @@ compat overload unreachable). FIX = call-site transform: strip the trailing
 under SM90 (python regex over megakernel, calls span 1-2 lines), and guard
 the tcgen05.ld drain block (~1482) + tt.addr uses behind #ifndef KITTENS_SM90
 with zeroed d_reg scaffold. Then rebuild r10.
+
+## P2 milestone (2026-08-13): device-op surface GREEN on H20
+4-rank torchrun: test_build_schedule, test_all_gather_top_experts (NVLS
+multicast live), test_schedule, test_fwd_epilogue, test_bwd_epilogue -- all
+PASSED. Only red: megakernel fwd/bwd (hangs at MMA scaffold no-ops, combine
+semaphores never satisfied -- the designed behavior). Single remaining front:
+wgmma register-accumulator rewrite per the P1-B v1 design, then
+test_forward_bf16 green = port correctness goal met.
