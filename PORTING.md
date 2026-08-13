@@ -106,3 +106,10 @@ PASSED. Only red: megakernel fwd/bwd (hangs at MMA scaffold no-ops, combine
 semaphores never satisfied -- the designed behavior). Single remaining front:
 wgmma register-accumulator rewrite per the P1-B v1 design, then
 test_forward_bf16 green = port correctness goal met.
+
+## P2 red/green map CLOSED (2026-08-13)
+GREEN 6/6 device ops (schedule/all_gather-NVLS/scheduling/epilogues).
+RED single-cause: megakernel fwd bf16 AND mxfp8 both hang at the MMA
+scaffold (combine semaphores starve) - confirmed by timeout runs.
+ONLY remaining front: wgmma register rewrite of the GEMM worker
+(design frozen above). test_forward_bf16 green == port correctness done.
