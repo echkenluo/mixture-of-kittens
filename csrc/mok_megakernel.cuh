@@ -1452,8 +1452,12 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
+        mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256> *acc_p = nullptr;
+        __shared__ char acc_store[sizeof(mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256>) > 1 ? 1 : 1];
+        (void)acc_store;
+        mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256> acc;
+        acc_p = &acc;
         if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) { // SM90 wgmma: fwd bf16 (wgrad=training-only, deferred)
-            mok_sm90::wgmma_acc<a_tile, b_tile, config::MLP_Mb / 2, config::MLP_Nb> acc;
             int input_ring = 0;
             if (warpgroup::laneid() == 0 && blockIdx.x < 2)
                 printf("[MOKDBG] cta=%d consumer enter iters=%d\n", (int)blockIdx.x, iters_per_task);
@@ -1479,9 +1483,20 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
-            #pragma unroll
-            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
-                warp::zero(d_reg[i]); // SM90 scaffold: accumulator drain pending wgmma rewrite
+            __shared__ st_bf<64, config::MLP_Nb> d_stage; // step-A staging (half 0)
+            if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
+                warpgroup::store(d_stage, acc_p->acc[0]);
+                warpgroup::sync(1);
+                #pragma unroll
+                for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i});
+                    warpgroup::load(d_reg[i], stg);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
+                    warp::zero(d_reg[i]);
+            }
             tensor_load_wait();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);

@@ -160,3 +160,13 @@ future wiring: never feed st_subtile views to wgmma; use real tile objects.
 Next: megakernel rewiring - CLUSTER_SIZE=1 quarter-tile ownership + drain
 into the 8 epilogue N-stages, then full BF16 matrix under the honest
 harness (real exit codes, pytest summary required).
+
+## SM90 dataflow design (final): h-loop emulation of the 2-CTA cluster
+Whole worker datapath is built on '2*tile_coord.x + cta_rank' half-splits.
+CLUSTER=1 correct form: one CTA sequentially iterates h in {0,1} replacing
+cta_rank -- loads BOTH halves per ring stage (a/b smem slots x2, expect_bytes
+= 2x(A+B)), mma per half into acc.acc[h], epilogue stores each half at
+{2*tile_coord.x + h}. Staged rollout: step A = half-0 drain plumbing only
+(predicted numeric gate failure at exactly 50% row coverage validates the
+plumbing); step B = full h-loop in producer loads + expect 2x + both-half
+stores.
