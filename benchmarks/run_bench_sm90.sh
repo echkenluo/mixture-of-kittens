@@ -14,7 +14,7 @@ RUN_ID=${RUN_ID:?RUN_ID required (host launcher generates it)}
 EXPECTED=${EXPECTED_HARNESS_SHA256:?EXPECTED_HARNESS_SHA256 required}
 BENCH_GPUS=${BENCH_GPUS:-0,1,2,3}
 PREFLIGHT_TRIES=${PREFLIGHT_TRIES:-24}
-mkdir -p /mok/runs
+mkdir -p /mok/runs && chmod a+rwx /mok/runs  # host must create sidecars here
 LOG=/mok/runs/$TAG-$RUN_ID.log
 JSON=/mok/runs/$TAG-$RUN_ID.json
 exec 9>/mok/build.lock

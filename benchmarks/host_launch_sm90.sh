@@ -17,10 +17,13 @@ TAG=${BENCH_TAG:?BENCH_TAG required}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
 SIDE=$MOKDIR/runs/$TAG-$RUN_ID.host
-mkdir -p "$MOKDIR/runs"
-if ! { echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"; } > "$SIDE" 2>/dev/null; then
+mkdir -p "$MOKDIR/runs" 2>/dev/null || true
+touch "$SIDE" 2>/dev/null
+if [ ! -w "$SIDE" ]; then
   echo "LAUNCH_VERIFY_FAIL:sidecar not writable at $SIDE"; exit 4
 fi
+echo "SIDECAR_START:$(date -u +%F_%T)" > "$SIDE"
+echo "RUN_ID:$RUN_ID" >> "$SIDE"
 side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
 
