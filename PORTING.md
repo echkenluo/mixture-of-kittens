@@ -222,3 +222,11 @@ gates, the SM90 scoping of the MXFP8 packing static_assert is justified:
 the exempted path is unreachable from the public API.
 Separately: R31 quadrant worker unit test green (AB & ABt, K=256/4096,
 max_rel 0.39%, zero_frac 0) - kept as an independent result.
+
+## Codex step-B P0 quartet FIXED (pre-build source invariants pass)
+(1) smem order a0/b0/a1/b1/scales via early constexpr, blanket-replace
+regression removed; (2) b1 mirrors per layout variant (IS_AB {z,k,2y+1},
+else {z,2y+1,k}); (3) wgmma_quad takes explicit IS_AB; (4) expect_bytes
+ownership moved into the elected producer before the first TMA load
+(consumer only waits). Note: two legacy expect sites remain inside the
+`false &&`-disabled SM100 issue branch - dead on SM90 by construction.
