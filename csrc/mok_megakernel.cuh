@@ -1450,7 +1450,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 if (warpgroup::laneid() == 0)
                     tma::expect_bytes(gemm_inputs_arrived[input_ring],
-                        config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
+                        sizeof(a_tile) + sizeof(b_tile)); // SM90: 1x per local barrier
                 warpgroup::sync(2);
                 if (warpgroup::laneid() == 0 && blockIdx.x < 2 && idx == 0)
                     printf("[MOKDBG] cta=%d expect done, waiting ring0\n", (int)blockIdx.x);

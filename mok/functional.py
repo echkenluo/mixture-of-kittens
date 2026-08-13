@@ -129,8 +129,16 @@ def validate_workspace_args(
     device = torch.device("cuda", device_index)
     if device_index != torch.cuda.current_device():
         raise ValueError("MoK workspace device must be the current CUDA device")
-    if torch.cuda.get_device_capability(device) not in ((9, 0), (10, 0), (10, 3)):
+    cap = torch.cuda.get_device_capability(device)
+    if cap not in ((9, 0), (10, 0), (10, 3)):
         raise NotImplementedError("MoK currently requires an SM90, SM100 or SM103 GPU")
+    if cap == (9, 0):
+        import os
+        if os.environ.get("MOK_SM90_EXPERIMENTAL") != "1":
+            raise NotImplementedError(
+                "MoK SM90 port is experimental: only the BF16 forward path is "
+                "being brought up (MXFP8 and backward are not implemented). "
+                "Set MOK_SM90_EXPERIMENTAL=1 to proceed.")
     device_properties = torch.cuda.get_device_properties(device)
     if type(num_local_tokens) is not int or num_local_tokens < 512:
         raise ValueError("num_local_tokens must be an integer at least 512")
