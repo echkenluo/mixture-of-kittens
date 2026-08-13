@@ -1390,7 +1390,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     }
                 }
             }
-        } else if (cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
+        } else if (
+#if defined(KITTENS_SM90)
+            false && // SM90: MMA moved into the consumer warpgroup (wgmma)
+#endif
+            cta_rank == 0 && warpgroup::warpid() == 0 && warp::elect_leader()) {
             int input_ring = 0;
             wait(gemm_outputs_finished, get_phasebit<1>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
             update_phasebit<1>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
@@ -1437,6 +1441,20 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         }
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
+#if defined(KITTENS_SM90)
+        { // SM90: consumer warpgroup computes wgmma over the input ring
+            mok_sm90::wgmma_acc<a_tile, b_tile, config::MLP_Mb / 2, config::MLP_Nb> acc;
+            int input_ring = 0;
+            for (int idx = 0; idx < iters_per_task; ++idx) {
+                wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                update_phasebit<0>(gemm_bitfield, input_ring);
+                acc.step_ABt(a_smem[input_ring], b_smem[input_ring], idx == 0);
+                if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
+                input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+            }
+            if (warpgroup::laneid() == 0) arrive(gemm_outputs_arrived);
+        }
+#endif
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
