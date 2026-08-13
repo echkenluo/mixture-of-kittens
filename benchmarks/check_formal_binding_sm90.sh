@@ -10,8 +10,8 @@
 # code with local tests only.
 #
 # The six-way agreement on the binary, and what each link rules out:
-#   1 expected record sha (out-of-band prior) == record bytes
-#       -> a record swapped on the verified end
+#   1 receipt bytes == EXPECTED_RECEIPT_SHA256 (the single out-of-band prior)
+#       -> a receipt swapped on the verified end, and the only trust root
 #   2 receipt.BUILD_RECORD_SHA256              == record bytes
 #       -> a receipt pointing at a different record
 #   3 receipt.BINARY_BUILD_COMMIT              == record.SOURCE_COMMIT
@@ -25,26 +25,36 @@
 #
 #   any violation -> exit 18 FORMAL_BINDING_FAIL:<why>
 #   all agree     -> exit 0, prints FORMAL_BINDING_PASS:<so_sha256>
-# Usage: EXPECTED_BUILD_RECORD_SHA256=... \
-#          check_formal_binding_sm90.sh <record> <receipt> <manifest> <so_dir>
+# Usage: EXPECTED_RECEIPT_SHA256=... [EXPECTED_BUILD_RECORD_SHA256=...] \
+#          check_formal_binding_sm90.sh <receipt> <record> <manifest> <so_dir>
 set -uo pipefail
-REC=${1:?build record}; RCPT=${2:?receipt}; MAN=${3:?manifest}; SODIR=${4:?dir holding the deployed _C*.so}
+RCPT=${1:?receipt}; REC=${2:?build record}; MAN=${3:?manifest}; SODIR=${4:?dir holding the deployed _C*.so}
 DIR=$(cd "$(dirname "$0")" && pwd)
 fb() { echo "FORMAL_BINDING_FAIL:$1"; exit 18; }
-EXPR_REC=${EXPECTED_BUILD_RECORD_SHA256:-}
-echo "$EXPR_REC" | grep -qE '^[0-9a-f]{64}$' \
-  || fb "EXPECTED_BUILD_RECORD_SHA256 env missing or not 64-hex"
-[ -f "$REC" ] || fb "build record $REC missing"
+# THE out-of-band prior is the receipt hash - the same anchor the rest of the
+# chain already uses. The record is reached THROUGH the anchored receipt, so a
+# second independent root cannot be substituted for it. An optional
+# EXPECTED_BUILD_RECORD_SHA256 may be supplied as a cross-check, never as the
+# root.
+EXPR_RCPT=${EXPECTED_RECEIPT_SHA256:-}
+echo "$EXPR_RCPT" | grep -qE '^[0-9a-f]{64}$' \
+  || fb "EXPECTED_RECEIPT_SHA256 env missing or not 64-hex"
 [ -f "$RCPT" ] || fb "receipt $RCPT missing"
+[ -f "$REC" ] || fb "build record $REC missing"
 [ -f "$MAN" ] || fb "manifest $MAN missing"
-bash "$DIR/validate_build_record_sm90.sh" "$REC" --check-mode >/dev/null \
-  || fb "build record failed shared validator"
+RCPTSHA=$(sha256sum "$RCPT" | cut -d' ' -f1)
+[ "$RCPTSHA" = "$EXPR_RCPT" ] || fb "receipt sha $RCPTSHA != EXPECTED_RECEIPT_SHA256 $EXPR_RCPT"
 bash "$DIR/validate_receipt_sm90.sh" "$RCPT" --check-mode >/dev/null \
   || fb "receipt failed shared validator"
+bash "$DIR/validate_build_record_sm90.sh" "$REC" --check-mode >/dev/null \
+  || fb "build record failed shared validator"
 bash "$DIR/validate_manifest_sm90.sh" "$MAN" >/dev/null \
   || fb "manifest failed shared validator"
 RSHA=$(sha256sum "$REC" | cut -d' ' -f1)
-[ "$RSHA" = "$EXPR_REC" ] || fb "record sha $RSHA != EXPECTED_BUILD_RECORD_SHA256 $EXPR_REC"
+if [ -n "${EXPECTED_BUILD_RECORD_SHA256:-}" ]; then
+  [ "$RSHA" = "$EXPECTED_BUILD_RECORD_SHA256" ] \
+    || fb "record sha $RSHA != optional cross-check EXPECTED_BUILD_RECORD_SHA256 $EXPECTED_BUILD_RECORD_SHA256"
+fi
 brget() { grep "^$1=" "$REC"  | head -1 | cut -d= -f2- || true; }
 rcget() { grep "^$1=" "$RCPT" | head -1 | cut -d= -f2- || true; }
 mnget() { grep "^$1=" "$MAN"  | head -1 | cut -d= -f2- || true; }
@@ -58,9 +68,11 @@ mnget() { grep "^$1=" "$MAN"  | head -1 | cut -d= -f2- || true; }
   || fb "receipt SO_SHA256 != record SO_SHA256"
 [ "$(mnget EXPECTED_SO_SHA256)" = "$(brget SO_SHA256)" ] \
   || fb "manifest EXPECTED_SO_SHA256 != record SO_SHA256"
-SOG=("$SODIR"/_C*.so)
-{ [ "${#SOG[@]}" -eq 1 ] && [ -f "${SOG[0]}" ]; } \
-  || fb "need exactly one _C*.so in $SODIR, found ${#SOG[@]}"
+# an unmatched glob expands to the literal pattern, so count real files -
+# reporting "found 1" for an empty directory would be a misleading diagnosis
+SOG=()
+for F in "$SODIR"/_C*.so; do [ -f "$F" ] && SOG+=("$F"); done
+[ "${#SOG[@]}" -eq 1 ] || fb "need exactly one _C*.so in $SODIR, found ${#SOG[@]}"
 [ "$(basename "${SOG[0]}")" = "$(brget SO_BASENAME)" ] \
   || fb "deployed basename $(basename "${SOG[0]}") != record SO_BASENAME $(brget SO_BASENAME)"
 DBYTES=$(stat -c %s "${SOG[0]}")

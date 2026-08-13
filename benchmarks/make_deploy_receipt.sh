@@ -63,6 +63,20 @@ if [ -n "${BUILD_RECORD:-}" ]; then
   if [ "$BINARY_BUILD_COMMIT" != "UNKNOWN" ] && [ "$BINARY_BUILD_COMMIT" != "$REC_COMMIT" ]; then
     echo "RECEIPT_FAIL:BINARY_BUILD_COMMIT $BINARY_BUILD_COMMIT != build record SOURCE_COMMIT $REC_COMMIT"; exit 2
   fi
+  # D: the record's own claims about the source are RECOMPUTED here from git
+  # objects at its SOURCE_COMMIT. Without this, any syntactically valid record
+  # could be bound to any receipt - a record could claim a tree, an input
+  # closure or a submodule set that the named commit never had.
+  IDENT=$(bash "$DIR/compute_build_inputs_sm90.sh" "$REPO" "$REC_COMMIT") \
+    || { echo "RECEIPT_FAIL:cannot recompute build inputs at record SOURCE_COMMIT $REC_COMMIT"; exit 2; }
+  for K in BUILD_INPUT_SPEC_NAME BUILD_INPUT_SPEC_SHA256 SOURCE_TREE_GIT_OID \
+           BUILD_INPUT_FILE_COUNT BUILD_INPUT_LIST_SHA256 BUILD_INPUT_CONTENT_SHA256 \
+           SUBMODULE_COUNT SUBMODULE_LIST_SHA256; do
+    RECV=$(grep "^$K=" "$BUILD_RECORD" | head -1 | cut -d= -f2-)
+    CALC=$(printf '%s\n' "$IDENT" | grep "^$K=" | head -1 | cut -d= -f2-)
+    [ "$RECV" = "$CALC" ] \
+      || { echo "RECEIPT_FAIL:record $K=$RECV != recomputed $CALC at $REC_COMMIT"; exit 2; }
+  done
   BINARY_BUILD_COMMIT=$REC_COMMIT
   RSCHEMA=2
 fi
