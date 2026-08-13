@@ -149,3 +149,14 @@ semantics at all. Next per review: (2) standalone wgmma_acc numeric test
 vs torch.matmul BEFORE megakernel rewiring; (3) expect_bytes 1x + ordering;
 (4) drain into 8 epilogue N-stages, no zero-fill; (5) harness real exit
 codes + pytest summary required; (6) fail-fast MXFP8/wgrad on SM90.
+
+## MILESTONE: wgmma worker numerics VERIFIED (review step 2 complete)
+Standalone unit test vs torch.matmul: max_rel 0.39% at K=64/256/4096
+(textbook bf16 accumulate), zero_frac 0. Root cause of the earlier wrong
+numbers found and documented: TK wgmma smem descriptors IGNORE st_subtile
+offsets (both M-chunks read chunk 0) while the register store path honors
+them - fixed via stacked-tile reinterpret for A M-halves. Rule for all
+future wiring: never feed st_subtile views to wgmma; use real tile objects.
+Next: megakernel rewiring - CLUSTER_SIZE=1 quarter-tile ownership + drain
+into the 8 epilogue N-stages, then full BF16 matrix under the honest
+harness (real exit codes, pytest summary required).
