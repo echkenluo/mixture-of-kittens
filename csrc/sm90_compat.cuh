@@ -65,3 +65,17 @@ template<int CLUSTER_SIZE> __device__ static inline void commit(semaphore &sem) 
 }} // namespace detail::tcgen05
 } // namespace kittens
 #endif
+
+#if defined(KITTENS_SM90)
+namespace kittens {
+// SCAFFOLD (numerics-invalid): parse/compile bridge for the tmem accumulator
+// while the wgmma register rewrite lands. tt ops are no-ops; P2 torchrun
+// tests MUST fail until the real accumulator path replaces this.
+template<typename T, int M, int N> struct tt {
+    template<typename S> __device__ inline S subtile(int, int = 0) const { return S{}; }
+};
+template<int BYTES> struct tensor_allocator {
+    template<typename T> __device__ inline T allocate(int) { return T{}; }
+};
+} // namespace kittens
+#endif
