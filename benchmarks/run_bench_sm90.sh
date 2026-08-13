@@ -1,18 +1,19 @@
 #!/bin/bash
-# Container-side benchmark runner for bench_sm90_fwd (tracked; runs INSIDE
-# the benchmark container). Guarantees per run:
-#   - unique RUN_ID artifact paths (no path reuse, stale artifacts impossible)
-#   - build lock (flock) with holder recorded
-#   - harness hash-equality gate: EXPECTED_HARNESS_SHA256 must match the file
-#     actually on disk before anything launches
-#   - GPU preflight: wait-loop until no foreign compute process holds the GPUs
-#   - RUN_ID / RUN_START / RUN_END / real exit code in the log
-# Host-side counterpart (host_launch_sm90.sh) verifies launch and captures
-# `docker top` so NVML host PIDs can be matched against this run's workers.
-set -u
+# Container-side benchmark runner (tracked). Formal-ready guarantees:
+#   - RUN_ID is provided by the host launcher: artifact paths are known a
+#     priori, no ls-based discovery, stale artifacts cannot be selected
+#   - flock build lock with holder recorded
+#   - harness hash-equality gate (EXPECTED_HARNESS_SHA256) before anything
+#   - GPU preflight scoped to BENCH_GPUS only, with explicit nvidia-smi RC
+#     handling and a HARD FAIL when still occupied after the wait budget
+#   - RUN_START/RUN_END/real exit recorded; CUDA_VISIBLE_DEVICES frozen and
+#     target GPU UUIDs logged
+set -uo pipefail
 TAG=${BENCH_TAG:?BENCH_TAG required}
+RUN_ID=${RUN_ID:?RUN_ID required (host launcher generates it)}
 EXPECTED=${EXPECTED_HARNESS_SHA256:?EXPECTED_HARNESS_SHA256 required}
-RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
+BENCH_GPUS=${BENCH_GPUS:-0,1,2,3}
+PREFLIGHT_TRIES=${PREFLIGHT_TRIES:-24}
 mkdir -p /mok/runs
 LOG=/mok/runs/$TAG-$RUN_ID.log
 JSON=/mok/runs/$TAG-$RUN_ID.json
@@ -24,25 +25,36 @@ ACTUAL=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
   echo "RUN_ID:$RUN_ID"
   echo "LOCK_HELD_BY:$$"
   echo "HARNESS_SHA256:$ACTUAL"
+  echo "BENCH_GPUS:$BENCH_GPUS"
 } > "$LOG"
+if ! UUIDS=$(nvidia-smi -i "$BENCH_GPUS" --query-gpu=index,uuid --format=csv,noheader 2>&1); then
+  echo "PREFLIGHT_FAIL:nvidia-smi-uuid-query rc=$? out=$UUIDS" >> "$LOG"; exit 7
+fi
+echo "TARGET_GPU_UUIDS:${UUIDS//$'\n'/;}" >> "$LOG"
 if [ "$ACTUAL" != "$EXPECTED" ]; then
-  echo "HASH_GATE_FAIL expected=$EXPECTED actual=$ACTUAL" >> "$LOG"
-  exit 8
+  echo "HASH_GATE_FAIL expected=$EXPECTED actual=$ACTUAL" >> "$LOG"; exit 8
 fi
 echo "HASH_GATE_PASS" >> "$LOG"
-for i in $(seq 1 24); do
-  FOREIGN=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
-  [ "$FOREIGN" -eq 0 ] && break
-  echo "PREFLIGHT_WAIT:$FOREIGN compute procs" >> "$LOG"
+CLEAR=0
+for i in $(seq 1 "$PREFLIGHT_TRIES"); do
+  if ! APPS=$(nvidia-smi -i "$BENCH_GPUS" --query-compute-apps=pid --format=csv,noheader 2>&1); then
+    echo "PREFLIGHT_FAIL:nvidia-smi-apps-query rc=$? out=$APPS" >> "$LOG"; exit 7
+  fi
+  FOREIGN=$(printf '%s' "$APPS" | grep -c '[0-9]' || true)
+  if [ "$FOREIGN" -eq 0 ]; then CLEAR=1; break; fi
+  echo "PREFLIGHT_WAIT:$FOREIGN compute procs on target GPUs" >> "$LOG"
   sleep 5
 done
+if [ "$CLEAR" -ne 1 ]; then
+  echo "PREFLIGHT_FAIL:target GPUs still occupied after $PREFLIGHT_TRIES tries" >> "$LOG"; exit 7
+fi
+echo "PREFLIGHT_PASS" >> "$LOG"
+export CUDA_VISIBLE_DEVICES="$BENCH_GPUS"
 echo "RUN_START:$(date -u +%F_%T)" >> "$LOG"
 export BENCH_OUTPUT="$JSON"
-timeout ${BENCH_TIMEOUT:-600} python3 -m torch.distributed.run --standalone \
+timeout "${BENCH_TIMEOUT:-600}" python3 -m torch.distributed.run --standalone \
   --nproc-per-node=4 -m benchmarks.bench_sm90_fwd >> "$LOG" 2>&1
 RC=$?
 echo "RUN_REAL_EXIT:$RC" >> "$LOG"
 echo "RUN_END:$(date -u +%F_%T)" >> "$LOG"
-ln -sf "$LOG" "/mok/runs/$TAG-latest.log"   # convenience only, never evidence
-ln -sf "$JSON" "/mok/runs/$TAG-latest.json" # convenience only, never evidence
 exit $RC
