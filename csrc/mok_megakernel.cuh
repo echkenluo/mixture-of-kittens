@@ -4,6 +4,7 @@
 #include "pyutils/torchutils.cuh"
 
 #include "sm90_compat.cuh"
+#include "sm90_gemm_worker.cuh"
 
 #include "mxfp8.cuh"
 #include "utils.cuh"
