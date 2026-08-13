@@ -160,6 +160,16 @@ def main() -> None:
     torch.cuda.synchronize()
     dist.barrier()
 
+    # PID namespace note: inside the container /proc/self/status NSpid is a
+    # single (container) value - the host PID is NOT visible from here. The
+    # host-side launcher captures `docker top` into the run log; acceptance
+    # matches NVML host PIDs against that capture, never against these.
+    nspid = "?"
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("NSpid"):
+                nspid = line.split(":", 1)[1].strip()
+                break
     pid_t = torch.tensor([os.getpid()], dtype=torch.int64, device=device)
     pid_g = [torch.empty_like(pid_t) for _ in range(world_size)]
     dist.all_gather(pid_g, pid_t)
@@ -191,7 +201,9 @@ def main() -> None:
                 "torch": torch.__version__, "cuda": torch.version.cuda,
                 "gpu_snapshot_start": snap_start,
                 "gpu_snapshot_end": gpu_snapshot(),
-                "self_rank_pids": sorted(self_pids),
+                "self_rank_pids_container_ns": sorted(self_pids),
+                "self_nspid_rank0": nspid,
+                "host_pid_mapping": "runner-level docker top capture (see run log)",
                 "statistics_semantics": "p50/p95 over 100 per-launch rank-max "
                                         "samples; cross-launch aggregation is "
                                         "computed externally over >=5 launches",
