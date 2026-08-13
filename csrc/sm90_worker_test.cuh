@@ -52,7 +52,7 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B) {
         b_gl{reinterpret_cast<kittens::bf16*>(B.data_ptr()), nullptr, nullptr, (int)B.size(0), (int)B.size(1)},
         d_gl{reinterpret_cast<kittens::bf16*>(D.data_ptr()), nullptr, nullptr, 128, 128},
         (int)(A.size(1) / 64)};
-    constexpr int SMEM = sizeof(a_st) + sizeof(b_st) + sizeof(d_st) + 1024;
+    constexpr int SMEM = sizeof(a_st) + 2 * sizeof(b_st) + sizeof(d_st) + 1024;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     kernel<<<1, 128, SMEM>>>(g);
     return D;
