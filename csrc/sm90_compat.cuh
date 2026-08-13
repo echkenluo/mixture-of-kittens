@@ -60,7 +60,7 @@ namespace detail { namespace tcgen05 {
 template<int CLUSTER_SIZE> __device__ static inline void commit(semaphore &sem) {
     // wgmma path: outputs are already in registers when the producer loop
     // ends; arrive the cluster-visible semaphore both CTAs wait on.
-    if (warp::laneid() == 0) tma::cluster::arrive(sem, 0);
+    if (::kittens::warp::laneid() == 0) ::kittens::warp::tma::cluster::arrive(sem, 0);
 }
 }} // namespace detail::tcgen05
 } // namespace kittens
