@@ -230,3 +230,16 @@ else {z,2y+1,k}); (3) wgmma_quad takes explicit IS_AB; (4) expect_bytes
 ownership moved into the elected producer before the first TMA load
 (consumer only waits). Note: two legacy expect sites remain inside the
 `false &&`-disabled SM100 issue branch - dead on SM90 by construction.
+
+## R36c VALID BUILD - staged path 8/8 green (codex independently checked)
+BUILD_EXIT:0, REAL_EXIT:0. AB/ABt x K=256/4096, max_rel 0.00384-0.00389,
+zero_frac 0 - the EXACT aliased-quadrant epilogue is numerically verified.
+Resource budget (forward globals_fwd instances, ptxas): 255 reg, 5 barriers,
+384 B static smem, 0 stack/spill. Launch: dynamic 231424 B + static 384 B =
+231808 B vs 232448 B cap (640 B physical margin); combine token_chunks
+229376 B leaves 1025 B worst-case alignment margin. LEGAL BUT TIGHT: no new
+static smem or registers without reopening this budget. bwd spills
+(116/132 B) are outside the SM90 BF16-forward contract - documented, not
+misattributed. Process hardening now standing: flock, no self-matching
+pkill, log-head evidence (precheck/marker/BUILD_START) required to call a
+build running.
