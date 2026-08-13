@@ -55,7 +55,11 @@ static __device__ __forceinline__ void mxfp8_quantize_single_block(
     // Compute the e8m0 scale, rounding towards positive infinity and saturating to finite (https://arxiv.org/pdf/2506.08027)
     const float scale = max(__bfloat162float(__hmax(amax.x, amax.y)) * 0.002232142857f, 0.000000000001f);
     uint16_t scale_fp8x2;
+    #if defined(KITTENS_SM90)
+    scale_fp8x2 = 0; // scaffold: ue8m0 cvt is SM100-only
+#else
     asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}" : "=h"(scale_fp8x2) : "f"(scale), "f"(scale));
+#endif
     scale_byte = scale_fp8x2 & 0xFF;
     const float scale_inv = __uint_as_float((254u - scale_byte) << 23); // directly build float32 reciprocal without division
 
