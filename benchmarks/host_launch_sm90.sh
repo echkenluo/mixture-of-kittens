@@ -14,6 +14,7 @@ set -uo pipefail
 CT=${1:?container name}
 MOKDIR=${2:?host mok dir}
 TAG=${BENCH_TAG:?BENCH_TAG required}
+: "${MOK_FROZEN_COMMIT:?MOK_FROZEN_COMMIT required (non-empty)}"
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 LOG=$MOKDIR/runs/$TAG-$RUN_ID.log
 SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host  # host-owned dir; container never touches it

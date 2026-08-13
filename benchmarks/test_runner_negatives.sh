@@ -25,7 +25,7 @@ sleep 25  # let the holder expire
 
 # N3: launcher must fail fast when runner never starts (bad container name)
 set +e
-OUT=$(BENCH_TAG=negn bash "$DIR/host_launch_sm90.sh" no-such-container "$MOKDIR" 2>&1)
+OUT=$(BENCH_TAG=negn MOK_FROZEN_COMMIT=negtest bash "$DIR/host_launch_sm90.sh" no-such-container "$MOKDIR" 2>&1)
 RC3=$?
 set -e 2>/dev/null || true
 [ "$RC3" -ne 0 ] && echo "$OUT" | grep -q "LAUNCH_VERIFY_FAIL"; report 3_no_start $?
@@ -37,14 +37,15 @@ OUT=$(docker exec -e BENCH_TAG=nego -e RUN_ID=neg4 -e EXPECTED_HARNESS_SHA256=$(
 echo "$OUT" | grep -q "RC:7" && grep -q "PREFLIGHT_FAIL" "$MOKDIR/runs/nego-neg4.log"; report 4_occupied $?
 sleep 35  # holder expiry
 
-# N5: unwritable sidecar dir -> launcher hard fail exit 4
-RO=$MOKDIR/negro; mkdir -p "$RO/runs" 2>/dev/null; chmod 555 "$RO/runs" 2>/dev/null
+# N5: unwritable HOST-RUNS dir -> launcher hard fail exit 4 with the
+# exact "sidecar not writable" message (sidecar lives in host-runs now)
+RO=$MOKDIR/negro; mkdir -p "$RO/host-runs" 2>/dev/null; chmod 555 "$RO/host-runs" 2>/dev/null
 set +e
-BENCH_TAG=negs bash "$DIR/host_launch_sm90.sh" "$CT" "$RO" >/dev/null 2>&1
+OUT5=$(BENCH_TAG=negs MOK_FROZEN_COMMIT=negtest bash "$DIR/host_launch_sm90.sh" "$CT" "$RO" 2>&1)
 RC5=$?
 set -e 2>/dev/null || true
-chmod 755 "$RO/runs" 2>/dev/null
-[ "$RC5" -eq 4 ]; report 5_sidecar_unwritable $?
+chmod 755 "$RO/host-runs" 2>/dev/null; rm -rf "$RO" 2>/dev/null
+[ "$RC5" -eq 4 ] && echo "$OUT5" | grep -q "sidecar not writable"; report 5_sidecar_unwritable $?
 
 echo "NEGATIVES: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
