@@ -210,3 +210,15 @@ wgmma_quad passes vs torch.matmul on BOTH layouts: AB & ABt, K=256/4096,
 max_rel 0.39%, zero_frac 0. Next: step-B megakernel rewiring (producer loads
 both a-halves+b-halves per ring stage, expect_bytes 2x(A+B), consumer
 quadrant steps, epilogue drains stitched halves at {2x+h}).
+
+## Gate remediation VERIFIED (codex issue 3 closed properly)
+tests/sm90_gates_check.py (run on H20): import+torch.ops.mok registration OK
+(earlier infer_schema failure = stale __pycache__; AST confirms decorator
+adjacency intact); mxfp8_quantize full-signature dispatcher call raises
+NotImplementedError; all three fused ops proven to reach _sm90_reject as the
+FIRST statement via sentinel monkeypatch on the undecorated implementations
+(TypeError shortcuts explicitly not counted). With these real fail-fast
+gates, the SM90 scoping of the MXFP8 packing static_assert is justified:
+the exempted path is unreachable from the public API.
+Separately: R31 quadrant worker unit test green (AB & ABt, K=256/4096,
+max_rel 0.39%, zero_frac 0) - kept as an independent result.
