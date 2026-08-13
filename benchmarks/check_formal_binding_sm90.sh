@@ -37,9 +37,29 @@
 #   any violation             -> exit 18 FORMAL_BINDING_FAIL:<why>
 #   formal requested          -> exit 18, always
 #   LOCAL_BINDING_ONLY=1 + ok -> exit 0, prints LOCAL_BINDING_PASS:<so_sha256>
+#     which asserts agreement between artifacts ONLY, and only as far as the
+#     tooling running it can be trusted - see the entrypoint note below
 # Usage: EXPECTED_RECEIPT_SHA256=... [EXPECTED_BUILD_RECORD_SHA256=...] \
 #          check_formal_binding_sm90.sh <receipt> <record> <manifest> <so_dir>
 set -uo pipefail
+# Same misuse protection as the launcher and the generator, and the same
+# boundary: every comparison below shells out through PATH, so LOCAL_BINDING_
+# PASS means "these artifacts agree WHEN THE TOOLING IS TRUSTED". It is not an
+# independently trustworthy local chain, and it is not a step toward formal.
+[[ -x /usr/bin/env && -x /usr/bin/grep ]] \
+  || { echo "FORMAL_BINDING_FAIL:/usr/bin/env or /usr/bin/grep missing"; exit 18; }
+[[ "${BASH_SOURCE[0]}" == "$0" ]] \
+  || { echo "FORMAL_BINDING_FAIL:this checker must be executed, not sourced"; exit 18; }
+BAD_ENTRY=$(/usr/bin/env | /usr/bin/grep -m1 -oE '^(BASH_FUNC_[^=%(]*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=?' || true)
+BAD_ENTRY=${BAD_ENTRY%=}
+if [[ -n $BAD_ENTRY ]]; then
+  case $BAD_ENTRY in
+    BASH_FUNC_*) echo "FORMAL_BINDING_FAIL:exported shell function ${BAD_ENTRY#BASH_FUNC_} is present; a function shadows PATH lookups" ;;
+    *) echo "FORMAL_BINDING_FAIL:$BAD_ENTRY is set; this checker must be started from a clean entrypoint" ;;
+  esac
+  exit 18
+fi
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RCPT=${1:?receipt}; REC=${2:?build record}; MAN=${3:?manifest}; SODIR=${4:?dir holding the deployed _C*.so}
 DIR=$(cd "$(dirname "$0")" && pwd)
 fb() { echo "FORMAL_BINDING_FAIL:$1"; exit 18; }

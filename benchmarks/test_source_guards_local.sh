@@ -123,12 +123,111 @@ check L5_receipt_fields_from_snapshot "$LAUNCH" \
   'rget() { grep "^$1=" "$RECEIPT" '
 # 9: a failed docker image inspect must not be read as "local-only image"
 check L6_inspect_failure_is_not_none "$LAUNCH" \
-  '\[ "\$IRC" -eq 0 \] \|\| \{ echo "IMAGE_TRUST_FAIL:docker image inspect failed' \
+  '\[ "\$IRC" -eq 0 \] \|\| rfail "IMAGE_TRUST_FAIL:docker image inspect failed' \
   '-' \
-  '[ "$IRC" -eq 0 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed' \
-  '[ "$IRC" -eq 99 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed'
+  '[ "$IRC" -eq 0 ] || rfail "IMAGE_TRUST_FAIL:docker image inspect failed' \
+  '[ "$IRC" -eq 99 ] || rfail "IMAGE_TRUST_FAIL:docker image inspect failed'
 
-EXPECTED=9
+# 10-13: launcher properties this repo cannot drive dynamically. The per-run
+# paths contain a run id generated inside the launcher, so nothing outside it
+# can pre-create that exact path, and a test-only override in production code
+# would be worse than the gap. These are SOURCE STRUCTURE GUARDS - they bind the
+# exact creation expressions, not the runtime behaviour, and runtime
+# verification is PENDING on a real host.
+# 10-12: each of the three host evidence files is created by an O_EXCL
+# redirection under noclobber, never by a copy that would follow or truncate an
+# existing path
+check L7_sidecar_created_o_excl "$LAUNCH" \
+  '^if ! \{ : > "\$SIDE"; \} 2>/dev/null; then' \
+  '^touch "\$SIDE"' \
+  'if ! { : > "$SIDE"; } 2>/dev/null; then' \
+  'touch "$SIDE"; if false; then'
+check L9_receipt_snapshot_created_o_excl "$LAUNCH" \
+  '^if ! \{ cat < "\$RECEIPT" > "\$RCOPY"; \} 2>/dev/null; then' \
+  '^cp "\$RECEIPT" "\$RCOPY"' \
+  'if ! { cat < "$RECEIPT" > "$RCOPY"; } 2>/dev/null; then' \
+  'cp "$RECEIPT" "$RCOPY"; if false; then'
+check L10_manifest_snapshot_created_o_excl "$LAUNCH" \
+  '^if ! \{ cat < "\$MANIFEST" > "\$MCOPY"; \} 2>/dev/null; then' \
+  '^cp "\$MANIFEST" "\$MCOPY"' \
+  'if ! { cat < "$MANIFEST" > "$MCOPY"; } 2>/dev/null; then' \
+  'cp "$MANIFEST" "$MCOPY"; if false; then'
+# 13: the chmod gate is TWO lines - the command and the branch that exits 4.
+# Binding only the first line would still pass if the branch became "|| true",
+# so the check reads the following line and a mutation proves it. Chmod failure
+# is not injectable locally (the process owns the files), so runtime remains
+# PENDING on a real host.
+lineno() { grep -nF "$2" "$1" | head -1 | cut -d: -f1; }
+chmod_gate_ok() { # file
+  local F=$1 L
+  L=$(lineno "$F" 'chmod 444 "$MCOPY" "$RCOPY" \')
+  [ -n "$L" ] || return 1
+  sed -n "$((L+1))p" "$F" | grep -qF '|| { echo "LAUNCH_VERIFY_FAIL:cannot make the per-run snapshots read-only"; exit 4; }'
+}
+MUT=$(mktemp)
+if ! chmod_gate_ok "$LAUNCH"; then
+  report L11_snapshot_chmod_is_a_gate 1 "the real file does not have the two-line chmod gate"
+else
+  L=$(lineno "$LAUNCH" 'chmod 444 "$MCOPY" "$RCOPY" \')
+  awk -v n=$((L+1)) 'NR==n {print "  || true"; next} {print}' "$LAUNCH" > "$MUT"
+  if cmp -s "$LAUNCH" "$MUT"; then
+    report L11_snapshot_chmod_is_a_gate 1 "mutation did not apply - the check would be vacuous"
+  elif chmod_gate_ok "$MUT"; then
+    report L11_snapshot_chmod_is_a_gate 1 "guard did not detect a cross-line || true"
+  else
+    report L11_snapshot_chmod_is_a_gate 0
+  fi
+fi
+rm -f "$MUT"
+# 14: the three creations must actually be ENCLOSED by noclobber. L7/L9/L10 bind
+# the expressions; without this, deleting or moving `set -o noclobber` would
+# leave them green while the redirections stopped being O_EXCL.
+noclobber_encloses() { # file
+  local F=$1 NC OFF A B C
+  NC=$(lineno "$F" 'set -o noclobber')
+  OFF=$(lineno "$F" 'set +o noclobber')
+  A=$(lineno "$F" 'if ! { : > "$SIDE"; } 2>/dev/null; then')
+  B=$(lineno "$F" 'if ! { cat < "$RECEIPT" > "$RCOPY"; } 2>/dev/null; then')
+  C=$(lineno "$F" 'if ! { cat < "$MANIFEST" > "$MCOPY"; } 2>/dev/null; then')
+  [ -n "$NC" ] && [ -n "$OFF" ] && [ -n "$A" ] && [ -n "$B" ] && [ -n "$C" ] \
+    && [ "$NC" -lt "$A" ] && [ "$A" -lt "$B" ] && [ "$B" -lt "$C" ] && [ "$C" -lt "$OFF" ]
+}
+M1=$(mktemp); M2=$(mktemp)
+grep -vF 'set -o noclobber' "$LAUNCH" > "$M1"
+awk -v drop="set -o noclobber" '{ if ($0 ~ /^set -o noclobber$/) next; print }
+  /^set \+o noclobber$/ { print "set -o noclobber" }' "$LAUNCH" > "$M2"
+if ! noclobber_encloses "$LAUNCH"; then
+  report L12_noclobber_encloses_the_creations 1 "the real file does not enclose the three creations"
+elif cmp -s "$LAUNCH" "$M1" || cmp -s "$LAUNCH" "$M2"; then
+  report L12_noclobber_encloses_the_creations 1 "mutation did not apply - the check would be vacuous"
+elif noclobber_encloses "$M1" || noclobber_encloses "$M2"; then
+  report L12_noclobber_encloses_the_creations 1 "guard survived deleting or moving the noclobber line"
+else
+  report L12_noclobber_encloses_the_creations 0
+fi
+rm -f "$M1" "$M2"
+# 15-16: the resolved operational knobs must actually reach the runner, and the
+# host completion wait must use the resolved value. Source structure only -
+# driving these needs a real container; runtime verification PENDING.
+check L13_knobs_reach_the_runner "$LAUNCH" \
+  'ENVARGS\+=\(-e PREFLIGHT_TRIES="\$PREFLIGHT_TRIES" -e BENCH_TIMEOUT="\$BENCH_TIMEOUT"\)' \
+  '\[ -n "\$\{PREFLIGHT_TRIES:-\}" \] && ENVARGS' \
+  'ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES" -e BENCH_TIMEOUT="$BENCH_TIMEOUT")' \
+  '[ -n "${PREFLIGHT_TRIES:-}" ] && ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES")'
+check L14_completion_wait_uses_resolved_value "$LAUNCH" \
+  '^WAIT=\$BENCH_WAIT_SECS$' \
+  '^WAIT=\$\{BENCH_WAIT_SECS:-900\}$' \
+  'WAIT=$BENCH_WAIT_SECS' \
+  'WAIT=${BENCH_WAIT_SECS:-900}'
+# 17: a gate that rejects after the sidecar is reserved must record why, and the
+# reservation must never be replaced by a renamed temp file
+check L8_rejections_are_recorded "$LAUNCH" \
+  'rfail\(\) \{ side "LAUNCH_REJECTED:' \
+  'mv -f "\$HTMP" "\$SIDE"' \
+  'rfail() { side "LAUNCH_REJECTED:' \
+  'rfail() { : "LAUNCH_REJECTED:'
+
+EXPECTED=17
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "GUARD_COUNT_FAIL:ran $TOTAL guards, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "SOURCE_GUARDS pass=$PASS fail=$FAIL"

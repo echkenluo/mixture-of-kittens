@@ -1,21 +1,39 @@
 #!/bin/bash
-# Packaging / validation side adversarial suite (tracked, no GPU, no docker,
-# no torch, no real build).
+# Packaging / validation side adversarial suite (tracked). No GPU, no torch, no
+# real build, and no live container or working docker daemon is required.
+# It does NOT mean docker is never invoked: the hardened launcher resolves its
+# tools through a pinned PATH, so new-side launcher cases run the real docker
+# CLI if one is installed and are expected to stop at that gate. Old-side cases
+# still use the mock docker/nvidia-smi, because the old launcher took PATH from
+# the caller.
 #
 # Scope: make_deploy_receipt.sh, validate_receipt_sm90.sh,
 # validate_manifest_sm90.sh, check_formal_binding_sm90.sh, host_launch_sm90.sh.
 #
-# Every case that claims a fix runs the SAME attack against 25cc1f5 first and
-# shows it succeeding there. Cases marked "regression guard" pin behaviour that
-# already existed and are labelled as such - they are not credited as fixes.
+# EVIDENCE CLASSES, per case - do not read a green count as more than this:
+#   dynamic old+new  - the attack is executed against the earlier code AND
+#                      against the current code. Which earlier code is named in
+#                      each case: 25cc1f5 for defects that predate the
+#                      packaging round, d3d1467 for defects that round
+#                      introduced (PKG16, PKG17).
+#   dynamic old only - the attack is executed here against the earlier code
+#                      (PKG20 inspect failure, PKG21 source TOCTOU). The new
+#                      refusal cannot be driven locally, because the hardened
+#                      launcher pins PATH and the mock docker/nvidia-smi no
+#                      longer resolve. The new behaviour is pinned as
+#                      mutation-checked SOURCE guards (L4/L5/L6 in
+#                      test_source_guards_local.sh): static structure evidence,
+#                      runtime verification PENDING on a real host.
+#   regression guard - behaviour that already existed, pinned so it cannot
+#                      regress; not credited as a fix.
 #
-# WHAT THIS SUITE CANNOT COVER. The hardened launcher pins PATH, so the mock
-# docker/nvidia-smi that drive a full launch no longer resolve: every new-side
-# launcher case here therefore ends at or before the first docker call. The
-# post-docker gates (RepoDigests handling, process shape, telemetry) are pinned
-# as mutation-checked SOURCE guards in test_source_guards_local.sh instead. The
-# deployment-tooling boundary itself stays UNVERIFIED: a hostile /usr/bin is
-# outside what any of this can detect.
+# Not covered dynamically anywhere: the O_EXCL property of the per-run paths
+# (the run id is generated inside the launcher, so no outside process can
+# pre-create that exact path) - guards L7/L9/L10, source structure only; and
+# the container's log/json creation, which is a plain truncating write.
+#
+# The deployment-tooling boundary stays UNVERIFIED: a hostile /usr/bin defeats
+# every hash comparison in these scripts and nothing here can detect it.
 #
 # Usage: bash test_packaging_audit_local.sh
 set -uo pipefail
@@ -28,6 +46,7 @@ H64() { printf "$1%.0s" $(seq 1 64); }
 H40() { printf "$1%.0s" $(seq 1 40); }
 GIT="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false -c init.defaultBranch=main"
 OLDREF=25cc1f5
+MIDREF=d3d1467   # the first packaging round, itself under review
 
 TMPD=$(mktemp -d)
 trap '[ -n "${PKG_KEEP_TMPD:-}" ] && { echo "PKG_TMPD_KEPT:$TMPD"; exit 0; }; rm -rf "$TMPD"' EXIT
@@ -36,6 +55,11 @@ mkdir -p "$OLD"
 git -C "$REPO" archive "$OLDREF" benchmarks 2>/dev/null | tar x -C "$OLD" || true
 OLDB=$OLD/benchmarks
 [ -f "$OLDB/host_launch_sm90.sh" ] || { echo "PKG_SETUP_FAIL:cannot extract $OLDREF"; exit 1; }
+MID=$TMPD/mid
+mkdir -p "$MID"
+git -C "$REPO" archive "$MIDREF" benchmarks 2>/dev/null | tar x -C "$MID" || true
+MIDB=$MID/benchmarks
+[ -f "$MIDB/host_launch_sm90.sh" ] || { echo "PKG_SETUP_FAIL:cannot extract $MIDREF"; exit 1; }
 
 # ---------------------------------------------------------------- fixtures --
 # a launcher harness: mok tree, manifest, receipt, mock docker/nvidia-smi
@@ -289,6 +313,64 @@ report 15b_edited_gate_code_refused $?
 echo "  15b rc=$R want=2(edited gate file in the worktree)"
 ( cd "$PKGREPO" && $GIT checkout -- benchmarks/validate_receipt_sm90.sh ) >/dev/null 2>&1
 
+# PKG16: d3d1467 added self-binding, and d3d1467's own version of it was
+# bypassable. It took dirname "${BASH_SOURCE[0]}" AFTER cd'ing into the target
+# repo, so a RELATIVE invocation from an attacker directory resolved to the
+# TARGET repo's benchmarks/ - it hashed the canonical scripts, self-bound clean,
+# and published, while the code that actually ran was the attacker's copy.
+# The attack therefore runs d3d1467's generator (MIDB), not 25cc1f5's, which
+# had no self-binding at all and would prove nothing here.
+# The target repo carries the current committed scripts throughout.
+cp "$DIR"/*.sh "$PKGREPO/benchmarks/"
+( cd "$PKGREPO" && $GIT add -A && { $GIT commit -qm resync || $GIT diff --quiet HEAD; } ) >/dev/null 2>&1 \
+  || { echo "PKG_SETUP_FAIL:cannot resync the packaging repo"; exit 1; }
+ATK=$TMPD/attacker
+mkdir -p "$ATK/benchmarks"
+cp "$MIDB/make_deploy_receipt.sh" "$ATK/benchmarks/make_deploy_receipt.sh"
+python3 - "$ATK/benchmarks/make_deploy_receipt.sh" << 'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+assert s.count('cd "$REPO"\n') == 1, "d3d1467 generator shape changed"
+p.write_text(s.replace('cd "$REPO"\n', 'echo "MARKER_A_RAN" >&2\ncd "$REPO"\n', 1))
+PY
+set +e
+O=$( cd "$ATK" && IMAGE_ID="sha256:$(H64 7)" IMAGE_REF=img:7 IMAGE_REPO_DIGESTS=NONE \
+     BINARY_BUILD_COMMIT=UNKNOWN bash benchmarks/make_deploy_receipt.sh "$PKGREPO" \
+     benchmarks/manifests/tiny-h20-v1.manifest "$TMPD/bypass.receipt" 2>&1 ); R=$?
+set -u
+{ [ "$R" -eq 0 ] && [ -f "$TMPD/bypass.receipt" ] \
+  && has1 "$O" '^MARKER_A_RAN$' && has1 "$O" '^EXPECTED_RECEIPT_SHA256:[0-9a-f]{64}$' \
+  && [ "$(printf '%s\n' "$O" | grep -c 'generator is running from' || true)" -eq 0 ]; }
+report 16a_d3d1467_selfbinding_bypassed_by_relative_path $?
+echo "  16a d3d1467 rc=$R published a receipt; the marker shows the attacker's copy is what ran"
+cp "$DIR/make_deploy_receipt.sh" "$ATK/benchmarks/make_deploy_receipt.sh"
+python3 - "$ATK/benchmarks/make_deploy_receipt.sh" << 'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+assert s.count('SELF=$(readlink -f "${BASH_SOURCE[0]}")') == 1
+p.write_text(s.replace('SELF=$(readlink -f "${BASH_SOURCE[0]}")',
+                       'echo "MARKER_A_RAN" >&2\nSELF=$(readlink -f "${BASH_SOURCE[0]}")', 1))
+PY
+set +e
+O=$( cd "$ATK" && IMAGE_ID="sha256:$(H64 8)" IMAGE_REF=img:8 IMAGE_REPO_DIGESTS=NONE \
+     BINARY_BUILD_COMMIT=UNKNOWN bash benchmarks/make_deploy_receipt.sh "$PKGREPO" \
+     benchmarks/manifests/tiny-h20-v1.manifest "$TMPD/bypass2.receipt" 2>&1 ); R=$?
+set -u
+{ [ "$R" -eq 2 ] && [ ! -f "$TMPD/bypass2.receipt" ] && has1 "$O" '^MARKER_A_RAN$' \
+  && has1 "$O" '^RECEIPT_FAIL:generator is running from .*/attacker/benchmarks, not .*/pkgrepo/benchmarks$'; }
+report 16b_relative_path_bypass_refused $?
+echo "  16b rc=$R want=2, nothing published, and the marker still proves which copy ran"
+# an ordinary RELATIVE repo argument must still work - d3d1467 resolved the repo
+# a second time after the cd and died on it
+set +e
+O=$( cd "$TMPD" && IMAGE_ID="sha256:$(H64 9)" IMAGE_REF=img:9 IMAGE_REPO_DIGESTS=NONE \
+     BINARY_BUILD_COMMIT=UNKNOWN bash pkgrepo/benchmarks/make_deploy_receipt.sh pkgrepo \
+     benchmarks/manifests/tiny-h20-v1.manifest "$TMPD/rel.receipt" 2>&1 ); R=$?
+set -u
+[ "$R" -eq 0 ] && [ -f "$TMPD/rel.receipt" ] && has1 "$O" '^EXPECTED_RECEIPT_SHA256:[0-9a-f]{64}$'
+report 16c_relative_repo_argument_still_works $?
+echo "  16c rc=$R want=0 (regression the path fix must not introduce)"
+
 # ================================================================= launcher ==
 HW=$TMPD/harness
 mkdir -p "$HW"
@@ -342,8 +424,16 @@ clean_runs "$HW"
 O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=forge EXPECTED_RECEIPT_SHA256=$HRSHA \
       bash "$OLDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/forged.receipt" 2>&1 ); R=$?
 set -u
-[ "$(printf '%s\n' "$O" | grep -c 'RECEIPT_TRUST_FAIL' || true)" -eq 0 ]; report 08a_old_anchor_forged_by_path_shim $?
-echo "  08a old accepted a forged receipt because sha256sum came from the caller's PATH"
+# measured with the REAL tool, outside the launcher's environment
+FORGED_ACTUAL=$(/usr/bin/sha256sum "$HW/forged.receipt" | cut -d' ' -f1)
+OLDRCOPY=$(ls "$HM"/host-runs/*.receipt 2>/dev/null | head -1)
+COPY_ACTUAL=$(/usr/bin/sha256sum "$OLDRCOPY" 2>/dev/null | cut -d' ' -f1)
+SIDE_RECORDED=$(grep -h '^RECEIPT_SHA256:' "$HM"/host-runs/*.host 2>/dev/null | cut -d: -f2)
+{ [ "$FORGED_ACTUAL" != "$HRSHA" ] && [ "$COPY_ACTUAL" = "$FORGED_ACTUAL" ] \
+  && [ "$SIDE_RECORDED" = "$HRSHA" ] && [ "$R" -eq 7 ] \
+  && has1 "$O" '^LAUNCH_VERIFY_FAIL:docker exec failed$'; }
+report 08a_old_anchor_forged_by_path_shim $?
+echo "  08a old: per-run copy is the forged file ($COPY_ACTUAL), sidecar recorded the anchored $SIDE_RECORDED, run reached the runner launch (rc=$R)"
 set +e
 clean_runs "$HW"
 O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=forge EXPECTED_RECEIPT_SHA256=$HRSHA \
@@ -353,14 +443,22 @@ set -u
 report 08b_pinned_path_defeats_the_shim $?
 echo "  08b rc=$R want=14 (misuse protection only - a hostile /usr/bin still wins)"
 rm -f "$HW/bin/sha256sum"
-# PKG09: measurement thresholds are contract, not caller preference
+# PKG09: measurement thresholds decided the verdict from caller env. Both runs
+# use the same fixture and the same live load; only the caller's number differs.
 set +e
-O=$(oldlaunch BENCH_TAG=thr LOAD1_MAX_PRELAUNCH=99999); R=$?
+O=$(oldlaunch BENCH_TAG=thr0 LOAD1_MAX_PRELAUNCH=0); R0=$?
+S0=$(grep -h '^PRELAUNCH_LOAD1_GATE:' "$HM"/host-runs/*.host 2>/dev/null)
 set -u
-has1 "$O" '^.*PRELAUNCH_LOAD1_GATE.*max=99999.*$' || \
-  [ "$(printf '%s\n' "$O" | grep -c 'TELEMETRY_GATE_FAIL:prelaunch load1' || true)" -eq 0 ]
-report 09a_old_took_a_caller_threshold $?
-echo "  09a old accepted LOAD1_MAX_PRELAUNCH=99999 from the caller"
+set +e
+O2=$(oldlaunch BENCH_TAG=thr9 LOAD1_MAX_PRELAUNCH=99999); R9=$?
+S9=$(grep -h '^PRELAUNCH_LOAD1_GATE:' "$HM"/host-runs/*.host 2>/dev/null)
+set -u
+{ [ "$R0" -eq 15 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:TELEMETRY_GATE_FAIL:prelaunch load1 .* above 0$' \
+  && has1 "$S0" '^PRELAUNCH_LOAD1_GATE:load1=[0-9.]+ max=0 ok=0$' \
+  && [ "$R9" -eq 7 ] && has1 "$O2" '^LAUNCH_VERIFY_FAIL:docker exec failed$' \
+  && has1 "$S9" '^PRELAUNCH_LOAD1_GATE:load1=[0-9.]+ max=99999 ok=1$'; }
+report 09a_old_verdict_followed_the_caller_number $?
+echo "  09a old: max=0 -> rc=$R0 gate ok=0 | max=99999 -> rc=$R9 gate ok=1, reached the runner launch"
 set +e
 O=$(newlaunch BENCH_TAG=thr LOAD1_MAX_PRELAUNCH=99999); R=$?
 set -u
@@ -392,17 +490,14 @@ SNAPSHA=$(sha256sum "$SNAP" 2>/dev/null | cut -d' ' -f1)
 { [ "$MODE" = "444" ] && [ "$SNAPSHA" = "$(sha256sum "$HW/man" | cut -d' ' -f1)" ]; }
 report 11a_snapshot_is_readonly_and_anchored $?
 echo "  11a per-run manifest snapshot mode=$MODE and equals the anchored bytes"
-clean_runs "$HW"
-mkdir -p "$HM/host-runs"
-ln -sf /etc/passwd "$HM/host-runs/plant.host" 2>/dev/null
-set +e
-O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=plant EXPECTED_RECEIPT_SHA256=$HRSHA \
-      RUN_ID_OVERRIDE=1 bash -c '
-        exec bash "$1" ct "$2" "$3" "$4"' _ "$DIR/host_launch_sm90.sh" "$HM" "$HW/man" "$HW/receipt" 2>&1 )
-set -u
-[ -L "$HM/host-runs/plant.host" ]; report 11b_planted_symlink_not_followed $?
-echo "  11b a planted symlink in host-runs/ is still a symlink (nothing wrote through it)"
-# PKG12: a schema-2 receipt asserts provenance the launcher is given no record for
+# NOTE: the O_EXCL property of the per-run files is NOT dynamically tested
+# here. The path contains a run id generated inside the launcher, so nothing
+# outside it can pre-create that exact path, and adding a test-only override to
+# production code would be worse than the gap. It is pinned as a
+# mutation-checked SOURCE guard (L7) instead, and that is static evidence.
+# PKG12: a schema-2 receipt asserts provenance the launcher is given no record
+# for. Both sides are called with the real host_launch signature
+# (<container> <mokdir> <manifest> <receipt>) and the schema-2 receipt.
 sed 's|^RECEIPT_SCHEMA=1$|RECEIPT_SCHEMA=2|' "$HW/receipt" > "$HW/r2"
 echo "BUILD_RECORD_SHA256=$(H64 7)" >> "$HW/r2"
 sed -i 's|^BINARY_BUILD_COMMIT=UNKNOWN$|BINARY_BUILD_COMMIT='"$(H40 d)"'|' "$HW/r2"
@@ -410,18 +505,149 @@ chmod 444 "$HW/r2"; R2SHA=$(sha256sum "$HW/r2" | cut -d' ' -f1)
 set +e
 clean_runs "$HW"
 O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=s2 EXPECTED_RECEIPT_SHA256=$R2SHA \
-      bash "$OLDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/receipt" 2>&1 ); R=$?
+      bash "$OLDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/r2" 2>&1 ); R=$?
 set -u
-[ "$(printf '%s\n' "$O" | grep -c 'claims a build-record binding' || true)" -eq 0 ]
-report 12a_old_did_not_notice_schema2 $?
-echo "  12a old had no opinion about a record-bound receipt in canary"
+# it must get PAST receipt validation and the schema gate, all the way to the
+# runner launch - "no error yet" would not show that
+[ "$R" -eq 7 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:docker exec failed$' \
+  && [ "$(printf '%s\n' "$O" | grep -c 'claims a build-record binding' || true)" -eq 0 ]
+report 12a_old_ran_a_record_bound_receipt $?
+echo "  12a old rc=$R reached the runner launch with a schema-2 receipt"
 set +e
 clean_runs "$HW"
 O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=s2 EXPECTED_RECEIPT_SHA256=$R2SHA \
-      bash "$DIR/host_launch_sm90.sh" ct "$HM" "$HW/r2" "$HW/man" 2>&1 ); R=$?
+      bash "$DIR/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/r2" 2>&1 ); R=$?
 set -u
-[ "$R" -ne 0 ]; report 12b_schema2_refused_in_canary $?
-echo "  12b rc=$R want!=0 (no record is supplied to this launcher)"
+[ "$R" -eq 14 ] && has1 "$O" '^RECEIPT_TRUST_FAIL:receipt schema 2 claims a build-record binding, and no record is supplied to this launcher$'
+report 12b_schema2_refused_in_canary $?
+echo "  12b rc=$R want=14 with the exact reason"
+# PKG17: d3d1467 reserved the sidecar and both snapshots and then rejected the
+# run with a bare echo, leaving an empty .host next to two snapshots - the
+# shape of a canonical run, with no state recorded anywhere.
+set +e
+clean_runs "$HW"
+O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=rej EXPECTED_RECEIPT_SHA256=$(H64 f) \
+      bash "$MIDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/receipt" 2>&1 ); R=$?
+set -u
+MIDSIDE=$(ls "$HM"/host-runs/*.host 2>/dev/null | head -1)
+MIDBYTES=$(stat -c %s "$MIDSIDE" 2>/dev/null || echo missing)
+MIDSNAPS=$(ls "$HM"/host-runs/*.manifest "$HM"/host-runs/*.receipt 2>/dev/null | wc -l)
+{ [ "$R" -eq 14 ] && [ "$MIDBYTES" = "0" ] && [ "$MIDSNAPS" -eq 2 ]; }
+report 17a_mid_left_unlabelled_evidence $?
+echo "  17a d3d1467 rc=$R left a ${MIDBYTES}-byte sidecar next to $MIDSNAPS snapshots, with no state"
+set +e
+clean_runs "$HW"
+O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=rej EXPECTED_RECEIPT_SHA256=$(H64 f) \
+      bash "$DIR/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/receipt" 2>&1 ); R=$?
+set -u
+NEWSIDE=$(ls "$HM"/host-runs/*.host 2>/dev/null | head -1)
+{ [ "$R" -eq 14 ] && [ -s "$NEWSIDE" ] \
+  && [ "$(grep -c '^LAUNCH_STATE:INCOMPLETE$' "$NEWSIDE" || true)" -eq 1 ] \
+  && [ "$(grep -c '^LAUNCH_REJECTED:RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch' "$NEWSIDE" || true)" -eq 1 ]; }
+report 17b_rejection_is_recorded_in_the_sidecar $?
+echo "  17b rc=$R and the sidecar carries LAUNCH_STATE:INCOMPLETE plus the rejection reason"
+# PKG19: operational knobs are range-checked instead of being passed through raw
+set +e
+O=$(newlaunch BENCH_TAG=knob PREFLIGHT_TRIES=abc); R=$?
+set -u
+[ "$R" -eq 4 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:PREFLIGHT_TRIES must be an integer, got \[abc\]$'
+report 19_operational_knob_is_validated $?
+echo "  19 rc=$R want=4"
+
+# PKG20 (dynamic OLD only): a failed `docker image inspect` was turned into
+# IMAGE_REPO_DIGESTS=NONE, so a daemon error satisfied a receipt that says NONE.
+# The new refusal cannot be driven here - the hardened launcher pins PATH, so
+# this mock is unreachable - and is pinned as source guard L6 instead.
+mkdir -p "$TMPD/bin_inspectfail"
+cp "$HW/bin/nvidia-smi" "$TMPD/bin_inspectfail/"
+sed 's|"image inspect"\*)      echo ""; exit 0 ;;|"image inspect"*)      echo "docker: error during connect (simulated)" >\&2; exit 1 ;;|' \
+  "$HW/bin/docker" > "$TMPD/bin_inspectfail/docker"
+chmod +x "$TMPD/bin_inspectfail/docker"
+grep -q 'simulated' "$TMPD/bin_inspectfail/docker" || { echo "PKG_SETUP_FAIL:inspect-fail mock not built"; exit 1; }
+set +e
+clean_runs "$HW"
+O=$( cd "$TMPD" && env PATH="$TMPD/bin_inspectfail:$PATH" BENCH_TAG=ins EXPECTED_RECEIPT_SHA256=$HRSHA \
+      bash "$OLDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/receipt" 2>&1 ); R=$?
+set -u
+SIDERD=$(grep -h '^IMAGE_REPO_DIGESTS:' "$HM"/host-runs/*.host 2>/dev/null)
+{ [ "$R" -eq 7 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:docker exec failed$' \
+  && [ "$SIDERD" = "IMAGE_REPO_DIGESTS:NONE" ] \
+  && [ "$(printf '%s\n' "$O" | grep -c 'IMAGE_TRUST_FAIL' || true)" -eq 0 ]; }
+report 20a_old_read_a_tool_failure_as_local_only $?
+echo "  20a old rc=$R passed the image gate on a failed inspect and recorded $SIDERD"
+
+# PKG21 (dynamic OLD only): the source TOCTOU. The manifest is flipped to an
+# attacker variant right after its hash was checked (via the stat call) and
+# restored before the per-run copy (via the first docker call), so the launcher
+# runs with BENCH_GPUS the anchor never covered while every hash still matches.
+# The new launcher snapshots once and reads only the snapshot; that path cannot
+# be driven here either (pinned PATH) and is pinned as guards L4/L5.
+mkdir -p "$TMPD/bin_flip"
+cp "$HW/bin/nvidia-smi" "$TMPD/bin_flip/"
+cp "$HW/man" "$TMPD/man.good"; sed 's|^BENCH_GPUS=.*|BENCH_GPUS=4,5,6,7|' "$TMPD/man.good" > "$TMPD/man.bad"
+chmod 444 "$TMPD/man.good" "$TMPD/man.bad"
+cat > "$TMPD/bin_flip/stat" << EOS
+#!/bin/bash
+for A in "\$@"; do case "\$A" in */man) /usr/bin/cp -f "$TMPD/man.bad" "$HW/man" 2>/dev/null ;; esac; done
+echo 444
+EOS
+sed '2i /usr/bin/cp -f '"$TMPD"'/man.good '"$HW"'/man 2>/dev/null' "$HW/bin/docker" > "$TMPD/bin_flip/docker"
+chmod +x "$TMPD/bin_flip/stat" "$TMPD/bin_flip/docker"
+chmod u+w "$HW/man"
+set +e
+clean_runs "$HW"
+O=$( cd "$TMPD" && env PATH="$TMPD/bin_flip:$PATH" BENCH_TAG=flip EXPECTED_RECEIPT_SHA256=$HRSHA \
+      bash "$OLDB/host_launch_sm90.sh" ct "$HM" "$HW/man" "$HW/receipt" 2>&1 ); R=$?
+set -u
+COPYSHA=$(/usr/bin/sha256sum "$HM"/host-runs/*.manifest 2>/dev/null | head -1 | cut -d' ' -f1)
+GOODSHA=$(/usr/bin/sha256sum "$TMPD/man.good" | cut -d' ' -f1)
+{ [ "$R" -eq 6 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:container gpu index 4 has no uuid$' \
+  && [ "$COPYSHA" = "$GOODSHA" ]; }
+report 21a_old_used_fields_the_anchor_never_covered $?
+echo "  21a old rc=$R ran against BENCH_GPUS=4,5,6,7 while the per-run copy hashed to the anchored manifest"
+chmod 444 "$HW/man"
+/usr/bin/cp -f "$TMPD/man.good" "$HW/man" 2>/dev/null || { chmod u+w "$HW/man"; /usr/bin/cp -f "$TMPD/man.good" "$HW/man"; chmod 444 "$HW/man"; }
+
+# PKG22: a half-finished allocation must leave nothing behind, and must never
+# remove a file it did not create.
+clean_runs "$HW"
+KEEPME=$HM/host-runs/unrelated-preexisting.txt
+echo keep > "$KEEPME"
+cp "$HW/receipt" "$TMPD/unreadable.receipt"; chmod 000 "$TMPD/unreadable.receipt"
+set +e
+O=$( cd "$TMPD" && env PATH="$HW/bin:$PATH" BENCH_TAG=part EXPECTED_RECEIPT_SHA256=$HRSHA \
+      bash "$DIR/host_launch_sm90.sh" ct "$HM" "$HW/man" "$TMPD/unreadable.receipt" 2>&1 ); R=$?
+set -u
+NHOST=$(ls "$HM"/host-runs/*.host 2>/dev/null | wc -l)
+NSNAP=$(ls "$HM"/host-runs/*.manifest "$HM"/host-runs/*.receipt 2>/dev/null | wc -l)
+{ [ "$R" -eq 4 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:receipt snapshot .* already exists or the receipt is unreadable$' \
+  && [ "$NHOST" -eq 0 ] && [ "$NSNAP" -eq 0 ] && [ -f "$KEEPME" ]; }
+report 22_partial_allocation_leaves_nothing $?
+echo "  22 rc=$R left $NHOST sidecars and $NSNAP snapshots; the pre-existing file survived"
+rm -f "$TMPD/unreadable.receipt" "$KEEPME"
+
+# PKG23: the knobs the sidecar reports must be the numbers actually in force
+set +e
+O=$(newlaunch BENCH_TAG=knobdef); R=$?
+K1=$(grep -h '^OPERATIONAL_KNOBS:' "$HM"/host-runs/*.host 2>/dev/null)
+set -u
+has1 "$K1" '^OPERATIONAL_KNOBS:preflight_tries=24 bench_timeout=600 bench_wait_secs=900 '
+report 23a_defaults_are_recorded_as_numbers $?
+echo "  23a $K1"
+set +e
+O=$(newlaunch BENCH_TAG=knobset PREFLIGHT_TRIES=30 BENCH_TIMEOUT=1200 BENCH_WAIT_SECS=1800); R=$?
+K2=$(grep -h '^OPERATIONAL_KNOBS:' "$HM"/host-runs/*.host 2>/dev/null)
+set -u
+has1 "$K2" '^OPERATIONAL_KNOBS:preflight_tries=30 bench_timeout=1200 bench_wait_secs=1800 '
+report 23b_overrides_are_recorded_exactly $?
+echo "  23b $K2"
+set +e
+O=$(newlaunch BENCH_TAG=knobbig PREFLIGHT_TRIES=999999); R=$?
+set -u
+[ "$R" -eq 4 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:PREFLIGHT_TRIES=999999 outside \[1,120\]$'
+report 23c_out_of_range_knob_refused $?
+echo "  23c rc=$R want=4 (999999 tries is a 58-day admission wait)"
+
 # PKG05/PKG07 regression guard: formal is still refused unconditionally
 set +e
 O=$(newlaunch BENCH_TAG=fm BENCH_MODE=formal); R=$?
@@ -430,7 +656,7 @@ set -u
 report 05_formal_mode_still_refused $?
 echo "  05 rc=$R want=14 (regression guard, unchanged behaviour)"
 
-EXPECTED=29
+EXPECTED=40
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "PKG_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "PACKAGING_AUDIT pass=$PASS fail=$FAIL"

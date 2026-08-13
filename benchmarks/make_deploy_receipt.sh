@@ -48,15 +48,25 @@ REPO=${1:?repo dir}; MREL=${2:?manifest relpath}; OUT=${3:?output receipt path}
 : "${IMAGE_REF:?IMAGE_REF required}"
 : "${IMAGE_REPO_DIGESTS:?IMAGE_REPO_DIGESTS required (literal NONE for local-only image)}"
 : "${BINARY_BUILD_COMMIT:?BINARY_BUILD_COMMIT required (full 40-hex with build record, else literal UNKNOWN)}"
-cd "$REPO"
+# Resolve BOTH paths to physical locations BEFORE any cd. The previous version
+# cd'd into the repo first and only then took dirname "${BASH_SOURCE[0]}": with
+# a RELATIVE invocation path (bash benchmarks/make_deploy_receipt.sh) that
+# dirname resolved against the repo, so a tampered copy executing from an
+# attacker directory hashed the target repo's canonical scripts and self-bound
+# clean. It also broke an ordinary relative repo argument, because REPO was
+# resolved a second time after the cd.
+SELF=$(readlink -f "${BASH_SOURCE[0]}") \
+  || { echo "RECEIPT_FAIL:cannot resolve this script's own path"; exit 2; }
+DIR=$(dirname "$SELF")
+REPO_ABS=$(cd "$REPO" 2>/dev/null && pwd -P) \
+  || { echo "RECEIPT_FAIL:repo dir $REPO does not exist"; exit 2; }
+cd "$REPO_ABS"
 DIRTY=$(git status --porcelain -- benchmarks)
 [ -z "$DIRTY" ] || { echo "RECEIPT_FAIL:benchmarks tree not clean vs HEAD (incl. untracked):"; echo "$DIRTY"; exit 2; }
-DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Self-binding, same rule as the build wrapper: this generator and the two
 # validators it calls must BE the committed code of the repository they are
 # describing. A copy run from outside the tree, or an edited worktree file,
 # produces a receipt whose gate code nobody can recompute.
-REPO_ABS=$(cd "$REPO" && pwd)
 [ "$DIR" = "$REPO_ABS/benchmarks" ] \
   || { echo "RECEIPT_FAIL:generator is running from $DIR, not $REPO_ABS/benchmarks"; exit 2; }
 for T in make_deploy_receipt.sh validate_receipt_sm90.sh validate_manifest_sm90.sh; do

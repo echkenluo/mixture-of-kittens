@@ -5,31 +5,44 @@
 # exact comparison of the receipt bytes against that external prior - a
 # read-only bit or schema validity establishes nothing by itself, and a
 # self-consistent rewrite of manifest+receipt still fails here. The verified
-# end never self-signs and performs no git lookups. Gate order:
-#   0. EXPECTED_RECEIPT_SHA256 env present + 64-hex                -> exit 14
-#   1. sha256(receipt) == EXPECTED_RECEIPT_SHA256 (exact)          -> exit 14
-#   2. receipt well-formed + read-only (shared validate_receipt)   -> exit 14
-#   3. BENCH_MODE gate: formal is UNCONDITIONALLY refused (no build-record
-#      contract exists yet); canary runs are labeled INVALID_FOR_FORMAL
-#      in sidecar, log and JSON                                    -> exit 14
-#   4. manifest present -> exit 12; content-bound to receipt and
-#      read-only                                                   -> exit 14
-#   5. shared manifest validation + harness/SO drift               -> exit 12/13
-#   6. receipt<->manifest expected-hash agreement                  -> exit 14
-#   7. live image id/ref/RepoDigests == receipt                    -> exit 14
-#   8. sidecar (atomic header) + per-run manifest AND receipt
-#      copies BEFORE the runner                                    -> exit 4
-#   9. prelaunch telemetry BEFORE docker exec: mapping, occupancy
-#      wait, clocks/load/vmstat snapshot                           -> exit 6/15
-#  10. docker exec runner; launch verification (exact log path,
-#      runner gates, uuid set equality, 1 parent + 4 workers, lock
-#      held, docker-top, per-GPU PID attribution, running clock
-#      floor)                                                      -> exit 5-8/15
-#  11. completion wait with PERIODIC foreign-process sampling on
-#      the target GPUs; RUN_END + exactly one RUN_REAL_EXIT:0 +
-#      parseable JSON                                              -> exit 15
-#  12. end telemetry gates: zero foreign occupancy, zero midrun
-#      foreign hits, load1 delta; sidecar finalized                -> exit 15
+# end never self-signs and performs no git lookups.
+#
+# REAL ORDER (the previous version of this comment described a flow that no
+# longer exists - it claimed an atomic sidecar header written after the image
+# gates, while allocation now happens before any content is verified):
+#   A. entrypoint: no inherited BASH_ENV/ENV/SHELLOPTS/BASHOPTS, no exported
+#      functions, PATH pinned                                      -> exit 4
+#   B. BENCH_TAG is one safe path segment; measurement thresholds are not
+#      caller-settable; operational knobs resolved to numbers      -> exit 4/15
+#   C. BENCH_MODE gate: formal is UNCONDITIONALLY refused          -> exit 14
+#   D. EXPECTED_RECEIPT_SHA256 present + 64-hex; both staged files exist and
+#      are not writable (staging hygiene, not a trust property)    -> exit 14/12
+#   E. PRE-HEADER ALLOCATION: run log/json paths must not exist, then the
+#      sidecar and the two snapshots are created with O_EXCL. Anything that
+#      fails here removes ONLY what this run created and leaves nothing behind
+#      - a pre-existing path is refused by the create, so it never enters the
+#      cleanup list                                                -> exit 4
+#   F. PROGRESSIVE sidecar: the header is written line by line into the file
+#      this run reserved, starting with LAUNCH_STATE:INCOMPLETE. It is NOT an
+#      atomic header, and the cleanup is disarmed from this point: every later
+#      refusal is recorded as LAUNCH_REJECTED in the sidecar rather than erased
+#   G. receipt: snapshot sha == EXPECTED_RECEIPT_SHA256, shared validator,
+#      schema 1 only (a record-bound receipt has no record here)   -> exit 14
+#   H. manifest: snapshot sha == receipt, basename == receipt MANIFEST_FILE,
+#      shared validator + harness/SO drift, receipt<->manifest hashes
+#                                                                  -> exit 12/13/14
+#   I. live image id/ref/RepoDigests == receipt; a failed inspect is an error,
+#      not a local-only image                                      -> exit 14
+#   J. prelaunch telemetry BEFORE docker exec: mapping, occupancy wait,
+#      clocks/load/vmstat snapshot                                 -> exit 6/15
+#   K. docker exec runner; launch verification (exact log path, runner gates,
+#      uuid set equality, 1 parent + 4 workers, lock held, docker-top, per-GPU
+#      PID attribution, running clock floor)                       -> exit 5-8/15
+#   L. completion wait with periodic foreign-process sampling; RUN_END +
+#      exactly one RUN_REAL_EXIT:0 + parseable JSON                -> exit 15
+#   M. end telemetry gates; LAUNCH_STATE_FINAL:COMPLETE + SIDECAR_END
+#
+# All fields are read from the snapshots after E, never from the caller's paths.
 # Gated quantities: target-GPU occupancy (prelaunch / periodic midrun / end),
 # absolute prelaunch load1, load1 delta, and a single-sample running SM clock
 # LIVENESS floor (not a stability gate - see below). Power draw and vmstat are
@@ -75,13 +88,39 @@ printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' \
 # Measurement thresholds are part of the contract, not caller preference: with
 # these as env overrides the same machine state passed or failed purely by what
 # the caller asked for, and the sidecar recorded the caller's number as if it
-# were the contract. Operational knobs (PREFLIGHT_TRIES, BENCH_TIMEOUT,
-# BENCH_WAIT_SECS) stay callable - they can only make a run fail sooner.
+# were the contract.
+# The operational knobs stay callable, but the earlier claim that they "can
+# only make a run fail sooner" was WRONG in both directions: a larger
+# PREFLIGHT_TRIES turns an occupancy wait that would have timed out into a
+# pass, and a larger BENCH_TIMEOUT/BENCH_WAIT_SECS lets a run that would have
+# been abandoned finish. What they cannot do is move a numerical validity
+# threshold. They are range-checked and written into the sidecar so a reader
+# can see what admission policy the run was given.
 for V in LOAD1_MAX_PRELAUNCH LOAD1_DELTA_MAX CLK_RUN_MIN_MHZ; do
   [ -z "$(printenv "$V" || true)" ] \
     || { echo "TELEMETRY_GATE_FAIL:$V is a tracked measurement threshold and cannot be set by the caller"; exit 15; }
 done
 LOAD1_MAX_PRELAUNCH=64; LOAD1_DELTA_MAX=16; CLK_RUN_MIN_MHZ=500
+# Resolved HERE to the number that will actually be in force, so the sidecar
+# records the effective policy rather than the word "default", and the runner
+# is handed the same number instead of applying its own fallback.
+# Bounds are chosen from what the knob does: the preflight loop sleeps 5s per
+# try, so 120 tries is a 10-minute admission wait; the benchmark timeout and
+# the host completion wait are capped at 1h and 2h. The earlier "below
+# 1000000" allowed a ~58-day preflight wait.
+knob() { # name default min max
+  local N=$1 D=$2 LO=$3 HI=$4 V
+  V=$(printenv "$N" || true)
+  [ -z "$V" ] && { echo "$D"; return 0; }
+  printf '%s' "$V" | grep -qE '^[0-9]+$' \
+    || { echo "LAUNCH_VERIFY_FAIL:$N must be an integer, got [$V]" >&2; return 1; }
+  { [ "$V" -ge "$LO" ] && [ "$V" -le "$HI" ]; } \
+    || { echo "LAUNCH_VERIFY_FAIL:$N=$V outside [$LO,$HI]" >&2; return 1; }
+  echo "$V"
+}
+PREFLIGHT_TRIES=$(knob PREFLIGHT_TRIES 24 1 120) || exit 4
+BENCH_TIMEOUT=$(knob BENCH_TIMEOUT 600 1 3600) || exit 4
+BENCH_WAIT_SECS=$(knob BENCH_WAIT_SECS 900 1 7200) || exit 4
 
 BMODE=${BENCH_MODE:-canary}
 case "$BMODE" in formal|canary) : ;; *) echo "MODE_FAIL:BENCH_MODE must be formal or canary (got $BMODE)"; exit 14 ;; esac
@@ -121,76 +160,114 @@ SIDE=$MOKDIR/host-runs/$TAG-$RUN_ID.host
 MCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.manifest
 RCOPY=$MOKDIR/host-runs/$TAG-$RUN_ID.receipt
 mkdir -p "$MOKDIR/host-runs" 2>/dev/null || true
-# O_EXCL for every per-run file: an existing path (or a symlink planted at it)
-# is refused rather than followed or overwritten
+# The three HOST evidence files are created with O_EXCL (noclobber redirection),
+# so an existing path or a planted symlink is refused rather than followed.
+# NOT covered, and stated so rather than implied: the container's run log and
+# the harness JSON are written with plain truncation and os.replace inside the
+# container. The pre-check below refuses a run whose log/json path already
+# exists, which closes the practical collision but is a CHECK, not an atomic
+# create - the window between the check and the container's open stays OPEN.
+for F in "$LOG" "$JSONF"; do
+  [ -e "$F" ] && { echo "LAUNCH_VERIFY_FAIL:run artifact $F already exists"; exit 4; }
+done
+# Until the sidecar carries state, a half-finished allocation is worse than
+# nothing: an empty .host beside one snapshot looks like the start of a
+# canonical run. Only files THIS run created are tracked and removed - a
+# pre-existing path is never touched, because the O_EXCL create refuses it and
+# it therefore never enters the list.
+CREATED=()
+cleanup_partial() { local F; for F in ${CREATED[@]+"${CREATED[@]}"}; do rm -f "$F"; done; }
+trap cleanup_partial EXIT
 set -o noclobber
 if ! { : > "$SIDE"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:sidecar $SIDE already exists"; exit 4; fi
-if ! { cat < "$RECEIPT" > "$RCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:receipt snapshot $RCOPY already exists or is unreadable"; exit 4; fi
-if ! { cat < "$MANIFEST" > "$MCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:manifest snapshot $MCOPY already exists or is unreadable"; exit 4; fi
+CREATED+=("$SIDE")
+if ! { cat < "$RECEIPT" > "$RCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:receipt snapshot $RCOPY already exists or the receipt is unreadable"; exit 4; fi
+CREATED+=("$RCOPY")
+if ! { cat < "$MANIFEST" > "$MCOPY"; } 2>/dev/null; then echo "LAUNCH_VERIFY_FAIL:manifest snapshot $MCOPY already exists or the manifest is unreadable"; exit 4; fi
+CREATED+=("$MCOPY")
 set +o noclobber
-chmod 444 "$MCOPY" "$RCOPY" 2>/dev/null || true
+# a chmod that silently fails leaves evidence writable while the log says it is
+# not; this is a gate, not a nicety
+chmod 444 "$MCOPY" "$RCOPY" \
+  || { echo "LAUNCH_VERIFY_FAIL:cannot make the per-run snapshots read-only"; exit 4; }
 side() { echo "$1" >> "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar write failed"; exit 4; }; }
 fail() { side "LAUNCH_VERIFY_FAIL:$1"; echo "LAUNCH_VERIFY_FAIL:$1"; exit "$2"; }
+# every gate from here on is recorded IN the sidecar before exiting: an
+# abandoned empty .host next to two snapshots used to look exactly like the
+# start of a canonical run
+rfail() { side "LAUNCH_REJECTED:$1"; echo "$1"; exit "$2"; }
+# the header goes into the file this run reserved - the previous version wrote
+# a temp file and mv -f'd it over the reservation, which threw the O_EXCL
+# guarantee away at the last step. Values that are not known yet are appended
+# by the gates that establish them, each exactly once.
+side "SIDECAR_START:$(date -u +%F_%T)"
+side "RUN_ID:$RUN_ID"
+side "LAUNCH_STATE:INCOMPLETE"
+side "BENCH_MODE:$BMODE"
+side "FORMAL_VALIDITY:$FORMAL_VALIDITY"
+side "MANIFEST_FILE:$(basename "$MANIFEST")"
+side "RECEIPT_FILE:$(basename "$RECEIPT")"
+side "RECEIPT_COPY:$(basename "$RCOPY")"
+side "MEASUREMENT_THRESHOLDS:load1_max=$LOAD1_MAX_PRELAUNCH load1_delta_max=$LOAD1_DELTA_MAX clk_run_min_mhz=$CLK_RUN_MIN_MHZ (tracked, not caller-set)"
+side "OPERATIONAL_KNOBS:preflight_tries=$PREFLIGHT_TRIES bench_timeout=$BENCH_TIMEOUT bench_wait_secs=$BENCH_WAIT_SECS (effective values; admission/completion policy, not validity thresholds)"
+# the sidecar now names the run and its policy: from here a rejection is
+# recorded rather than erased
+trap - EXIT
 RSHA=$(sha256sum "$RCOPY" | cut -d' ' -f1)
-[ "$RSHA" = "$EXPR_SHA" ] || { echo "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch (snapshot $RSHA expected $EXPR_SHA)"; exit 14; }
-bash "$DIR/validate_receipt_sm90.sh" "$RCOPY" --check-mode || exit 14
+[ "$RSHA" = "$EXPR_SHA" ] \
+  || rfail "RECEIPT_TRUST_FAIL:EXPECTED_RECEIPT_SHA256 mismatch (snapshot $RSHA expected $EXPR_SHA)" 14
+VOUT=$(bash "$DIR/validate_receipt_sm90.sh" "$RCOPY" --check-mode 2>&1) || rfail "$VOUT" 14
 rget() { grep "^$1=" "$RCOPY" | head -1 | cut -d= -f2-; }
+side "RECEIPT_SCHEMA:$(rget RECEIPT_SCHEMA)"
+side "RECEIPT_SHA256:$RSHA"
 # schema 2 asserts a build-record binding this launcher is given no record to
 # check, so accepting it would run under provenance nothing here verified
 [ "$(rget RECEIPT_SCHEMA)" = "1" ] \
-  || { echo "RECEIPT_TRUST_FAIL:receipt schema $(rget RECEIPT_SCHEMA) claims a build-record binding, and no record is supplied to this launcher"; exit 14; }
+  || rfail "RECEIPT_TRUST_FAIL:receipt schema $(rget RECEIPT_SCHEMA) claims a build-record binding, and no record is supplied to this launcher" 14
 
 
 MSHA=$(sha256sum "$MCOPY" | cut -d' ' -f1)
+side "MANIFEST_SHA256:$MSHA"
 [ "$MSHA" = "$(rget MANIFEST_SHA256)" ] \
-  || { echo "MANIFEST_TRUST_FAIL:manifest snapshot sha $MSHA != receipt $(rget MANIFEST_SHA256)"; exit 14; }
+  || rfail "MANIFEST_TRUST_FAIL:manifest snapshot sha $MSHA != receipt $(rget MANIFEST_SHA256)" 14
 # the receipt names the manifest it describes; the generator writes a bare
 # filename, so a name that disagrees means the wrong artifact was staged
 [ "$(basename "$MANIFEST")" = "$(rget MANIFEST_FILE)" ] \
-  || { echo "MANIFEST_TRUST_FAIL:manifest basename $(basename "$MANIFEST") != receipt MANIFEST_FILE $(rget MANIFEST_FILE)"; exit 14; }
+  || rfail "MANIFEST_TRUST_FAIL:manifest basename $(basename "$MANIFEST") != receipt MANIFEST_FILE $(rget MANIFEST_FILE)" 14
 
 mget() { grep "^$1=" "$MCOPY" | head -1 | cut -d= -f2-; }
 # schema 2 selects the implementation; schema 1 is MoK-only by definition
 HARNESS_MODULE=$(mget HARNESS_MODULE)
 [ -n "$HARNESS_MODULE" ] || HARNESS_MODULE=benchmarks.bench_sm90_fwd
 HARNESS_FILE=$MOKDIR/mixture-of-kittens/$(echo "$HARNESS_MODULE" | tr '.' '/').py
-[ -f "$HARNESS_FILE" ] || { echo "MANIFEST_SCHEMA_FAIL:harness file for $HARNESS_MODULE missing"; exit 12; }
+[ -f "$HARNESS_FILE" ] || rfail "MANIFEST_SCHEMA_FAIL:harness file for $HARNESS_MODULE missing" 12
 bash "$DIR/validate_manifest_sm90.sh" "$MCOPY" \
   --harness "$HARNESS_FILE" \
   --so-dir "$MOKDIR/mixture-of-kittens/mok"
 VRC=$?
-[ "$VRC" -eq 0 ] || exit "$VRC"
+[ "$VRC" -eq 0 ] || { side "LAUNCH_REJECTED:manifest snapshot failed the shared validator (rc=$VRC)"; exit "$VRC"; }
 EXPECTED=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256)
 FROZEN=$(mget FROZEN_COMMIT); BGPUS=$(mget BENCH_GPUS)
-[ "$(rget HARNESS_SHA256)" = "$EXPECTED" ] || { echo "RECEIPT_TRUST_FAIL:harness sha receipt != manifest"; exit 14; }
-[ "$(rget SO_SHA256)" = "$EXPSO" ] || { echo "RECEIPT_TRUST_FAIL:so sha receipt != manifest"; exit 14; }
+[ "$(rget HARNESS_SHA256)" = "$EXPECTED" ] || rfail "RECEIPT_TRUST_FAIL:harness sha receipt != manifest" 14
+[ "$(rget SO_SHA256)" = "$EXPSO" ] || rfail "RECEIPT_TRUST_FAIL:so sha receipt != manifest" 14
 
 IMGID=$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)
-[ -n "$IMGID" ] || { echo "IMAGE_TRUST_FAIL:container inspect failed for $CT"; exit 14; }
+[ -n "$IMGID" ] || rfail "IMAGE_TRUST_FAIL:container inspect failed for $CT" 14
 IMGREF=$(docker inspect --format '{{.Config.Image}}' "$CT" 2>/dev/null)
-[ -n "$IMGREF" ] || { echo "IMAGE_TRUST_FAIL:image ref empty"; exit 14; }
+[ -n "$IMGREF" ] || rfail "IMAGE_TRUST_FAIL:image ref empty" 14
 # a failed inspect is NOT a local-only image: treating both as NONE let a
 # docker daemon error satisfy a receipt that says NONE, so a tool failure was
 # laundered into a provenance statement
 IMGRD=$(docker image inspect --format '{{join .RepoDigests ","}}' "$IMGID" 2>/dev/null); IRC=$?
-[ "$IRC" -eq 0 ] || { echo "IMAGE_TRUST_FAIL:docker image inspect failed (rc=$IRC) for $IMGID; a tool failure cannot stand in for NONE"; exit 14; }
+[ "$IRC" -eq 0 ] || rfail "IMAGE_TRUST_FAIL:docker image inspect failed (rc=$IRC) for $IMGID; a tool failure cannot stand in for NONE" 14
 [ -n "$IMGRD" ] || IMGRD=NONE
-[ "$IMGID" = "$(rget IMAGE_ID)" ] || { echo "IMAGE_TRUST_FAIL:image id live $IMGID != receipt $(rget IMAGE_ID)"; exit 14; }
-[ "$IMGREF" = "$(rget IMAGE_REF)" ] || { echo "IMAGE_TRUST_FAIL:image ref live $IMGREF != receipt $(rget IMAGE_REF)"; exit 14; }
-[ "$IMGRD" = "$(rget IMAGE_REPO_DIGESTS)" ] || { echo "IMAGE_TRUST_FAIL:repo digests live $IMGRD != receipt $(rget IMAGE_REPO_DIGESTS)"; exit 14; }
+[ "$IMGID" = "$(rget IMAGE_ID)" ] || rfail "IMAGE_TRUST_FAIL:image id live $IMGID != receipt $(rget IMAGE_ID)" 14
+[ "$IMGREF" = "$(rget IMAGE_REF)" ] || rfail "IMAGE_TRUST_FAIL:image ref live $IMGREF != receipt $(rget IMAGE_REF)" 14
+[ "$IMGRD" = "$(rget IMAGE_REPO_DIGESTS)" ] || rfail "IMAGE_TRUST_FAIL:repo digests live $IMGRD != receipt $(rget IMAGE_REPO_DIGESTS)" 14
 
-HTMP=$SIDE.hdr.$$
-if ! { echo "SIDECAR_START:$(date -u +%F_%T)"; echo "RUN_ID:$RUN_ID"
-       echo "BENCH_MODE:$BMODE"; echo "FORMAL_VALIDITY:$FORMAL_VALIDITY"
-       echo "MANIFEST_FILE:$(basename "$MANIFEST")"; echo "MANIFEST_SHA256:$MSHA"
-       echo "RECEIPT_FILE:$(basename "$RECEIPT")"; echo "RECEIPT_SHA256:$RSHA"
-       echo "RECEIPT_COPY:$(basename "$RCOPY")"
-       echo "RECEIPT_SCHEMA:$(rget RECEIPT_SCHEMA)"
-       echo "MEASUREMENT_THRESHOLDS:load1_max=$LOAD1_MAX_PRELAUNCH load1_delta_max=$LOAD1_DELTA_MAX clk_run_min_mhz=$CLK_RUN_MIN_MHZ (tracked, not caller-set)"
-       echo "IMAGE_ID:$IMGID"; echo "IMAGE_REF:$IMGREF"; echo "IMAGE_REPO_DIGESTS:$IMGRD"; } > "$HTMP"; then
-  echo "LAUNCH_VERIFY_FAIL:sidecar header write failed"; exit 4
-fi
-mv -f "$HTMP" "$SIDE" || { echo "LAUNCH_VERIFY_FAIL:sidecar header rename failed"; exit 4; }
+side "IMAGE_ID:$IMGID"
+side "IMAGE_REF:$IMGREF"
+side "IMAGE_REPO_DIGESTS:$IMGRD"
 
 # prelaunch telemetry: container->host GPU mapping for BENCH_GPUS only,
 # occupancy wait, clocks/power/load snapshot - all BEFORE docker exec.
@@ -246,8 +323,8 @@ ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
 for K in TORCH_VERSION_PIN DEEPEP_PY_TREE_SHA256 DEEPEP_EXT_SHA256 DEEPEP_TORCH_COMPILE; do
   V=$(mget "$K"); [ -n "$V" ] && ENVARGS+=(-e "$K=$V")
 done
-[ -n "${PREFLIGHT_TRIES:-}" ] && ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES")
-[ -n "${BENCH_TIMEOUT:-}" ] && ENVARGS+=(-e BENCH_TIMEOUT="$BENCH_TIMEOUT")
+# always passed, so the runner cannot apply a fallback the sidecar never saw
+ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES" -e BENCH_TIMEOUT="$BENCH_TIMEOUT")
 docker exec -d "${ENVARGS[@]}" "$CT" bash /mok/mixture-of-kittens/benchmarks/run_bench_sm90.sh \
   || fail "docker exec failed" 7
 
@@ -313,7 +390,7 @@ echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE manifest_sha=$MSHA r
 # completion wait with periodic foreign-process sampling: every poll tick,
 # any NVML compute pid on a target GPU that is not one of our 4 workers
 # counts as a foreign hit (gated to zero)
-WAIT=${BENCH_WAIT_SECS:-900}
+WAIT=$BENCH_WAIT_SECS
 DONE=0; NSAMP=0; NFOREIGN=0
 for i in $(seq 1 $((WAIT/10))); do
   PAIRSM=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader 2>/dev/null | tr -d ' ')
@@ -346,5 +423,6 @@ DELTA_OK=$(python3 -c "print(1 if float('$L1E')-float('$L1S') <= float('$LOAD1_D
 side "LOAD1_DELTA_GATE:start=$L1S end=$L1E max=+$LOAD1_DELTA_MAX ok=${DELTA_OK:-0}"
 [ "${DELTA_OK:-0}" = "1" ] || fail "TELEMETRY_GATE_FAIL:load1 rose $L1S -> $L1E (> +$LOAD1_DELTA_MAX)" 15
 side "TELEMETRY_FINAL_PASS"
+side "LAUNCH_STATE_FINAL:COMPLETE"
 side "SIDECAR_END:$(date -u +%F_%T)"
 echo "LAUNCH_COMPLETE run_id=$RUN_ID log=$LOG json=$JSONF sidecar=$SIDE manifest_sha=$MSHA receipt_sha=$RSHA mode=$BMODE formal_validity=$FORMAL_VALIDITY run_real_exit=0 telemetry=PASS"
