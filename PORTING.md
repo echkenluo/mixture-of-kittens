@@ -36,3 +36,14 @@ Logs: /mok/build-sm90*.log. Runtime: H20 MULTICAST_SUPPORTED=1 (NVLS comm OK).
 ## After compile: P2 gates
 - make test (torchrun 4-GPU, tests vs mok/_fake_impls.py) on GPUs 0-3/4-7
 - V4 shape single-layer vs DeepEP+DeepGEMM reference numerics
+
+## P1-B design decision (r3 prep)
+`mma2_*` are TK SM100 2-CTA cluster MMA (both CTAs feed one tmem accumulator).
+SM90 rewrite: KEEP the cluster + multicast loads unchanged; split the
+accumulator per-CTA (each CTA owns half of N via cta_rank), run plain
+warpgroup::mma_AB/ABt/AtB on rt_fl<.,128> halves, mma_async_wait then arrive
+the existing semaphores (replaces tcgen05::commit). Epilogue: each CTA drains
+its own register half to its d smem tiles (removes tcgen05.ld PTX + d_tt
+subtile loads). This also resolves the register-budget concern (128-wide
+accum per warpgroup fits). Scale-tt params (a_sc_tt/b_sc_tt) get parse stubs
+only (MXFP8 branches discarded in BF16 build).
