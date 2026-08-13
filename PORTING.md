@@ -113,3 +113,12 @@ RED single-cause: megakernel fwd bf16 AND mxfp8 both hang at the MMA
 scaffold (combine semaphores starve) - confirmed by timeout runs.
 ONLY remaining front: wgmma register rewrite of the GEMM worker
 (design frozen above). test_forward_bf16 green == port correctness done.
+
+## r14: wgmma worker unit COMPILER-VALIDATED (0 errors in full TU)
+wgmma_acc (rt_fl per-warp accumulator, warpgroup::mm_/mma_ABt,
+mma_async_wait, warpgroup::store drain) compiles clean at SM90 inside the
+megakernel TU. Next patch (r15): replace consumer-branch mma2 call sites
+with wgmma_acc step/drain sequence wired to the existing input-ring
+semaphores + full-N B loads; then torchrun regression until
+test_forward_bf16 green; then V4-shape numerics vs DeepEP+DeepGEMM and
+methodology-v2 measurement.
