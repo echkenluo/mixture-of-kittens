@@ -75,7 +75,7 @@ struct config {
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
 #if defined(KITTENS_SM90)
-    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024 - 33 * 1024; // 32KB static drain staging
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024 - 17 * 1024; // 16KiB half staging + slack; dispatch needs ~194.5KiB dynamic
 #else
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 #endif
@@ -1509,10 +1509,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         auto store_bf16 = [&]() {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
 #if defined(KITTENS_SM90)
-            __shared__ st_bf<2 * 64, config::MLP_Nb> d_stage; // full task tile staging
-            if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
-                quad.drain_to(d_stage);
-            }
+            __shared__ st_bf<64, config::MLP_Nb> d_stage; // ONE M-half staging (16KiB)
 #else
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
@@ -1535,12 +1532,16 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             constexpr int MOK_H = 1;
 #endif
             #pragma unroll
-            for (int h = 0; h < MOK_H; ++h)
+            for (int h = 0; h < MOK_H; ++h) {
+#if defined(KITTENS_SM90)
+                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+                    quad.drain_half_to(d_stage, h); // sequential halves through one buffer
+#endif
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
 #if defined(KITTENS_SM90)
                 if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
-                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{h, i});
+                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i});
                     warpgroup::load(d_reg[i], stg);
                 }
 #endif
@@ -1561,6 +1562,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
 #endif
                 }
+            }
             }
             warpgroup::tma::store_async_read_wait();
         };

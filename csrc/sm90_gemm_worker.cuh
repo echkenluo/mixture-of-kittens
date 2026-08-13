@@ -32,6 +32,17 @@ struct wgmma_quad {
         }
         warpgroup::mma_async_wait();
     }
+    // Store ONE M-half (both N-quadrants) into a half-tile staging buffer
+    // (AH x 2*BN). 16KiB budget form per codex step-B smem review.
+    template<typename DST> __device__ inline void drain_half_to(DST &d, int hm) {
+        #pragma unroll
+        for (int hn = 0; hn < 2; ++hn) {
+            auto sub = d.template subtile<AH, BN>(int2{0, hn});
+            warpgroup::store(sub, acc[hm][hn]);
+        }
+        warpgroup::sync(1);
+    }
+
     // d covers the full task tile (2*AH x 2*BN); store path honors subtiles.
     template<typename DST> __device__ inline void drain_to(DST &d) {
         #pragma unroll
