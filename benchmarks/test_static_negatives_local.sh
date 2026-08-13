@@ -252,8 +252,55 @@ NLEFT=$(ls "$TMPD"/.receipt.* 2>/dev/null | wc -l)
   && [ "$PRESHA" = "$POSTSHA" ] && [ "$NLEFT" -eq 0 ]; report MK6_publish_atomicity $?
 echo "  MK6 rc=$MKRC want=2(invalid receipt not published; OUT unchanged=$([ "$PRESHA" = "$POSTSHA" ] && echo yes || echo no); temps left=$NLEFT)"
 
+# ---- manifest schema v2 (matrix cells) ----
+M2MOK=$DIR/manifests/matrix-repo_micro-mok_sm90-sm24.manifest
+M2DEEP=$DIR/manifests/matrix-repo_micro-deepep_torch-sm24.manifest
+v2case() { # name base mutator want_rc reason-ERE
+  local NAME=$1 BASE=$2 MUT=$3 WANT=$4 REASON=$5
+  local MF=$TMPD/$NAME.manifest O R
+  BASEF=$BASE eval "$MUT" > "$MF"
+  set +e
+  O=$(bash "$VALM" "$MF" 2>&1); R=$?
+  set -u
+  [ "$R" -eq "$WANT" ] && has1 "$O" "$REASON"; report "$NAME" $?
+  echo "  $NAME rc=$R want=$WANT($REASON)"
+}
+set +e
+O=$(bash "$VALM" "$M2MOK" 2>&1); R=$?
+set -u
+[ "$R" -eq 0 ] && has1 "$O" '^MANIFEST_VALID:[0-9a-f]{64}$'; report S1_v2_mok_positive $?
+echo "  S1_v2_mok_positive rc=$R want=0(MANIFEST_VALID)"
+set +e
+O=$(bash "$VALM" "$M2DEEP" 2>&1); R=$?
+set -u
+[ "$R" -eq 0 ] && has1 "$O" '^MANIFEST_VALID:[0-9a-f]{64}$'; report S2_v2_deepep_positive $?
+echo "  S2_v2_deepep_positive rc=$R want=0(MANIFEST_VALID)"
+# the schema-1 contract that the tiny9 canary chain validated must keep
+# validating unchanged - adding schema 2 must not disturb it
+set +e
+O=$(bash "$VALM" "$DIR/manifests/tiny-h20-v1.manifest" 2>&1); R=$?
+set -u
+[ "$R" -eq 0 ] && has1 "$O" '^MANIFEST_VALID:[0-9a-f]{64}$'; report S3_v1_regression_guard $?
+echo "  S3_v1_regression_guard rc=$R want=0(schema 1 still valid)"
+v2case S4_bad_impl "$M2MOK" 'sed "s/^IMPL=.*/IMPL=bogus/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:IMPL not in allowed set \{mok_sm90,deepep_torch\}$'
+v2case S5_module_mismatch "$M2MOK" 'sed "s|^HARNESS_MODULE=.*|HARNESS_MODULE=benchmarks.bench_deepep_fwd|" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:HARNESS_MODULE benchmarks\.bench_deepep_fwd does not match IMPL mok_sm90$'
+v2case S6_timing_mismatch "$M2MOK" 'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS=dispatch+expert+combine.v2|" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS does not match IMPL mok_sm90 \(want build_schedule\+forward\.v2\)$'
+v2case S7_bad_shape_id "$M2MOK" 'sed "s/^SHAPE_ID=.*/SHAPE_ID=whatever/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:SHAPE_ID not in allowed set \{repo_micro,v4_layer,tiny_h20\}$'
+v2case S8_deepep_missing_pin "$M2DEEP" 'grep -v "^DEEPEP_FINGERPRINT_SHA256=" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:key DEEPEP_FINGERPRINT_SHA256 count=0 \(need exactly 1\)$'
+v2case S9_deepep_bad_compile "$M2DEEP" 'sed "s/^DEEPEP_TORCH_COMPILE=.*/DEEPEP_TORCH_COMPILE=maybe/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:DEEPEP_TORCH_COMPILE not in allowed set \{on,off\}$'
+v2case S10_deepep_bad_fingerprint "$M2DEEP" 'sed "s/^DEEPEP_FINGERPRINT_SHA256=.*/DEEPEP_FINGERPRINT_SHA256=nothex/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:DEEPEP_FINGERPRINT_SHA256 not 64-hex$'
+v2case S11_bad_schema_version "$M2MOK" 'sed "s/^MANIFEST_SCHEMA=2/MANIFEST_SCHEMA=3/" "$BASEF"' 12 \
+  '^MANIFEST_SCHEMA_FAIL:bad or missing schema version$'
+
 rm -rf "$TMPD"
-EXPECTED=48
+EXPECTED=59
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "STATIC_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "STATIC_NEGATIVES pass=$PASS fail=$FAIL"

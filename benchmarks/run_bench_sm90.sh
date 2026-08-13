@@ -18,6 +18,12 @@ EXPSO=${EXPECTED_SO_SHA256:?EXPECTED_SO_SHA256 required}
 MSHAE=${MANIFEST_SHA256:?MANIFEST_SHA256 required}
 RSHAE=${RECEIPT_SHA256:?RECEIPT_SHA256 required}
 BMODE=${BENCH_MODE:-canary}
+HARNESS_MODULE=${HARNESS_MODULE:-benchmarks.bench_sm90_fwd}
+case "$HARNESS_MODULE" in
+  benchmarks.bench_sm90_fwd|benchmarks.bench_deepep_fwd) : ;;
+  *) echo "HARNESS_MODULE_FAIL:$HARNESS_MODULE not in allowed set"; exit 11 ;;
+esac
+HARNESS_FILE=$(echo "$HARNESS_MODULE" | tr '.' '/').py
 BENCH_GPUS=${BENCH_GPUS:-0,1,2,3}
 PREFLIGHT_TRIES=${PREFLIGHT_TRIES:-24}
 mkdir -p /mok/runs  # container-owned; host writes only to host-runs/
@@ -26,7 +32,8 @@ JSON=/mok/runs/$TAG-$RUN_ID.json
 exec 9>/mok/build.lock
 flock -n 9 || { echo "LOCK_BUSY $(date -u +%T)" > "$LOG"; exit 9; }
 cd /mok/mixture-of-kittens
-ACTUAL=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
+[ -f "$HARNESS_FILE" ] || { mkdir -p /mok/runs; echo "HARNESS_MODULE_FAIL:$HARNESS_FILE missing" > "$LOG"; exit 11; }
+ACTUAL=$(sha256sum "$HARNESS_FILE" | cut -d' ' -f1)
 {
   echo "RUN_ID:$RUN_ID"
   echo "LOCK_HELD_BY:$$"
@@ -34,6 +41,7 @@ ACTUAL=$(sha256sum benchmarks/bench_sm90_fwd.py | cut -d' ' -f1)
   echo "MANIFEST_SHA256:$MSHAE"
   echo "RECEIPT_SHA256:$RSHAE"
   echo "BENCH_MODE:$BMODE"
+  echo "HARNESS_MODULE:$HARNESS_MODULE"
   echo "BENCH_GPUS:$BENCH_GPUS"
 } > "$LOG"
 UUIDS=$(nvidia-smi -i "$BENCH_GPUS" --query-gpu=index,uuid --format=csv,noheader 2>&1)
@@ -77,7 +85,7 @@ export CUDA_VISIBLE_DEVICES="$BENCH_GPUS"
 echo "RUN_START:$(date -u +%F_%T)" >> "$LOG"
 export BENCH_OUTPUT="$JSON"
 timeout "${BENCH_TIMEOUT:-600}" python3 -m torch.distributed.run --standalone \
-  --nproc-per-node=4 -m benchmarks.bench_sm90_fwd >> "$LOG" 2>&1
+  --nproc-per-node=4 -m "$HARNESS_MODULE" >> "$LOG" 2>&1
 RC=$?
 echo "RUN_REAL_EXIT:$RC" >> "$LOG"
 echo "RUN_END:$(date -u +%F_%T)" >> "$LOG"

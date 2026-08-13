@@ -72,12 +72,17 @@ MSHA_ACT=$(sha256sum "$MANIFEST" | cut -d' ' -f1)
 MMODE=$(stat -c %a "$MANIFEST")
 case "$MMODE" in *[2367]*) echo "MANIFEST_TRUST_FAIL:write bits set ($MMODE)"; exit 14 ;; esac
 
+mget() { grep "^$1=" "$MANIFEST" | head -1 | cut -d= -f2-; }
+# schema 2 selects the implementation; schema 1 is MoK-only by definition
+HARNESS_MODULE=$(mget HARNESS_MODULE)
+[ -n "$HARNESS_MODULE" ] || HARNESS_MODULE=benchmarks.bench_sm90_fwd
+HARNESS_FILE=$MOKDIR/mixture-of-kittens/$(echo "$HARNESS_MODULE" | tr '.' '/').py
+[ -f "$HARNESS_FILE" ] || { echo "MANIFEST_SCHEMA_FAIL:harness file for $HARNESS_MODULE missing"; exit 12; }
 bash "$DIR/validate_manifest_sm90.sh" "$MANIFEST" \
-  --harness "$MOKDIR/mixture-of-kittens/benchmarks/bench_sm90_fwd.py" \
+  --harness "$HARNESS_FILE" \
   --so-dir "$MOKDIR/mixture-of-kittens/mok"
 VRC=$?
 [ "$VRC" -eq 0 ] || exit "$VRC"
-mget() { grep "^$1=" "$MANIFEST" | head -1 | cut -d= -f2-; }
 EXPECTED=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256)
 FROZEN=$(mget FROZEN_COMMIT); BGPUS=$(mget BENCH_GPUS)
 [ "$(rget HARNESS_SHA256)" = "$EXPECTED" ] || { echo "RECEIPT_TRUST_FAIL:harness sha receipt != manifest"; exit 14; }
@@ -167,7 +172,12 @@ ENVARGS=(-e BENCH_TAG="$TAG" -e RUN_ID="$RUN_ID"
          -e INTERMEDIATE_DIM="$(mget intermediate)" -e NUM_EXPERTS="$(mget experts)"
          -e TOPK="$(mget topk)" -e MINIBATCH_SIZE="$(mget minibatch)"
          -e MACROBATCH_SIZE="$(mget macrobatch)" -e BENCH_WARMUP="$(mget warmup_iters)"
-         -e BF16_FWD_COMM_SMS="$(mget comm_sms)")
+         -e BF16_FWD_COMM_SMS="$(mget comm_sms)" -e HARNESS_MODULE="$HARNESS_MODULE")
+# comparator stack pins: passed only when the manifest declares them, so the
+# comparator's own gate fails closed rather than defaulting to something
+for K in TORCH_VERSION_PIN DEEPEP_FINGERPRINT_SHA256 DEEPEP_TORCH_COMPILE; do
+  V=$(mget "$K"); [ -n "$V" ] && ENVARGS+=(-e "$K=$V")
+done
 [ -n "${PREFLIGHT_TRIES:-}" ] && ENVARGS+=(-e PREFLIGHT_TRIES="$PREFLIGHT_TRIES")
 [ -n "${BENCH_TIMEOUT:-}" ] && ENVARGS+=(-e BENCH_TIMEOUT="$BENCH_TIMEOUT")
 docker exec -d "${ENVARGS[@]}" "$CT" bash /mok/mixture-of-kittens/benchmarks/run_bench_sm90.sh \

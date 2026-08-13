@@ -21,7 +21,19 @@ done
 [ -f "$MAN" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MAN"; exit 12; }
 REQ_KEYS="MANIFEST_SCHEMA FROZEN_COMMIT EXPECTED_SO_SHA256 EXPECTED_HARNESS_SHA256 BENCH_GPUS TIMING_SEMANTICS tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
 INT_KEYS="tokens_per_rank hidden intermediate experts topk world_size comm_sms minibatch macrobatch warmup_iters timed_iters"
-head -1 "$MAN" | grep -q '^MANIFEST_SCHEMA=1$' || { echo "MANIFEST_SCHEMA_FAIL:bad or missing schema version"; exit 12; }
+# schema 1: single-implementation contract (MoK SM90 forward), as validated by
+#           the tiny9 canary chain - semantics frozen, do not extend
+# schema 2: matrix cell contract - adds the implementation identity and, for
+#           the DeepEP comparator, the stack pins its gate enforces at runtime
+SCHEMA=$(head -1 "$MAN" | sed -n 's/^MANIFEST_SCHEMA=//p')
+case "$SCHEMA" in
+  1) : ;;
+  2) REQ_KEYS="$REQ_KEYS IMPL SHAPE_ID HARNESS_MODULE" ;;
+  *) echo "MANIFEST_SCHEMA_FAIL:bad or missing schema version"; exit 12 ;;
+esac
+if [ "$SCHEMA" = "2" ] && grep -q '^IMPL=deepep_torch$' "$MAN"; then
+  REQ_KEYS="$REQ_KEYS TORCH_VERSION_PIN DEEPEP_FINGERPRINT_SHA256 DEEPEP_TORCH_COMPILE"
+fi
 for K in $REQ_KEYS; do
   N=$(grep -c "^$K=" "$MAN" || true)
   [ "$N" -eq 1 ] || { echo "MANIFEST_SCHEMA_FAIL:key $K count=$N (need exactly 1)"; exit 12; }
@@ -42,8 +54,35 @@ done
 # manifest's expected hashes and shape; it is NOT binary build lineage
 # (that lives only in the deployment receipt's BINARY_BUILD_COMMIT)
 mget FROZEN_COMMIT | grep -qE '^[0-9a-f]{40}$' || { echo "MANIFEST_SCHEMA_FAIL:FROZEN_COMMIT not 40-hex"; exit 12; }
-[ "$(mget TIMING_SEMANTICS)" = "build_schedule+forward.v2" ] \
-  || { echo "MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set {build_schedule+forward.v2}"; exit 12; }
+if [ "$SCHEMA" = "1" ]; then
+  [ "$(mget TIMING_SEMANTICS)" = "build_schedule+forward.v2" ] \
+    || { echo "MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set {build_schedule+forward.v2}"; exit 12; }
+else
+  IMPL=$(mget IMPL)
+  case "$IMPL" in
+    mok_sm90)
+      WANT_MODULE=benchmarks.bench_sm90_fwd; WANT_TIMING="build_schedule+forward.v2" ;;
+    deepep_torch)
+      WANT_MODULE=benchmarks.bench_deepep_fwd; WANT_TIMING="dispatch+expert+combine.v2" ;;
+    *) echo "MANIFEST_SCHEMA_FAIL:IMPL not in allowed set {mok_sm90,deepep_torch}"; exit 12 ;;
+  esac
+  case "$(mget SHAPE_ID)" in
+    repo_micro|v4_layer|tiny_h20) : ;;
+    *) echo "MANIFEST_SCHEMA_FAIL:SHAPE_ID not in allowed set {repo_micro,v4_layer,tiny_h20}"; exit 12 ;;
+  esac
+  [ "$(mget HARNESS_MODULE)" = "$WANT_MODULE" ] \
+    || { echo "MANIFEST_SCHEMA_FAIL:HARNESS_MODULE $(mget HARNESS_MODULE) does not match IMPL $IMPL"; exit 12; }
+  [ "$(mget TIMING_SEMANTICS)" = "$WANT_TIMING" ] \
+    || { echo "MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS does not match IMPL $IMPL (want $WANT_TIMING)"; exit 12; }
+  if [ "$IMPL" = "deepep_torch" ]; then
+    mget DEEPEP_FINGERPRINT_SHA256 | grep -qE '^[0-9a-f]{64}$' \
+      || { echo "MANIFEST_SCHEMA_FAIL:DEEPEP_FINGERPRINT_SHA256 not 64-hex"; exit 12; }
+    case "$(mget DEEPEP_TORCH_COMPILE)" in
+      on|off) : ;;
+      *) echo "MANIFEST_SCHEMA_FAIL:DEEPEP_TORCH_COMPILE not in allowed set {on,off}"; exit 12 ;;
+    esac
+  fi
+fi
 for K in $INT_KEYS; do
   V=$(mget "$K")
   echo "$V" | grep -qE '^[0-9]+$' && [ "$V" -gt 0 ] || { echo "MANIFEST_SCHEMA_FAIL:$K not positive int"; exit 12; }

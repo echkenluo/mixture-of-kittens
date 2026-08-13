@@ -84,6 +84,18 @@ cnt1 "$SIDE" '^FORMAL_VALIDITY:'; FV=$(grep '^FORMAL_VALIDITY:' "$SIDE" | cut -d
 [ "$FV" = "INVALID_FOR_FORMAL" ] || vf "canary mode but validity=$FV"
 SHA=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256); FC=$(mget FROZEN_COMMIT)
 BGP=$(mget BENCH_GPUS)
+# schema 2 pins which implementation ran; schema 1 is MoK-only by definition
+IMPL=$(mget IMPL); [ -n "$IMPL" ] || IMPL=mok_sm90
+case "$IMPL" in
+  mok_sm90)     JSCHEMA=bench-sm90-fwd.v1;   HMOD=benchmarks.bench_sm90_fwd ;;
+  deepep_torch) JSCHEMA=bench-deepep-fwd.v1; HMOD=benchmarks.bench_deepep_fwd ;;
+  *) vf "unknown IMPL $IMPL" ;;
+esac
+if [ "$(grep -c '^HARNESS_MODULE:' "$LOG")" -eq 1 ]; then
+  [ "$(grep '^HARNESS_MODULE:' "$LOG" | cut -d: -f2)" = "$HMOD" ] || vf "log harness module != manifest IMPL"
+elif [ "$IMPL" != "mok_sm90" ]; then
+  vf "log has no HARNESS_MODULE line but manifest IMPL=$IMPL"
+fi
 [ "$(rget HARNESS_SHA256)" = "$SHA" ] || vf "receipt harness sha != manifest"
 [ "$(rget SO_SHA256)" = "$EXPSO" ] || vf "receipt so sha != manifest"
 cnt1 "$LOG" "^RUN_ID:$R\$"
@@ -120,14 +132,14 @@ cnt1 "$SIDE" '^RUNNING_CLOCK_LIVENESS:'
 grep '^RUNNING_CLOCK_LIVENESS:' "$SIDE" | grep -q 'low=0$' || vf "running clock liveness below floor"
 cnt1 "$SIDE" '^LOAD1_DELTA_GATE:'
 grep '^LOAD1_DELTA_GATE:' "$SIDE" | grep -q 'ok=1$' || vf "load1 delta gate not ok"
-python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$EXPR_SHA" "$BGP" "$SMODE" <<'PY' || exit 1
+python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$EXPR_SHA" "$BGP" "$SMODE" "$JSCHEMA" <<'PY' || exit 1
 import json, math, statistics, sys
 d = json.load(open(sys.argv[1]))
 m = d["meta"]; p = m["provenance"]
 man = dict(l.strip().split("=", 1) for l in open(sys.argv[5]) if "=" in l)
 sh = m["shape"]
 checks = [
-    (d.get("schema") == "bench-sm90-fwd.v1", "schema mismatch"),
+    (d.get("schema") == sys.argv[11], f"schema {d.get('schema')} != expected {sys.argv[11]}"),
     (p["harness_sha256"] == sys.argv[2], "json harness sha != manifest"),
     (p["frozen_commit_env"] == sys.argv[3], "json frozen commit != manifest"),
     (p.get("so_sha256") == sys.argv[6], "json so sha256 != manifest"),
