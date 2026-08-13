@@ -42,4 +42,13 @@ BB=$(rget BINARY_BUILD_COMMIT)
 { echo "$BB" | grep -qE '^[0-9a-f]{40}$' || [ "$BB" = "UNKNOWN" ]; } \
   || { echo "RECEIPT_TRUST_FAIL:BINARY_BUILD_COMMIT not 40-hex or UNKNOWN"; exit 14; }
 rget IMAGE_ID | grep -qE '^sha256:[0-9a-f]{64}$' || { echo "RECEIPT_TRUST_FAIL:IMAGE_ID malformed (want sha256:<64-hex>)"; exit 14; }
+# IMAGE_REPO_DIGESTS: literal NONE (local-only image) or a comma-separated
+# list of canonical repo@sha256:<64-hex> entries - a free-form string must
+# not be able to stand in for registry provenance
+RD=$(rget IMAGE_REPO_DIGESTS)
+if [ "$RD" != "NONE" ]; then
+  printf '%s\n' "$RD" | tr ',' '\n' | while IFS= read -r E; do
+    echo "$E" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$' || exit 1
+  done || { echo "RECEIPT_TRUST_FAIL:IMAGE_REPO_DIGESTS malformed (want NONE or repo@sha256:<64-hex> list)"; exit 14; }
+fi
 echo "RECEIPT_VALID:$(sha256sum "$REC" | cut -d' ' -f1)"

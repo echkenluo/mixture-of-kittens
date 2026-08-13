@@ -1,5 +1,7 @@
 #!/bin/bash
-# Container-side benchmark runner (tracked). Formal-ready guarantees:
+# Container-side benchmark runner (tracked). Canary-grade mechanics; formal
+# mode is refused upstream (no build-record contract yet), so nothing here
+# should be read as formal-ready. Properties:
 #   - RUN_ID is provided by the host launcher: artifact paths are known a
 #     priori, no ls-based discovery, stale artifacts cannot be selected
 #   - flock build lock with holder recorded

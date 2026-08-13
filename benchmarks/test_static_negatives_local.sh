@@ -107,16 +107,17 @@ lcase L7_receipt_unknown_key "$(sha256sum "$TMPD/rogue.receipt" | cut -d' ' -f1)
   '^RECEIPT_TRUST_FAIL:unknown key rogue$' -- no-ct "$MOKF" "$MANF" "$TMPD/rogue.receipt"
 lcase L8_bad_mode "$RSHA" weird 14 \
   '^MODE_FAIL:BENCH_MODE must be formal or canary \(got weird\)$' -- no-ct "$MOKF" "$MANF" "$RECF"
+# formal is refused for ANY receipt - including one that looks complete
+# (40-hex resolvable build commit + canonical repo digests) - because a
+# commit id cannot prove it built this .so
 mkreceipt "$TMPD/unk.receipt" "$MSHA" UNKNOWN
-lcase L9_formal_unknown_build "$(sha256sum "$TMPD/unk.receipt" | cut -d' ' -f1)" formal 14 \
-  '^FORMAL_MODE_FAIL:BINARY_BUILD_COMMIT UNKNOWN \(no build record; formal forbidden\)$' \
+lcase L9_formal_blocked_unknown "$(sha256sum "$TMPD/unk.receipt" | cut -d' ' -f1)" formal 14 \
+  '^FORMAL_MODE_FAIL:build-record contract not implemented$' \
   -- no-ct "$MOKF" "$MANF" "$TMPD/unk.receipt"
-mkreceipt "$TMPD/nodig.receipt" "$MSHA" "$(H40 0)" NONE
-lcase L10_formal_local_image "$(sha256sum "$TMPD/nodig.receipt" | cut -d' ' -f1)" formal 14 \
-  '^FORMAL_MODE_FAIL:IMAGE_REPO_DIGESTS NONE \(local-only image; formal forbidden\)$' \
-  -- no-ct "$MOKF" "$MANF" "$TMPD/nodig.receipt"
+lcase L10_formal_blocked_complete "$RSHA" formal 14 \
+  '^FORMAL_MODE_FAIL:build-record contract not implemented$' -- no-ct "$MOKF" "$MANF" "$RECF"
 lcase L11_manifest_missing "$RSHA" canary 12 \
-  '^MANIFEST_SCHEMA_FAIL:missing ' -- no-ct "$MOKF" "$TMPD/nonexistent.manifest" "$RECF"
+  "^MANIFEST_SCHEMA_FAIL:missing $TMPD/nonexistent\.manifest\$" -- no-ct "$MOKF" "$TMPD/nonexistent.manifest" "$RECF"
 sed 's/^tokens_per_rank=.*/tokens_per_rank=513/' "$MANF" > "$TMPD/mut.manifest"; chmod 444 "$TMPD/mut.manifest"
 lcase L12_manifest_mutated "$RSHA" canary 14 \
   "^MANIFEST_TRUST_FAIL:manifest sha != receipt \(actual $(sha256sum "$TMPD/mut.manifest" | cut -d' ' -f1) receipt $MSHA\)\$" \
@@ -152,7 +153,7 @@ vcase V6_world_size    'sed "s/^world_size=.*/world_size=8/" "$MANF"' 12 '^MANIF
 vcase V7_gpus_dup      'sed "s/^BENCH_GPUS=.*/BENCH_GPUS=0,0,2,3/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:BENCH_GPUS ids not unique$'
 vcase V8_gpus_nonnum   'sed "s/^BENCH_GPUS=.*/BENCH_GPUS=0,1,2,x/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:BENCH_GPUS non-numeric id$'
 vcase V9_frozen_short  'sed "s/^FROZEN_COMMIT=.*/FROZEN_COMMIT=6df8bb7/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:FROZEN_COMMIT not 40-hex$'
-vcase V10_timing_enum  'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS=forward.v1|" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set'
+vcase V10_timing_enum  'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS=forward.v1|" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set \{build_schedule\+forward\.v2\}$'
 vcase V11_topk_gt_exp  'sed "s/^topk=.*/topk=9/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:topk > experts$'
 vcase V12_mini_gt_macro 'sed "s/^minibatch=.*/minibatch=8192/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:minibatch > macrobatch$'
 vcase V13_macro_multiple 'sed "s/^macrobatch=.*/macrobatch=4097/" "$MANF"' 12 '^MANIFEST_SCHEMA_FAIL:macrobatch not a multiple of minibatch$'
@@ -162,7 +163,7 @@ vcase V15_harness_drift "sed \"s/^EXPECTED_HARNESS_SHA256=.*/EXPECTED_HARNESS_SH
 vcase V16_so_drift "sed \"s/^EXPECTED_SO_SHA256=.*/EXPECTED_SO_SHA256=$(H64 e)/\" \"\$MANF\"" 13 \
   "^SO_DRIFT_FAIL expected=$(H64 e) actual=$SOSHA\$" --so-dir "$MOKF/mixture-of-kittens/mok"
 mkdir -p "$TMPD/twoso"; touch "$TMPD/twoso/_Ca.so" "$TMPD/twoso/_Cb.so"
-vcase V17_two_so 'cat "$MANF"' 13 '^SO_DRIFT_FAIL:need exactly one _C\*\.so in ' --so-dir "$TMPD/twoso"
+vcase V17_two_so 'cat "$MANF"' 13 "^SO_DRIFT_FAIL:need exactly one _C\*\.so in $TMPD/twoso\$" --so-dir "$TMPD/twoso"
 
 # ---- receipt validator surface ----
 rcase() { # name mutator want_rc reason-ERE
@@ -182,6 +183,8 @@ rcase R4_missing_key 'grep -v "^HARNESS_COMMIT=" "$RECF"' 14 '^RECEIPT_TRUST_FAI
 rcase R5_dup_key     'cat "$RECF"; echo "SO_SHA256='"$(H64 0)"'"' 14 '^RECEIPT_TRUST_FAIL:key SO_SHA256 count=2 \(need exactly 1\)$'
 rcase R6_short_commit 'sed "s|^SOURCE_TREE_COMMIT=.*|SOURCE_TREE_COMMIT=abc1234|" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:SOURCE_TREE_COMMIT not 40-hex$'
 rcase R7_bad_schema  'sed "s|^RECEIPT_SCHEMA=1|RECEIPT_SCHEMA=2|" "$RECF"' 14 '^RECEIPT_TRUST_FAIL:bad or missing schema version$'
+rcase R8_bad_digests 'sed "s|^IMAGE_REPO_DIGESTS=.*|IMAGE_REPO_DIGESTS=some-free-form-string|" "$RECF"' 14 \
+  '^RECEIPT_TRUST_FAIL:IMAGE_REPO_DIGESTS malformed \(want NONE or repo@sha256:<64-hex> list\)$'
 
 # ---- receipt generator (throwaway git fixture repo; never on a deploy target) ----
 FIX=$TMPD/fixrepo
@@ -191,9 +194,9 @@ cp "$MANF" "$FIX/benchmarks/manifests/fix.manifest"
 chmod 644 "$FIX/benchmarks/manifests/fix.manifest"
 ( cd "$FIX" && git init -q && git add -A \
   && git -c user.email=t@example.com -c user.name=t commit -qm init ) >/dev/null 2>&1
-mk() { # name env-prefix... -> runs generator, sets MKRC/MKOUT
+mk() { # build_commit outname -> runs generator, sets MKRC/MKOUT
   set +e
-  MKOUT=$( cd "$FIX" && IMAGE_ID="sha256:$(H64 1)" IMAGE_REF="fixture-image:latest" \
+  MKOUT=$( cd "$FIX" && IMAGE_ID="${MK_IMAGE_ID:-sha256:$(H64 1)}" IMAGE_REF="fixture-image:latest" \
     IMAGE_REPO_DIGESTS="registry.local/mok@sha256:$(H64 9)" BINARY_BUILD_COMMIT="$1" \
     bash benchmarks/make_deploy_receipt.sh "$FIX" benchmarks/manifests/fix.manifest "$TMPD/gen-$2.receipt" 2>&1 )
   MKRC=$?
@@ -222,9 +225,22 @@ echo "# drift" >> "$FIX/benchmarks/manifests/fix.manifest"
 mk UNKNOWN trackeddrift
 [ "$MKRC" -eq 2 ] && has1 "$MKOUT" '^RECEIPT_FAIL:benchmarks tree not clean vs HEAD \(incl\. untracked\):$'; report MK5_tracked_drift $?
 echo "  MK5 rc=$MKRC want=2(modified tracked manifest rejected at porcelain gate)"
+git -C "$FIX" checkout -- benchmarks/manifests/fix.manifest 2>/dev/null
+# publish safety: a receipt that fails its own validation must not be
+# published and must not clobber the existing good one, and must leave no
+# temp behind (fault injected through a malformed IMAGE_ID)
+PRESHA=$(sha256sum "$TMPD/gen-ok.receipt" | cut -d' ' -f1)
+MK_IMAGE_ID=notasha
+mk UNKNOWN ok
+unset MK_IMAGE_ID
+POSTSHA=$(sha256sum "$TMPD/gen-ok.receipt" | cut -d' ' -f1)
+NLEFT=$(ls "$TMPD"/.receipt.* 2>/dev/null | wc -l)
+[ "$MKRC" -eq 2 ] && has1 "$MKOUT" '^RECEIPT_FAIL:generated receipt failed self-validation \(not published\)$' \
+  && [ "$PRESHA" = "$POSTSHA" ] && [ "$NLEFT" -eq 0 ]; report MK6_publish_atomicity $?
+echo "  MK6 rc=$MKRC want=2(invalid receipt not published; OUT unchanged=$([ "$PRESHA" = "$POSTSHA" ] && echo yes || echo no); temps left=$NLEFT)"
 
 rm -rf "$TMPD"
-EXPECTED=46
+EXPECTED=48
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED" ] || { echo "STATIC_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED"; FAIL=$((FAIL+1)); }
 echo "STATIC_NEGATIVES pass=$PASS fail=$FAIL"

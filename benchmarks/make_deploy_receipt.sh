@@ -47,6 +47,7 @@ grep -q "^EXPECTED_HARNESS_SHA256=$HSHA$" "$MREL" || { echo "RECEIPT_FAIL:tree h
 SOSHA=$(grep '^EXPECTED_SO_SHA256=' "$MREL" | head -1 | cut -d= -f2)
 OUTDIR=$(dirname "$OUT")
 TMP=$(mktemp "$OUTDIR/.receipt.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
 {
   echo "RECEIPT_SCHEMA=1"
   echo "SOURCE_TREE_COMMIT=$SRC"
@@ -62,7 +63,11 @@ TMP=$(mktemp "$OUTDIR/.receipt.XXXXXX")
   echo "IMAGE_REPO_DIGESTS=$IMAGE_REPO_DIGESTS"
 } > "$TMP"
 chmod 444 "$TMP"
+# validate BEFORE publishing: a bad receipt must never reach $OUT, and must
+# never clobber an existing good one. The EXIT trap removes the temp on any
+# failure path.
+bash "$DIR/validate_receipt_sm90.sh" "$TMP" --check-mode >/dev/null \
+  || { echo "RECEIPT_FAIL:generated receipt failed self-validation (not published)"; exit 2; }
 mv -f "$TMP" "$OUT"
-bash "$DIR/validate_receipt_sm90.sh" "$OUT" --check-mode >/dev/null \
-  || { echo "RECEIPT_FAIL:generated receipt failed self-validation"; exit 2; }
+trap - EXIT
 echo "EXPECTED_RECEIPT_SHA256:$(sha256sum "$OUT" | cut -d' ' -f1)"

@@ -9,9 +9,9 @@
 #   0. EXPECTED_RECEIPT_SHA256 env present + 64-hex                -> exit 14
 #   1. sha256(receipt) == EXPECTED_RECEIPT_SHA256 (exact)          -> exit 14
 #   2. receipt well-formed + read-only (shared validate_receipt)   -> exit 14
-#   3. BENCH_MODE gate: formal refuses BINARY_BUILD_COMMIT=UNKNOWN
-#      and IMAGE_REPO_DIGESTS=NONE; canary runs are labeled
-#      INVALID_FOR_FORMAL in sidecar+log                           -> exit 14
+#   3. BENCH_MODE gate: formal is UNCONDITIONALLY refused (no build-record
+#      contract exists yet); canary runs are labeled INVALID_FOR_FORMAL
+#      in sidecar, log and JSON                                    -> exit 14
 #   4. manifest present -> exit 12; content-bound to receipt and
 #      read-only                                                   -> exit 14
 #   5. shared manifest validation + harness/SO drift               -> exit 12/13
@@ -30,8 +30,10 @@
 #      parseable JSON                                              -> exit 15
 #  12. end telemetry gates: zero foreign occupancy, zero midrun
 #      foreign hits, load1 delta; sidecar finalized                -> exit 15
-# Gated quantities: occupancy (pre/mid/end), running SM clock floor, load1
-# delta. Power draw and vmstat are RECORD-ONLY disclosures, not gates.
+# Gated quantities: target-GPU occupancy (prelaunch / periodic midrun / end),
+# absolute prelaunch load1, load1 delta, and a single-sample running SM clock
+# LIVENESS floor (not a stability gate - see below). Power draw and vmstat are
+# RECORD-ONLY disclosures and are never gates.
 # Usage: BENCH_TAG=... EXPECTED_RECEIPT_SHA256=... [BENCH_MODE=formal|canary] \
 #          bash host_launch_sm90.sh <container> <host_mok_dir> <manifest> <receipt>
 set -uo pipefail
@@ -53,13 +55,16 @@ rget() { grep "^$1=" "$RECEIPT" | head -1 | cut -d= -f2-; }
 
 BMODE=${BENCH_MODE:-canary}
 case "$BMODE" in formal|canary) : ;; *) echo "MODE_FAIL:BENCH_MODE must be formal or canary (got $BMODE)"; exit 14 ;; esac
+# Formal mode is UNCONDITIONALLY refused. A 40-hex BINARY_BUILD_COMMIT that
+# resolves in the repo proves only that some commit exists - it does not prove
+# that commit produced this .so, so any commit could stand in for the real
+# one. Until a build-record contract exists (record bytes + hash binding the
+# SO hash, source commit and toolchain/image, verified end to end), formal
+# provenance cannot be established and must not be simulated.
 if [ "$BMODE" = "formal" ]; then
-  [ "$(rget BINARY_BUILD_COMMIT)" != "UNKNOWN" ] || { echo "FORMAL_MODE_FAIL:BINARY_BUILD_COMMIT UNKNOWN (no build record; formal forbidden)"; exit 14; }
-  [ "$(rget IMAGE_REPO_DIGESTS)" != "NONE" ] || { echo "FORMAL_MODE_FAIL:IMAGE_REPO_DIGESTS NONE (local-only image; formal forbidden)"; exit 14; }
-  FORMAL_VALIDITY=VALID_FOR_FORMAL
-else
-  FORMAL_VALIDITY=INVALID_FOR_FORMAL
+  echo "FORMAL_MODE_FAIL:build-record contract not implemented"; exit 14
 fi
+FORMAL_VALIDITY=INVALID_FOR_FORMAL
 
 [ -f "$MANIFEST" ] || { echo "MANIFEST_SCHEMA_FAIL:missing $MANIFEST"; exit 12; }
 MSHA_ACT=$(sha256sum "$MANIFEST" | cut -d' ' -f1)
@@ -144,6 +149,11 @@ side "PRELAUNCH_OCCUPANCY:$OCC"
 [ "$OCC" -eq 0 ] || fail "TELEMETRY_GATE_FAIL:prelaunch foreign occupancy=$OCC on target GPUs" 15
 LOAD_START=$(cat /proc/loadavg)
 side "HOST_LOADAVG_PRELAUNCH:$LOAD_START"
+L1P=${LOAD_START%% *}
+LOAD1_MAX_PRELAUNCH=${LOAD1_MAX_PRELAUNCH:-64}
+PLOK=$(python3 -c "print(1 if float('$L1P') <= float('$LOAD1_MAX_PRELAUNCH') else 0)" 2>/dev/null)
+side "PRELAUNCH_LOAD1_GATE:load1=$L1P max=$LOAD1_MAX_PRELAUNCH ok=${PLOK:-0}"
+[ "${PLOK:-0}" = "1" ] || fail "TELEMETRY_GATE_FAIL:prelaunch load1 $L1P above $LOAD1_MAX_PRELAUNCH" 15
 side "HOST_VMSTAT_PRELAUNCH:$(vmstat 1 2 2>/dev/null | tail -1 | tr -s ' ')"
 side "HOST_GPU_CLOCKS_PRELAUNCH:$(gpuq)"
 side "TELEMETRY_PRELAUNCH_END:$(date -u +%F_%T)"
@@ -209,6 +219,9 @@ done
 side "PID_ATTRIBUTION_$ATTR"
 side "NVML_UUID_PID_PAIRS:$(printf '%s' "$PAIRS" | grep -f <(echo $TUUIDS | tr ' ' '\n') | tr '\n' ';')"
 [ "$ATTR" = PASS ] || fail "per-GPU worker attribution failed" 5
+# single-sample liveness floor taken shortly after launch: it may land in
+# setup/JIT rather than the timed region, so it is NOT an environment-
+# stability gate and must never be described as one
 RUNCLK=$(gpuq)
 side "HOST_GPU_CLOCKS_RUNNING:$RUNCLK"
 CLK_RUN_MIN_MHZ=${CLK_RUN_MIN_MHZ:-500}
@@ -216,8 +229,8 @@ LOWCLK=0
 for C in $(printf '%s' "$RUNCLK" | tr ';' '\n' | cut -d, -f2 | grep -oE '^[0-9]+'); do
   [ "$C" -lt "$CLK_RUN_MIN_MHZ" ] && LOWCLK=1
 done
-side "RUNNING_CLOCK_GATE:min=${CLK_RUN_MIN_MHZ}MHz low=$LOWCLK"
-[ "$LOWCLK" -eq 0 ] || fail "TELEMETRY_GATE_FAIL:running sm clock below ${CLK_RUN_MIN_MHZ}MHz" 15
+side "RUNNING_CLOCK_LIVENESS:min=${CLK_RUN_MIN_MHZ}MHz low=$LOWCLK"
+[ "$LOWCLK" -eq 0 ] || fail "TELEMETRY_GATE_FAIL:running sm clock liveness below ${CLK_RUN_MIN_MHZ}MHz" 15
 echo "LAUNCH_VERIFIED run_id=$RUN_ID log=$LOG sidecar=$SIDE manifest_sha=$MSHA receipt_sha=$RSHA pid_attribution=PASS"
 
 # completion wait with periodic foreign-process sampling: every poll tick,

@@ -71,7 +71,7 @@ SJSON=$SHADOW/runs/$TAG-$RID.json
 set +e
 OUT=$(bash "$DIR/verify_run_sm90.sh" "$SHADOW" "$TAG" "$RID" "$MAN" "$RECEIPT" "$CT" 2>&1); RC=$?
 set -u
-[ "$RC" -eq 0 ] && has1 "$OUT" '^VERIFY_PASS'; phreport 0_shadow_baseline $?
+[ "$RC" -eq 0 ] && has1 "$OUT" '^VERIFY_PASS mode=canary formal_validity=INVALID_FOR_FORMAL$'; phreport 0_shadow_baseline $?
 echo "  shadow_baseline rc=$RC want=0(VERIFY_PASS)"
 
 ph() { # name mutate-cmd expected-reason-ERE
@@ -91,7 +91,7 @@ ph() { # name mutate-cmd expected-reason-ERE
   unset PHMAN PHREC
 }
 ph 1_manifest_copy_tamper 'echo "TAMPER=1" >> "$SMAN"' '^VERIFY_FAIL:per-run copy failed shared validator$'
-ph 2_receipt_copy_tamper  'echo "TAMPER=1" >> "$SREC"' '^VERIFY_FAIL:receipt copy tampered'
+ph 2_receipt_copy_tamper  'echo "TAMPER=1" >> "$SREC"' '^VERIFY_FAIL:receipt copy tampered \(copy [0-9a-f]{64} != expected\)$'
 ph 3_sidecar_manifest_sha 'sed -i "s|^MANIFEST_SHA256:.*|MANIFEST_SHA256:$(printf "a%.0s" $(seq 1 64))|" "$SSIDE"' '^VERIFY_FAIL:sidecar pre-start manifest hash != copy$'
 ph 4_sidecar_receipt_sha  'sed -i "s|^RECEIPT_SHA256:.*|RECEIPT_SHA256:$(printf "a%.0s" $(seq 1 64))|" "$SSIDE"' '^VERIFY_FAIL:sidecar receipt sha mismatch$'
 ph 5_log_manifest_sha     'sed -i "s|^MANIFEST_SHA256:.*|MANIFEST_SHA256:$(printf "b%.0s" $(seq 1 64))|" "$SLOG"' '^VERIFY_FAIL:runner log manifest hash != copy$'

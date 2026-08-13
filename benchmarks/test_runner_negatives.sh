@@ -149,24 +149,25 @@ sed "s|^MANIFEST_SHA256=.*|MANIFEST_SHA256=$(H64 b)|" "$RECEIPT" > "$TMPD/badbin
 lcase 12_receipt_binding "$(sha256sum "$TMPD/badbind.receipt" | cut -d' ' -f1)" 14 \
   '^MANIFEST_TRUST_FAIL:manifest sha != receipt \(actual '"$REALMSHA"' receipt '"$(H64 b)"'\)$' \
   -- "$CT" "$MOKDIR" "$MANI" "$TMPD/badbind.receipt"
+LIVEID=$(docker inspect --format '{{.Image}}' "$CT" 2>/dev/null)
+[ -n "$LIVEID" ] || { echo "SUITE_SETUP_FAIL:cannot read live image id for $CT"; exit 3; }
 sed "s|^IMAGE_ID=.*|IMAGE_ID=sha256:$(H64 c)|" "$RECEIPT" > "$TMPD/badimg.receipt"; chmod 444 "$TMPD/badimg.receipt"
 lcase 13_image_mismatch "$(sha256sum "$TMPD/badimg.receipt" | cut -d' ' -f1)" 14 \
-  '^IMAGE_TRUST_FAIL:image id live ' -- "$CT" "$MOKDIR" "$MANI" "$TMPD/badimg.receipt"
+  "^IMAGE_TRUST_FAIL:image id live $LIVEID != receipt sha256:$(H64 c)\$" -- "$CT" "$MOKDIR" "$MANI" "$TMPD/badimg.receipt"
 
-# ---- formal-mode gates: a genuine receipt without build/registry provenance
-# must be refused in formal mode (canary is allowed, labeled INVALID_FOR_FORMAL)
+# ---- formal mode is refused unconditionally: a commit id cannot prove it
+# built this .so, so formal provenance must not be simulated. Both a receipt
+# with UNKNOWN lineage and one that looks complete must be rejected.
 sed "s|^BINARY_BUILD_COMMIT=.*|BINARY_BUILD_COMMIT=UNKNOWN|" "$RECEIPT" > "$TMPD/unk.receipt"; chmod 444 "$TMPD/unk.receipt"
-LMODE=formal lcase 14_formal_unknown_build "$(sha256sum "$TMPD/unk.receipt" | cut -d' ' -f1)" 14 \
-  '^FORMAL_MODE_FAIL:BINARY_BUILD_COMMIT UNKNOWN \(no build record; formal forbidden\)$' \
+LMODE=formal lcase 14_formal_blocked_unknown "$(sha256sum "$TMPD/unk.receipt" | cut -d' ' -f1)" 14 \
+  '^FORMAL_MODE_FAIL:build-record contract not implemented$' \
   -- "$CT" "$MOKDIR" "$MANI" "$TMPD/unk.receipt"
-sed "s|^IMAGE_REPO_DIGESTS=.*|IMAGE_REPO_DIGESTS=NONE|; s|^BINARY_BUILD_COMMIT=.*|BINARY_BUILD_COMMIT=$(printf '0%.0s' $(seq 1 40))|" \
-  "$RECEIPT" > "$TMPD/nodig.receipt"; chmod 444 "$TMPD/nodig.receipt"
-LMODE=formal lcase 15_formal_local_image "$(sha256sum "$TMPD/nodig.receipt" | cut -d' ' -f1)" 14 \
-  '^FORMAL_MODE_FAIL:IMAGE_REPO_DIGESTS NONE \(local-only image; formal forbidden\)$' \
-  -- "$CT" "$MOKDIR" "$MANI" "$TMPD/nodig.receipt"
+LMODE=formal lcase 15_formal_blocked_real "$EXPR_SHA" 14 \
+  '^FORMAL_MODE_FAIL:build-record contract not implemented$' \
+  -- "$CT" "$MOKDIR" "$MANI" "$RECEIPT"
 
 # ---- host-side manifest / sidecar gates ----
-lcase 16_manifest_missing "$EXPR_SHA" 12 '^MANIFEST_SCHEMA_FAIL:missing ' \
+lcase 16_manifest_missing "$EXPR_SHA" 12 "^MANIFEST_SCHEMA_FAIL:missing $TMPD/nonexistent\.manifest\$" \
   -- "$CT" "$MOKDIR" "$TMPD/nonexistent.manifest" "$RECEIPT"
 CID=17_sidecar_unwritable-$SUITE
 RO=$MOKDIR/negro-$SUITE
@@ -180,7 +181,8 @@ set -u
 chmod 755 "$RO/host-runs" 2>/dev/null
 NART=$(ls "$RO/runs/" 2>/dev/null | wc -l)
 rm -rf "$RO" 2>/dev/null
-[ "$R" -eq 4 ] && has1 "$O" '^LAUNCH_VERIFY_FAIL:sidecar not writable at ' && [ "$NART" -eq 0 ]; report 17_sidecar_unwritable $?
+[ "$R" -eq 4 ] && has1 "$O" "^LAUNCH_VERIFY_FAIL:sidecar not writable at $RO/host-runs/$CID-[0-9]{8}T[0-9]{6}Z-[0-9]+\.host\$" \
+  && [ "$NART" -eq 0 ]; report 17_sidecar_unwritable $?
 echo "  17 rc=$R want=4(sidecar not writable, artifacts=$NART)"
 
 # ---- validate-only surfaces (no launcher, no docker) ----
@@ -199,7 +201,7 @@ vcase 19_unknown_key   'cat "$MANI"; echo "rogue_key=1"' 12 '^MANIFEST_SCHEMA_FA
 vcase 20_duplicate_key 'cat "$MANI"; echo "topk=1"' 12 '^MANIFEST_SCHEMA_FAIL:key topk count=2 \(need exactly 1\)$'
 vcase 21_bad_hex       'sed "s/^EXPECTED_SO_SHA256=.*/EXPECTED_SO_SHA256=nothex/" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:EXPECTED_SO_SHA256 not 64-hex$'
 vcase 22_frozen_short  'sed "s/^FROZEN_COMMIT=.*/FROZEN_COMMIT=6df8bb7/" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:FROZEN_COMMIT not 40-hex$'
-vcase 23_timing_enum   'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS=forward.v1|" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set'
+vcase 23_timing_enum   'sed "s|^TIMING_SEMANTICS=.*|TIMING_SEMANTICS=forward.v1|" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:TIMING_SEMANTICS not in allowed set \{build_schedule\+forward\.v2\}$'
 vcase 24_world_size    'sed "s/^world_size=.*/world_size=8/" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:world_size must be 4$'
 vcase 25_gpus_dup      'sed "s/^BENCH_GPUS=.*/BENCH_GPUS=0,0,2,3/" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:BENCH_GPUS ids not unique$'
 vcase 26_topk_gt_exp   'sed "s/^topk=.*/topk=9/" "$MANI"' 12 '^MANIFEST_SCHEMA_FAIL:topk > experts$'
@@ -224,11 +226,13 @@ rcase 31_receipt_bad_image 'sed "s|^IMAGE_ID=.*|IMAGE_ID=notasha|" "$RECEIPT"' 1
   '^RECEIPT_TRUST_FAIL:IMAGE_ID malformed \(want sha256:<64-hex>\)$'
 rcase 32_receipt_empty_val 'sed "s|^IMAGE_REF=.*|IMAGE_REF=|" "$RECEIPT"' 14 \
   '^RECEIPT_TRUST_FAIL:key IMAGE_REF empty$'
+rcase 33_receipt_bad_digests 'sed "s|^IMAGE_REPO_DIGESTS=.*|IMAGE_REPO_DIGESTS=some-free-form-string|" "$RECEIPT"' 14 \
+  '^RECEIPT_TRUST_FAIL:IMAGE_REPO_DIGESTS malformed \(want NONE or repo@sha256:<64-hex> list\)$'
 
 # cleanup only AFTER the last case that uses TMPD fixtures
 rm -rf "$TMPD"
 
-EXPECTED_CASES=32
+EXPECTED_CASES=33
 TOTAL=$((PASS+FAIL))
 [ "$TOTAL" -eq "$EXPECTED_CASES" ] || { echo "SUITE_COUNT_FAIL:ran $TOTAL cases, expected $EXPECTED_CASES"; FAIL=$((FAIL+1)); }
 echo "NEGATIVES suite=$SUITE pass=$PASS fail=$FAIL"

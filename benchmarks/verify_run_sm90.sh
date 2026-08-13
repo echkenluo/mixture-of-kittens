@@ -77,15 +77,11 @@ fi
 cnt1 "$SIDE" '^BENCH_MODE:'; SMODE=$(grep '^BENCH_MODE:' "$SIDE" | cut -d: -f2)
 cnt1 "$LOG" '^BENCH_MODE:';  LMODE=$(grep '^BENCH_MODE:' "$LOG" | cut -d: -f2)
 [ "$SMODE" = "$LMODE" ] || vf "sidecar mode != log mode"
-case "$SMODE" in formal|canary) : ;; *) vf "invalid mode $SMODE" ;; esac
+# only canary exists: formal provenance needs a build-record contract that is
+# not implemented, so a run claiming formal mode is itself evidence of tampering
+[ "$SMODE" = "canary" ] || vf "only canary mode is implemented (build-record contract missing), got $SMODE"
 cnt1 "$SIDE" '^FORMAL_VALIDITY:'; FV=$(grep '^FORMAL_VALIDITY:' "$SIDE" | cut -d: -f2)
-if [ "$SMODE" = "formal" ]; then
-  [ "$FV" = "VALID_FOR_FORMAL" ] || vf "formal mode but validity=$FV"
-  [ "$(rget BINARY_BUILD_COMMIT)" != "UNKNOWN" ] || vf "formal mode with UNKNOWN build lineage"
-  [ "$(rget IMAGE_REPO_DIGESTS)" != "NONE" ] || vf "formal mode with local-only image"
-else
-  [ "$FV" = "INVALID_FOR_FORMAL" ] || vf "canary mode but validity=$FV"
-fi
+[ "$FV" = "INVALID_FOR_FORMAL" ] || vf "canary mode but validity=$FV"
 SHA=$(mget EXPECTED_HARNESS_SHA256); EXPSO=$(mget EXPECTED_SO_SHA256); FC=$(mget FROZEN_COMMIT)
 BGP=$(mget BENCH_GPUS)
 [ "$(rget HARNESS_SHA256)" = "$SHA" ] || vf "receipt harness sha != manifest"
@@ -118,8 +114,10 @@ cnt1 "$SIDE" '^PRELAUNCH_OCCUPANCY:'; grep -q '^PRELAUNCH_OCCUPANCY:0$' "$SIDE" 
 cnt1 "$SIDE" '^END_OCCUPANCY:'; grep -q '^END_OCCUPANCY:0$' "$SIDE" || vf "end occupancy not zero"
 cnt1 "$SIDE" '^MIDRUN_FOREIGN_SAMPLES:'
 grep '^MIDRUN_FOREIGN_SAMPLES:' "$SIDE" | grep -q 'hits=0$' || vf "midrun foreign hits not zero"
-cnt1 "$SIDE" '^RUNNING_CLOCK_GATE:'
-grep '^RUNNING_CLOCK_GATE:' "$SIDE" | grep -q 'low=0$' || vf "running clock gate not clean"
+cnt1 "$SIDE" '^PRELAUNCH_LOAD1_GATE:'
+grep '^PRELAUNCH_LOAD1_GATE:' "$SIDE" | grep -q 'ok=1$' || vf "prelaunch absolute load1 gate not ok"
+cnt1 "$SIDE" '^RUNNING_CLOCK_LIVENESS:'
+grep '^RUNNING_CLOCK_LIVENESS:' "$SIDE" | grep -q 'low=0$' || vf "running clock liveness below floor"
 cnt1 "$SIDE" '^LOAD1_DELTA_GATE:'
 grep '^LOAD1_DELTA_GATE:' "$SIDE" | grep -q 'ok=1$' || vf "load1 delta gate not ok"
 python3 - "$JSON" "$SHA" "$FC" "$R" "$MAN" "$EXPSO" "$MS_GIVEN" "$EXPR_SHA" "$BGP" "$SMODE" <<'PY' || exit 1
