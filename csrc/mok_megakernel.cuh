@@ -1336,11 +1336,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     wait_for_wgrad_operands(idx, k_block * MLP_Kb);
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                     if constexpr (!USE_ROUTED_MXFP8) { // BF16 AtB: A/B tiles are K-major slices of normal token-major activations
-                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {k_block - macrobatch_k_offset, tile_coord.x * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {k_block - macrobatch_k_offset, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {k_block - macrobatch_k_offset, tile_coord.x * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {k_block - macrobatch_k_offset, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
                     } else { // MXFP8 ABt: A/B are transpose-quantized activations with K = tokens
-                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(a_smem[input_ring], a_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
                     }
                     update_phasebit<1>(gemm_bitfield, input_ring);
                     input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
@@ -1352,11 +1352,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     const auto &b_gmem_curr = idx < first_gemm_iters ? b_gmem : *b2_gmem;
                     const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
-                    tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
                     if constexpr (IS_AB)
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
                     else
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank));
                     update_phasebit<1>(gemm_bitfield, input_ring);
                     input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                 }
@@ -1369,8 +1369,8 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     for (int idx = 0, k_block = k_start / MLP_Kb; idx < iters_per_task; ++idx, ++k_block) {
                         wait_for_wgrad_operands(idx, k_block * MLP_Kb);
                         wait(gemm_scales_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
-                        tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank));
+                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11));
                         update_phasebit<1>(gemm_bitfield, input_ring);
                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                     }
@@ -1382,8 +1382,8 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         const sc_gl &b_sc_curr = idx < first_gemm_iters ? *b_sc_gmem : *b2_sc_gmem;
                         const auto &b_gmem_curr = idx < first_gemm_iters ? b_gmem : *b2_gmem;
                         const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
-                        tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr, {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb) + tile_coord.y * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank));
+                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr, {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb) + tile_coord.y * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11));
                         update_phasebit<1>(gemm_bitfield, input_ring);
                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                     }
@@ -1442,7 +1442,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
-                warpgroup::load_async(d_reg[i], d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH * i));
+                warp::zero(d_reg[i]); // SM90 scaffold: accumulator drain pending wgmma rewrite
             tensor_load_wait();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
