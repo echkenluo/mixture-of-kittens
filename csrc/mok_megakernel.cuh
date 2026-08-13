@@ -1445,12 +1445,18 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) { // SM90 wgmma: fwd bf16 (wgrad=training-only, deferred)
             mok_sm90::wgmma_acc<a_tile, b_tile, config::MLP_Mb / 2, config::MLP_Nb> acc;
             int input_ring = 0;
+            if (warpgroup::laneid() == 0 && blockIdx.x < 2)
+                printf("[MOKDBG] cta=%d consumer enter iters=%d\n", (int)blockIdx.x, iters_per_task);
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 if (warpgroup::laneid() == 0)
                     tma::expect_bytes(gemm_inputs_arrived[input_ring],
                         config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
                 warpgroup::sync(2);
+                if (warpgroup::laneid() == 0 && blockIdx.x < 2 && idx == 0)
+                    printf("[MOKDBG] cta=%d expect done, waiting ring0\n", (int)blockIdx.x);
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
+                if (warpgroup::laneid() == 0 && blockIdx.x < 2 && idx == 0)
+                    printf("[MOKDBG] cta=%d input ring0 ARRIVED\n", (int)blockIdx.x);
                 update_phasebit<0>(gemm_bitfield, input_ring);
                 acc.step(a_smem[input_ring], b_smem[input_ring], idx == 0);
                 if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
