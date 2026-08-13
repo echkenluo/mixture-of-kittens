@@ -75,7 +75,7 @@ struct config {
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS; // 256
 #if defined(KITTENS_SM90)
-    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024 - 17 * 1024; // 16KiB half staging + slack; dispatch needs ~194.5KiB dynamic
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 #else
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 #endif
@@ -1490,6 +1490,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
 #if defined(KITTENS_SM90)
 #if defined(KITTENS_SM90)
         mok_sm90::wgmma_quad<a_tile, b_tile, IS_AB> quad;
+        int mok_held_ring = 0;
         if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
             int input_ring = 0;
             for (int idx = 0; idx < iters_per_task; ++idx) {
@@ -1497,7 +1498,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 update_phasebit<0>(gemm_bitfield, input_ring);
                 quad.step(a_smem[input_ring], a_smem2[input_ring],
                           b_smem[input_ring], b_smem2[input_ring], idx == 0);
-                if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
+                if (idx + 1 < iters_per_task) { // hold the LAST slot for epilogue aliasing
+                    if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
+                } else mok_held_ring = input_ring;
                 input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
             if (warpgroup::laneid() == 0) arrive(gemm_outputs_arrived);
@@ -1509,7 +1512,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         auto store_bf16 = [&]() {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
 #if defined(KITTENS_SM90)
-            __shared__ st_bf<64, config::MLP_Nb> d_stage; // ONE M-half staging (16KiB)
+            // stage through the HELD GEMM input slot (extern smem alias; protected
+            // by the deferred gemm_inputs_finished of that slot)
+            auto &d_stage64 = *reinterpret_cast<st_bf<64, 64> *>(&a_smem[mok_held_ring]);
 #else
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
@@ -1517,7 +1522,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
 #endif
             tensor_load_wait();
             warpgroup::sync(1);
+#if !defined(KITTENS_SM90)
             warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+#endif
             if (output_row_ready != nullptr && epilogue_group::laneid() == 0) {
                 const int previous_macrobatch_offset = (macrobatch_idx + 1) * macrobatch_size;
                 const int row_idx = tile_coord.x * config::MLP_Mb + cta_rank * (config::MLP_Mb / config::CLUSTER_SIZE);
@@ -1534,17 +1541,21 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             #pragma unroll
             for (int h = 0; h < MOK_H; ++h) {
 #if defined(KITTENS_SM90)
-                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
-                    quad.drain_half_to(d_stage, h); // sequential halves through one buffer
+                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
+                    #pragma unroll
+                    for (int hn = 0; hn < 2; ++hn) {
+                        quad.drain_quadrant_to(d_stage64, h, hn);
+                        #pragma unroll
+                        for (int i2 = 0; i2 < config::MLP_EPI_PIPE_DEPTH / 2; ++i2) {
+                            auto stg = d_stage64.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i2});
+                            warpgroup::load(d_reg[hn * (config::MLP_EPI_PIPE_DEPTH / 2) + i2], stg);
+                        }
+                    }
+                }
 #endif
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
-#if defined(KITTENS_SM90)
-                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
-                    auto stg = d_stage.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i});
-                    warpgroup::load(d_reg[i], stg);
-                }
-#endif
+
                 warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
                 warpgroup::sync(1);
                 warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
@@ -1565,6 +1576,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             }
             }
             warpgroup::tma::store_async_read_wait();
+#if defined(KITTENS_SM90)
+            warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+            if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+                if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[mok_held_ring]);
+#endif
         };
         if constexpr (USE_ROUTED_MXFP8) {
           if (d_routed_gmem != nullptr) {

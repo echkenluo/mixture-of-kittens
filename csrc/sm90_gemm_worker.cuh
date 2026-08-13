@@ -32,6 +32,13 @@ struct wgmma_quad {
         }
         warpgroup::mma_async_wait();
     }
+    // Store a single quadrant into a 64x64 staging tile (aliased GEMM input
+    // slot; kernel-wide static smem is impossible in the fused kernel).
+    template<typename DST> __device__ inline void drain_quadrant_to(DST &d, int hm, int hn) {
+        warpgroup::store(d, acc[hm][hn]);
+        warpgroup::sync(1);
+    }
+
     // Store ONE M-half (both N-quadrants) into a half-tile staging buffer
     // (AH x 2*BN). 16KiB budget form per codex step-B smem review.
     template<typename DST> __device__ inline void drain_half_to(DST &d, int hm) {
