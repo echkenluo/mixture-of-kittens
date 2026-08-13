@@ -1448,7 +1448,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                acc.step_ABt(a_smem[input_ring], b_smem[input_ring], idx == 0);
+                acc.step_AB(a_smem[input_ring], b_smem[input_ring], idx == 0);
                 if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
                 input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }

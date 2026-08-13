@@ -17,12 +17,12 @@ struct wgmma_acc {
     static constexpr int MCH = MB / 64;
     using a_sub_t = st_bf<64, AST::cols>;
     rt_fl<16, NB / 2> acc[MCH];
-    __device__ inline void step_ABt(const AST &a, const BST &b, bool first) {
+    __device__ inline void step_AB(const AST &a, const BST &b, bool first) {
         #pragma unroll
         for (int m = 0; m < MCH; ++m) {
             auto a_sub = const_cast<AST &>(a).template subtile<64, AST::cols>(int2{m, 0});
-            if (first) warpgroup::mm_ABt (acc[m], a_sub, b);
-            else       warpgroup::mma_ABt(acc[m], a_sub, b);
+            if (first) warpgroup::mm_AB (acc[m], a_sub, b); // B is K-major [K,N]
+            else       warpgroup::mma_AB(acc[m], a_sub, b);
         }
         warpgroup::mma_async_wait();
     }
