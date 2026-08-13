@@ -74,7 +74,7 @@ namespace kittens {
 template<typename T, int M, int N> struct tt {
     template<typename S> __device__ inline S subtile(int, int = 0) const { return S{}; }
 };
-template<int BYTES> struct tensor_allocator {
+template<int... Args> struct tensor_allocator {
     template<typename T> __device__ inline T allocate(int) { return T{}; }
 };
 } // namespace kittens
