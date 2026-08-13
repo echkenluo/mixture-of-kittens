@@ -1452,6 +1452,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
+#if defined(MOK_SM90_STEPB)
         mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256> *acc_p = nullptr;
         __shared__ char acc_store[sizeof(mok_sm90::wgmma_acc<a_tile, b_tile, 128, 256>) > 1 ? 1 : 1];
         (void)acc_store;
@@ -1478,11 +1479,14 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             }
             if (warpgroup::laneid() == 0) arrive(gemm_outputs_arrived);
         }
+
+#endif // MOK_SM90_STEPB
 #endif
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
+#if defined(MOK_SM90_STEPB)
             __shared__ st_bf<64, config::MLP_Nb> d_stage; // step-A staging (half 0)
             if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
                 warpgroup::store(d_stage, acc_p->acc[0]);
@@ -1497,6 +1501,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
                     warp::zero(d_reg[i]);
             }
+#else
+            #pragma unroll
+            for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
+                warp::zero(d_reg[i]); // pre-step-B scaffold
+#endif
             tensor_load_wait();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);

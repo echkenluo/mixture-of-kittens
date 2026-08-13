@@ -1,46 +1,39 @@
 #pragma once
-// SM90 GEMM worker: wgmma register-accumulator implementation of the MoK
-// minibatch GEMM stage (replaces the SM100 tcgen05/tmem path).
-// Design (PORTING.md P1-B v1): consumer warpgroup computes AND drains;
-// per-CTA M-half x full-N accumulator in rt_fl; producer TMA loop unchanged.
+// SM90 quadrant GEMM worker: task tile (2*AH) x (2*BN) covered by 2x2
+// quadrant accumulators over A halves (AH x K) and K-major B halves (K x BN).
+// Full coverage per codex review; register budget 4 x rt_fl<AH/4, BN>.
 #if defined(KITTENS_SM90)
 namespace mok_sm90 {
 using namespace kittens;
 
-// One K-pipelined BF16 ABt accumulation over the existing smem ring.
-// Caller (consumer warpgroup): waits gemm_inputs_arrived[ring] per stage,
-// then calls step(); arrives gemm_inputs_finished[ring] after.
-template<typename AST, typename BST, int MB, int NB>
-struct wgmma_acc {
-    // TK SM90 warpgroup mma is fixed at M=64 per call (A height 4 tiles,
-    // D height 1 tile/warp): loop the MB rows in 64-row chunks.
-    static constexpr int MCH = MB / 64;
-    using a_sub_t = st_bf<64, AST::cols>;
-    rt_fl<16, NB / 2> acc[MCH];
-    __device__ inline void step(const AST &a, const BST &b, bool first) {
+template<typename AST, typename BST>
+struct wgmma_quad {
+    static constexpr int AH = AST::rows;
+    static constexpr int BN = BST::cols;
+    rt_fl<AH / 4, BN> acc[2][2];
+    __device__ inline void step(const AST &a0, const AST &a1,
+                                const BST &b0, const BST &b1, bool first) {
+        const AST *as[2] = {&a0, &a1};
+        const BST *bs[2] = {&b0, &b1};
         #pragma unroll
-        for (int m = 0; m < MCH; ++m) {
-            // NOTE: wgmma smem descriptors ignore st_subtile offsets (verified
-            // by the unit test: both M-chunks read chunk 0). Reinterpret the
-            // M-halves as independent stacked tiles instead.
-            using a_half_t = st_bf<64, AST::cols>;
-            auto &a_sub = *reinterpret_cast<a_half_t *>(
-                reinterpret_cast<char *>(const_cast<AST *>(&a)) + m * sizeof(a_half_t));
-            if constexpr (BST::rows == AST::cols) { // B [K,N] -> AB
-                if (first) warpgroup::mm_AB (acc[m], a_sub, b);
-                else       warpgroup::mma_AB(acc[m], a_sub, b);
-            } else {                                // B [N,K] -> ABt
-                if (first) warpgroup::mm_ABt (acc[m], a_sub, b);
-                else       warpgroup::mma_ABt(acc[m], a_sub, b);
+        for (int hm = 0; hm < 2; ++hm) {
+            #pragma unroll
+            for (int hn = 0; hn < 2; ++hn) {
+                if (first) warpgroup::mm_AB (acc[hm][hn], *as[hm], *bs[hn]);
+                else       warpgroup::mma_AB(acc[hm][hn], *as[hm], *bs[hn]);
             }
         }
         warpgroup::mma_async_wait();
     }
-    template<typename DST> __device__ inline void drain_to(DST &d_smem) {
+    // d covers the full task tile (2*AH x 2*BN); store path honors subtiles.
+    template<typename DST> __device__ inline void drain_to(DST &d) {
         #pragma unroll
-        for (int m = 0; m < MCH; ++m)
-            { auto d_sub = d_smem.template subtile<64, DST::cols>(int2{m, 0});
-              warpgroup::store(d_sub, acc[m]); }
+        for (int hm = 0; hm < 2; ++hm)
+            #pragma unroll
+            for (int hn = 0; hn < 2; ++hn) {
+                auto sub = d.template subtile<AH, BN>(int2{hm, hn});
+                warpgroup::store(sub, acc[hm][hn]);
+            }
         warpgroup::sync(1);
     }
 };
