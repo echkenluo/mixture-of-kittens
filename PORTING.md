@@ -78,3 +78,14 @@ MLP_LOAD_PIPE_DEPTH 6 -> 3 for SM90 config. Epilogue: drain rt directly to
 d smem tiles per EPI stage (replaces tmem load_async + tcgen05.ld).
 tensor_load_wait -> warpgroup::mma_async_wait; tensor_*_thread_sync -> no-op;
 tcgen05::commit -> plain semaphore arrive after mma_async_wait.
+
+## r8 taxonomy (final work surface, 101 errs after tt scaffold unmasked MMA layer)
+- 42x tma::cluster::load_async overload: SM90 TK signature differs from SM100
+  call form (smem,gmem,coord,sem,mask,0) - check TK SM90 header, adapt sites
+  (mechanical, or wrap in compat with the trailing-arg dropped).
+- 14x group::load_async from tt subtiles (epilogue drain): DISAPPEAR with the
+  register-accumulator rewrite (drain directly from rt_fl).
+- 8x mma2_ABt + 8x mm2_ABt undefined: replace per PORTING P1-B v1 design
+  (warpgroup::mm_/mma_ABt on per-CTA rt_fl, B full-N).
+- 6x load_mxnv_scale_async2: MXFP8-only branches -> parse stub in compat.
+Convergence: 96/55/46/14/10/9/3 -> unmasked 101 (deeper layer, mapped).
