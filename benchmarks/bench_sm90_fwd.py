@@ -202,8 +202,10 @@ def main() -> None:
             "tflops_p50": round(get_tflops(p50, NUM_LOCAL_TOKENS, TOPK,
                                            HIDDEN_DIM, INTERMEDIATE_DIM), 2),
         }
-        with open(OUTPUT, "w") as f:
+        tmp = OUTPUT + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(record, f, indent=1)
+        os.replace(tmp, OUTPUT)  # atomic: no partially-written artifact
         print(f"BENCH|sm90_fwd|comm_sms={COMM_SMS}|p50={p50:.4f}ms|p95={p95:.4f}ms"
               f"|abs_max={abs_max:.5f}|relative={relative:.6f}|out={OUTPUT}")
 
