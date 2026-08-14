@@ -1571,37 +1571,23 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
 #endif
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+
+                warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
+                warpgroup::sync(1);
+                warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
+                warpgroup::sync(1);
+                if constexpr (IS_WGRAD) {
+                    if (is_first_wgrad_contribution)
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                    else
+                        // Macrobatches are serialized by routed_buffers_done, so additions occur in a fixed order, preserving determinism
+                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                } else {
 #if defined(KITTENS_SM90)
-                if constexpr (MOK_USE_WGMMA_QUAD) {
-                    // Canary: avoid the register -> shared-memory -> TMA ring
-                    // round trip for the SM90 BF16 forward path.  The same
-                    // direct-store primitive already passed the N64 component
-                    // oracle; this branch measures whether it also shortens
-                    // the validated N128 critical path.
-                    warpgroup::store(
-                        d_gmem, d_reg[i],
-                        {2 * tile_coord.x + h,
-                         config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
-                } else
-#endif
-                {
-                    warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
-                    warpgroup::sync(1);
-                    warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
-                    warpgroup::sync(1);
-                    if constexpr (IS_WGRAD) {
-                        if (is_first_wgrad_contribution)
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
-                        else
-                            // Macrobatches are serialized by routed_buffers_done, so additions occur in a fixed order, preserving determinism
-                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
-                    } else {
-#if defined(KITTENS_SM90)
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + h, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + h, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
 #else
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
 #endif
-                    }
                 }
             }
             }
