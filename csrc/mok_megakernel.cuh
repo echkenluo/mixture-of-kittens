@@ -1494,16 +1494,16 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;
 #if defined(KITTENS_SM90)
-#if defined(KITTENS_SM90)
-        mok_sm90::wgmma_quad<a_tile, b_tile, IS_AB> quad;
+        static constexpr bool MOK_USE_WGMMA_QUAD = !USE_ROUTED_MXFP8 && !IS_WGRAD;
+        mok_sm90::wgmma_quad_slot<MOK_USE_WGMMA_QUAD, a_tile, b_tile, IS_AB> quad_slot;
         int mok_held_ring = 0;
-        if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
+        if constexpr (MOK_USE_WGMMA_QUAD) {
             int input_ring = 0;
             for (int idx = 0; idx < iters_per_task; ++idx) {
                 wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
                 update_phasebit<0>(gemm_bitfield, input_ring);
-                quad.step(a_smem[input_ring], a_smem2[input_ring],
-                          b_smem[input_ring], b_smem2[input_ring], idx == 0);
+                quad_slot.value.step(a_smem[input_ring], a_smem2[input_ring],
+                                     b_smem[input_ring], b_smem2[input_ring], idx == 0);
                 if (idx + 1 < iters_per_task) { // hold the LAST slot for epilogue aliasing
                     if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[input_ring]);
                 } else mok_held_ring = input_ring;
@@ -1511,7 +1511,6 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             }
             if (warpgroup::laneid() == 0) arrive(gemm_outputs_arrived);
         }
-#endif
 #endif
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
@@ -1547,10 +1546,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             #pragma unroll
             for (int h = 0; h < MOK_H; ++h) {
 #if defined(KITTENS_SM90)
-                if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD) {
+                if constexpr (MOK_USE_WGMMA_QUAD) {
                     #pragma unroll
                     for (int hn = 0; hn < 2; ++hn) {
-                        quad.drain_quadrant_to(d_stage64, h, hn);
+                        quad_slot.value.drain_quadrant_to(d_stage64, h, hn);
                         #pragma unroll
                         for (int i2 = 0; i2 < config::MLP_EPI_PIPE_DEPTH / 2; ++i2) {
                             auto stg = d_stage64.template subtile<64, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>(int2{0, i2});
@@ -1584,7 +1583,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             warpgroup::tma::store_async_read_wait();
 #if defined(KITTENS_SM90)
             warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
-            if constexpr (!USE_ROUTED_MXFP8 && !IS_WGRAD)
+            if constexpr (MOK_USE_WGMMA_QUAD)
                 if (warpgroup::laneid() == 0) arrive(gemm_inputs_finished[mok_held_ring]);
 #endif
         };

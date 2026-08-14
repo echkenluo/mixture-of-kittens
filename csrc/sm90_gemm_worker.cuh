@@ -77,5 +77,16 @@ struct wgmma_quad {
         warpgroup::sync(1);
     }
 };
+
+// Keep the WGMMA type itself out of unsupported template instances. Merely
+// putting its calls behind `if constexpr` is insufficient if an unconditional
+// local declaration has already instantiated wgmma_quad with MXFP8 operands.
+template<bool ENABLED, typename AST, typename BST, bool IS_AB>
+struct wgmma_quad_slot {};
+
+template<typename AST, typename BST, bool IS_AB>
+struct wgmma_quad_slot<true, AST, BST, IS_AB> {
+    wgmma_quad<AST, BST, IS_AB> value;
+};
 } // namespace mok_sm90
 #endif
