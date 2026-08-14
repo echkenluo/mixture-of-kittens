@@ -254,6 +254,11 @@ class DeepEpBf16Forward:
         self.num_local_experts = num_local_experts
         self.num_experts = num_local_experts * dist.get_world_size()
         self.comm_sms = comm_sms
+        # Buffer.num_sms is a process-global input to get_*_config().  Set it
+        # before deriving the size hint: allocating with the default (24) and
+        # switching to 32 afterwards makes DeepEP launch more channels than
+        # the NVL buffer was sized for (deep_ep.cpp's capacity assertion).
+        deep_ep_mod.Buffer.set_num_sms(comm_sms)
         hidden_bytes = self.x.shape[1] * max(self.x.element_size(), 2)
         num_nvl_bytes = 0
         for cfg in (deep_ep_mod.Buffer.get_dispatch_config(dist.get_world_size()),
@@ -261,7 +266,6 @@ class DeepEpBf16Forward:
             num_nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, dist.get_world_size()),
                                 num_nvl_bytes)
         self.buffer = deep_ep_mod.Buffer(group, num_nvl_bytes, 0, explicitly_destroy=True)
-        self.buffer.set_num_sms(comm_sms)
         # expert weights transposed once, outside the timed region, exactly as
         # the vendor benchmark does - transpose cost is setup on both sides
         self.w_gate_t = w_routed_gate.detach().transpose(1, 2).contiguous()

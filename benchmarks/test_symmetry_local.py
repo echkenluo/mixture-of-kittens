@@ -54,6 +54,15 @@ def func_src(src, tree, name):
     return None
 
 
+def class_method(tree, class_name, method_name):
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == method_name:
+                    return child
+    return None
+
+
 def const_map(src, tree):
     out = {}
     for node in tree.body:
@@ -101,6 +110,23 @@ report("A_single_comm_sm_knob",
        "BF16_FWD_COMM_SMS" in (deep_c.get("COMM_SMS") or "")
        and "BF16_FWD_COMM_SMS" in (mok_c.get("COMM_SMS") or ""),
        "comparator must read the same comm-SM env var as the MoK side")
+
+# Buffer.num_sms is consumed while get_*_config() constructs the configs used
+# for the NVL size hint.  Setting it after allocation happens to work at the
+# default 24 SMs but under-allocates the buffer for 32 SMs.
+deep_init = class_method(DEEP_AST, "DeepEpBf16Forward", "__init__")
+deep_calls = list(ast.walk(deep_init)) if deep_init is not None else []
+sms_lines = [n.lineno for n in deep_calls if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "set_num_sms"]
+config_lines = [n.lineno for n in deep_calls if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("get_dispatch_config", "get_combine_config")]
+buffer_lines = [n.lineno for n in deep_calls if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "Buffer"]
+report("A_set_sms_before_buffer_sizing",
+       len(sms_lines) == 1 and len(config_lines) == 2 and len(buffer_lines) == 1
+       and sms_lines[0] < min(config_lines) < buffer_lines[0],
+       f"call lines set_num_sms={sms_lines}, configs={config_lines}, Buffer={buffer_lines}")
 
 mok_stats = block(MOK_SRC, "ordered = sorted(samples)", "p95 = ordered[")
 deep_stats = block(DEEP_SRC, "ordered = sorted(samples)", "p95 = ordered[")
@@ -271,7 +297,7 @@ with open(os.path.join(PKG, "extra.py"), "w") as f:
 report("B_py_tree_is_content_sensitive", py_tree_sha(PKG) != GOOD_PY,
        "python-tree hash unchanged after adding a file")
 
-EXPECTED = 27
+EXPECTED = 28
 TOTAL = PASS + FAIL
 if TOTAL != EXPECTED:
     print(f"SYM_COUNT_FAIL:ran {TOTAL} checks, expected {EXPECTED}")
