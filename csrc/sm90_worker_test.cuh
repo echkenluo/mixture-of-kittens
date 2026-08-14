@@ -42,6 +42,9 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
         auto &a1 = *reinterpret_cast<a_half *>(
             reinterpret_cast<char *>(&a_smem) + sizeof(a_half));
         acc.step(a0, a1, b_smem0, b_smem1, k == 0);
+        // This standalone harness has one operand stage, so it cannot overlap
+        // K-stages the way the fused kernel's four-slot ring does.
+        acc.template wait<0>();
         warpgroup::sync(0);
     }
     if (g.staged) {

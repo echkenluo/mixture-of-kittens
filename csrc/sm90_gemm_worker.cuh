@@ -28,6 +28,10 @@ struct wgmma_quad {
     static_assert(AH == 64 && BN == 64,
                   "SM90 v1 quadrant ownership is frozen at 64x64");
     rt_fl<AH / 4, BN> acc[2][2];
+    // Issue one K-stage as four committed groups (one per quadrant). The
+    // caller owns the wait because the fused kernel has a four-slot operand
+    // ring and can safely keep one K-stage in flight. A caller that reuses the
+    // same operand storage immediately must call wait<0>() after every step.
     __device__ inline void step(const AST &a0, const AST &a1,
                                 const BST &b0, const BST &b1, bool first) {
         const AST *as[2] = {&a0, &a1};
@@ -45,7 +49,10 @@ struct wgmma_quad {
                 }
             }
         }
-        warpgroup::mma_async_wait();
+    }
+    template<int N = 0>
+    __device__ inline void wait() {
+        warpgroup::mma_async_wait<N>();
     }
     // Store a single quadrant into a 64x64 staging tile (aliased GEMM input
     // slot; kernel-wide static smem is impossible in the fused kernel).
