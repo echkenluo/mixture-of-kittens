@@ -10,8 +10,23 @@ template<typename AST, typename BST, bool IS_AB>
 struct wgmma_quad {
     // Layout is EXPLICIT (codex finding 2): after the quarter config both AB
     // and ABt B tiles are 64x64, so shape-based dispatch is impossible.
+    // WGMMA descriptors use tile.data[0] and do not apply st_subtile offsets.
+    // Reject view types at instantiation so the earlier silent wrong-address
+    // failure cannot be reintroduced by a new call site.
+    static_assert(AST::rows == AST::underlying_rows && AST::cols == AST::underlying_cols,
+                  "wgmma_quad A must be a real shared tile, not st_subtile");
+    static_assert(BST::rows == BST::underlying_rows && BST::cols == BST::underlying_cols,
+                  "wgmma_quad B must be a real shared tile, not st_subtile");
+    static_assert(std::is_same_v<typename AST::dtype, bf16>
+                  && std::is_same_v<typename BST::dtype, bf16>,
+                  "SM90 v1 wgmma_quad is BF16-only");
+    static_assert(AST::swizzle && BST::swizzle
+                  && AST::swizzle_bytes == 128 && BST::swizzle_bytes == 128,
+                  "wgmma_quad requires real 128-byte-swizzled operands");
     static constexpr int AH = AST::rows;
     static constexpr int BN = IS_AB ? BST::cols : BST::rows;
+    static_assert(AH == 64 && BN == 64,
+                  "SM90 v1 quadrant ownership is frozen at 64x64");
     rt_fl<AH / 4, BN> acc[2][2];
     __device__ inline void step(const AST &a0, const AST &a1,
                                 const BST &b0, const BST &b1, bool first) {

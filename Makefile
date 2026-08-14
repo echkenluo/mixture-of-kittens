@@ -41,8 +41,14 @@ endif
 
 all: $(OUT)
 
+ifeq ($(ARCH),SM90)
+test: $(OUT)
+	MOK_SM90_EXPERIMENTAL=1 $(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=4 -m pytest -s tests/test_sm90_worker.py
+	MOK_SM90_EXPERIMENTAL=1 $(PYTHON) tests/sm90_gates_check.py
+else
 test: $(OUT)
 	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=4 -m pytest -s tests/
+endif
 
 $(OUT): $(SRC) $(HEADERS)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(OUT)

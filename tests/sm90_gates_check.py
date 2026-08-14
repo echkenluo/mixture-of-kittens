@@ -1,6 +1,13 @@
-import os, sys, inspect, torch
+import inspect
+import os
+from pathlib import Path
+import sys
+
+import torch
+
 os.environ.setdefault("MOK_SM90_EXPERIMENTAL", "1")
-sys.path.insert(0, "/mok/mixture-of-kittens")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 fails = 0
 # 1) import/registration smoke
 import mok.ops as ops

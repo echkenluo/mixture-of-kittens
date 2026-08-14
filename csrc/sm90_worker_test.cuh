@@ -73,23 +73,36 @@ __global__ __launch_bounds__(128, 1) void kernel(const __grid_constant__ globals
 }
 
 inline at::Tensor entry(at::Tensor A, at::Tensor B, bool is_ab, bool staged) {
-    if (is_ab) { TORCH_CHECK(A.size(0) == 128 && B.size(1) == 128 && A.size(1) == B.size(0)); }
-    else       { TORCH_CHECK(A.size(0) == 128 && B.size(0) == 128 && A.size(1) == B.size(1)); }
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be rank-2 tensors");
+    kittens::py::tensor_check<a_gl>(A);
+    kittens::py::tensor_check<b_gl>(B);
+    kittens::py::device_check(A, B);
+    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "A and B must be CUDA tensors");
+    if (is_ab) {
+        TORCH_CHECK(A.size(0) == 128 && B.size(1) == 128 && A.size(1) == B.size(0),
+                    "AB expects A[128,K] and B[K,128]");
+    } else {
+        TORCH_CHECK(A.size(0) == 128 && B.size(0) == 128 && A.size(1) == B.size(1),
+                    "ABt expects A[128,K] and B[128,K]");
+    }
     TORCH_CHECK(A.size(1) % 64 == 0);
+    c10::cuda::CUDAGuard device_guard(A.device());
     auto D = at::empty({128, 128}, A.options());
     globals g{
-        a_gl{reinterpret_cast<kittens::bf16*>(A.data_ptr()), nullptr, nullptr, (int)A.size(0), (int)A.size(1)},
-        b_gl{reinterpret_cast<kittens::bf16*>(B.data_ptr()), nullptr, nullptr, (int)B.size(0), (int)B.size(1)},
-        d_gl{reinterpret_cast<kittens::bf16*>(D.data_ptr()), nullptr, nullptr, 128, 128},
+        kittens::py::tensor_to_gl<a_gl>(A),
+        kittens::py::tensor_to_gl<b_gl>(B),
+        kittens::py::tensor_to_gl<d_gl>(D),
         (int)(A.size(1) / 64), staged ? 1 : 0};
     constexpr int SMEM = sizeof(a_st) + 2 * sizeof(b_st) + sizeof(d_st) + 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
     if (is_ab) {
-        cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        kernel<true><<<1, 128, SMEM>>>(g);
+        CUDACHECK(cudaFuncSetAttribute(kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        kernel<true><<<1, 128, SMEM, stream>>>(g);
     } else {
-        cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        kernel<false><<<1, 128, SMEM>>>(g);
+        CUDACHECK(cudaFuncSetAttribute(kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        kernel<false><<<1, 128, SMEM, stream>>>(g);
     }
+    CUDACHECK(cudaGetLastError());
     return D;
 }
 } // namespace wtest
