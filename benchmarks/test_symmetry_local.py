@@ -22,6 +22,7 @@ import tempfile
 DIR = os.path.dirname(os.path.abspath(__file__))
 MOK = os.path.join(DIR, "bench_sm90_fwd.py")
 DEEPEP = os.path.join(DIR, "bench_deepep_fwd.py")
+PHASES = os.path.join(DIR, "bench_sm90_fwd_phases.py")
 
 PASS = 0
 FAIL = 0
@@ -45,6 +46,7 @@ def load(path):
 
 MOK_SRC, MOK_AST = load(MOK)
 DEEP_SRC, DEEP_AST = load(DEEPEP)
+PHASE_SRC, PHASE_AST = load(PHASES)
 
 
 def func_src(src, tree, name):
@@ -156,6 +158,32 @@ report("A_same_timed_iters",
        "TIMED_ITERS" in DEEP_SRC and "range(TIMED_ITERS)" in DEEP_SRC
        and "range(TIMED_ITERS)" in MOK_SRC,
        "comparator must use the shared TIMED_ITERS")
+
+# The phase harness is diagnostic-only and must leave the frozen comparator
+# untouched.  It still has to reuse the exact V4 knobs/truth and expose three
+# independent rank-max series whose combined leg matches the frozen boundary.
+phase_imports = {alias.name for node in PHASE_AST.body if isinstance(node, ast.ImportFrom)
+                 and node.module == "benchmarks.bench_sm90_fwd" for alias in node.names}
+report("A_phase_reuses_frozen_knobs",
+       {"COMM_SMS", "HIDDEN_DIM", "INTERMEDIATE_DIM", "MACROBATCH_SIZE",
+        "MINIBATCH_SIZE", "NUM_EXPERTS", "NUM_LOCAL_TOKENS", "TOPK", "WARMUP"}
+       <= phase_imports,
+       f"phase imports: {sorted(phase_imports)}")
+report("A_phase_reuses_correctness_truth",
+       all(name in PHASE_SRC for name in ("generate_inputs", "run_forward_reference_bf16",
+                                          "run_fwd_epilogue_reference", "BF16_TOLERANCE")),
+       "phase harness must reuse the frozen input/reference/tolerance path")
+report("A_phase_has_three_rank_max_series",
+       PHASE_SRC.count(" = measure(") == 3
+       and all(marker in PHASE_SRC for marker in
+               ("schedule_samples = measure(build_schedule)",
+                "forward_samples = measure(lambda: run_forward(cached_schedule))",
+                "combined_samples = measure(run_combined)")),
+       "phase harness must measure schedule, cached forward, and combined")
+report("A_phase_closure_is_explicit",
+       "combined_minus_isolated_sum_ms" in PHASE_SRC
+       and "combined must reproduce frozen harness" in PHASE_SRC,
+       "phase attribution must fail interpretation when the additive closure is poor")
 
 # The comparator must not contain any unsupported path in EXECUTABLE code.
 # Scanning raw text would flag the disclosure prose (which names MXFP8 and the
@@ -297,7 +325,7 @@ with open(os.path.join(PKG, "extra.py"), "w") as f:
 report("B_py_tree_is_content_sensitive", py_tree_sha(PKG) != GOOD_PY,
        "python-tree hash unchanged after adding a file")
 
-EXPECTED = 28
+EXPECTED = 32
 TOTAL = PASS + FAIL
 if TOTAL != EXPECTED:
     print(f"SYM_COUNT_FAIL:ran {TOTAL} checks, expected {EXPECTED}")
