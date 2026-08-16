@@ -1,6 +1,7 @@
 #include "mok_megakernel.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
+#include "sm90_fp8_block_worker_test.cuh"
 #include "utils.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -73,6 +74,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     #if defined(KITTENS_SM90)
     m.def("sm90_worker_test", &mok_sm90::wtest::entry, "");
+    m.def("sm90_fp8_block_test", &mok_sm90::fp8_block_test::entry, "");
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
