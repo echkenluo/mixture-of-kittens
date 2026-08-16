@@ -83,6 +83,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &mok_sm90::fp8_block_test::grouped::entry_out, "");
     m.def("sm90_fp8_block_grouped_pipelined_out_test",
           &mok_sm90::fp8_block_test::grouped::entry_pipelined_out, "");
+    m.def("fp8_block_grouped_pipelined_out",
+          &mok_sm90::fp8_block_test::grouped::entry_pipelined_out, "",
+          pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("masked_m"), pybind11::arg("output"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

@@ -112,7 +112,7 @@ def summarize(samples: list[float], effective_flops: int) -> dict:
 
 def main() -> None:
     assert hasattr(_C, "sm90_fp8_block_grouped_test")
-    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test")
+    assert hasattr(_C, "fp8_block_grouped_pipelined_out")
     assert K % 128 == 0 and N % 128 == 0 and MAX_M % 64 == 0
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -155,7 +155,7 @@ def main() -> None:
         )
 
     def run_mok_pipelined_out():
-        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+        return _C.fp8_block_grouped_pipelined_out(
             a, b, a_scale, b_scale, masked_m, mok_pipe_output
         )
 

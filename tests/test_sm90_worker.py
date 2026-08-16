@@ -23,6 +23,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test"), (
         "SM90 build did not register sm90_fp8_block_grouped_pipelined_out_test"
     )
+    assert hasattr(_C, "fp8_block_grouped_pipelined_out"), (
+        "SM90 build did not register fp8_block_grouped_pipelined_out"
+    )
 
 
 @pytest.mark.parametrize("is_ab", [True, False], ids=["AB", "ABt"])
@@ -230,7 +233,7 @@ def test_sm90_fp8_block_grouped_numeric(
     "impl_name",
     [
         "sm90_fp8_block_grouped_out_test",
-        "sm90_fp8_block_grouped_pipelined_out_test",
+        "fp8_block_grouped_pipelined_out",
     ],
     ids=["sync", "cpasync-2stage"],
 )
@@ -306,17 +309,17 @@ def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
         )
     output = torch.empty((2, 64, 128), dtype=torch.bfloat16, device=device)
     with pytest.raises(RuntimeError, match="D must have shape"):
-        _C.sm90_fp8_block_grouped_pipelined_out_test(
+        _C.fp8_block_grouped_pipelined_out(
             a, b, a_scale, b_scale, masked_m, output[:, :, :64]
         )
     with pytest.raises(RuntimeError, match="CUDA bfloat16"):
-        _C.sm90_fp8_block_grouped_pipelined_out_test(
+        _C.fp8_block_grouped_pipelined_out(
             a, b, a_scale, b_scale, masked_m, output.float()
         )
     noncontiguous = torch.empty(
         (2, 128, 64), dtype=torch.bfloat16, device=device
     ).transpose(1, 2)
     with pytest.raises(RuntimeError, match="D must be contiguous"):
-        _C.sm90_fp8_block_grouped_pipelined_out_test(
+        _C.fp8_block_grouped_pipelined_out(
             a, b, a_scale, b_scale, masked_m, noncontiguous
         )

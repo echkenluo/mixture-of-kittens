@@ -157,7 +157,7 @@ def main() -> None:
             "FP8_MLP_BINARY_BUILD_COMMIT is required to bind the loaded SO "
             "to its clean build source"
         )
-    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test")
+    assert hasattr(_C, "fp8_block_grouped_pipelined_out")
     assert HIDDEN % 128 == 0
     assert INTERMEDIATE % 128 == 0
     assert (2 * INTERMEDIATE) % 128 == 0
@@ -256,7 +256,7 @@ def main() -> None:
         return output
 
     def run_mok_gateup() -> torch.Tensor:
-        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+        return _C.fp8_block_grouped_pipelined_out(
             hidden,
             w13,
             hidden_scale,
@@ -277,7 +277,7 @@ def main() -> None:
         return dg_gateup
 
     def run_mok_down() -> torch.Tensor:
-        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+        return _C.fp8_block_grouped_pipelined_out(
             mok_activation,
             w2,
             mok_activation_scale,
