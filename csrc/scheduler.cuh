@@ -148,10 +148,13 @@ static __device__ __forceinline__ void schedule_kernel(const globals &G) {
     }
 }
 
-static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> schedule(
+static __host__ void schedule_out(
     const at::Tensor &topk_all,
-    const int num_local_experts,
-    const int schedule_capacity,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+    const at::Tensor &tokens_per_expert_and_peer,
     const int rank,
     const int expert_padding
 ) {
@@ -159,14 +162,66 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
         expert_padding == 64 || expert_padding == 128
             || expert_padding == 256,
         "expert_padding must be one of 64, 128, 256");
+    TORCH_CHECK(
+        topk_all.dim() == 3 && topk_all.is_cuda()
+            && topk_all.scalar_type() == at::kInt
+            && topk_all.is_contiguous(),
+        "topk_all must be contiguous CUDA int32 [ep_size,T,topk]");
     const int world_size = static_cast<int>(topk_all.size(0));
+    const int num_local_tokens = static_cast<int>(topk_all.size(1));
+    const int topk = static_cast<int>(topk_all.size(2));
+    const int num_local_experts = static_cast<int>(tokens_per_expert.numel());
+    const int schedule_capacity = static_cast<int>(schedule_peer_rank.numel());
+    TORCH_CHECK(
+        world_size == 4 || world_size == 8 || world_size == 16
+            || world_size == 32 || world_size == 64,
+        "topk_all ep_size must be one of 4, 8, 16, 32, 64");
+    TORCH_CHECK(num_local_tokens >= 256 && num_local_tokens % 256 == 0,
+                "topk_all T must be at least 256 and divisible by 256");
+    TORCH_CHECK(topk > 0 && topk <= 255, "topk must be in [1,255]");
+    TORCH_CHECK(num_local_experts > 0, "num_local_experts must be positive");
+    TORCH_CHECK(rank >= 0 && rank < world_size, "rank must be in [0,ep_size)");
+    TORCH_CHECK(
+        schedule_capacity > 0 && schedule_capacity % 256 == 0
+            && schedule_capacity >= num_local_tokens * topk,
+        "schedule capacity must be M256 aligned and hold local routes");
+    const at::Tensor outputs[] = {
+        schedule_peer_rank, schedule_peer_token_idx, num_tokens,
+        tokens_per_expert, tokens_per_expert_and_peer,
+    };
+    for (const auto &tensor : outputs) {
+        TORCH_CHECK(
+            tensor.is_cuda() && tensor.device() == topk_all.device()
+                && tensor.scalar_type() == at::kInt
+                && tensor.is_contiguous(),
+            "schedule outputs must be contiguous CUDA int32 tensors on the topk device");
+    }
+    TORCH_CHECK(schedule_peer_rank.dim() == 1,
+                "schedule_peer_rank must be one-dimensional");
+    TORCH_CHECK(
+        schedule_peer_token_idx.dim() == 1
+            && schedule_peer_token_idx.numel() == schedule_capacity,
+        "schedule_peer_token_idx must match schedule capacity");
+    TORCH_CHECK(num_tokens.dim() == 1 && num_tokens.numel() == 1,
+                "num_tokens must have shape [1]");
+    TORCH_CHECK(tokens_per_expert.dim() == 1,
+                "tokens_per_expert must be one-dimensional");
+    TORCH_CHECK(
+        tokens_per_expert_and_peer.dim() == 1
+            && tokens_per_expert_and_peer.numel()
+                == num_local_experts * world_size,
+        "tokens_per_expert_and_peer must have shape [E_local*ep_size]");
 
-    at::Tensor schedule_peer_rank = at::empty({schedule_capacity}, topk_all.options().dtype(at::kInt));
-    at::Tensor schedule_peer_token_idx = at::empty({schedule_capacity}, topk_all.options().dtype(at::kInt));
-    at::Tensor num_tokens = at::zeros({1}, topk_all.options().dtype(at::kInt));
-    at::Tensor tokens_per_expert = at::empty({num_local_experts}, topk_all.options().dtype(at::kInt));
-    at::Tensor tokens_per_expert_and_peer = at::zeros({num_local_experts * world_size}, topk_all.options().dtype(at::kInt));
-    schedule_peer_rank.fill_(-1);
+    c10::cuda::CUDAGuard device_guard(topk_all.device());
+    auto stream = at::cuda::getCurrentCUDAStream(topk_all.get_device());
+    CUDACHECK(cudaMemsetAsync(
+        schedule_peer_rank.data_ptr<int>(), 0xff,
+        schedule_capacity * sizeof(int), stream));
+    CUDACHECK(cudaMemsetAsync(
+        num_tokens.data_ptr<int>(), 0, sizeof(int), stream));
+    CUDACHECK(cudaMemsetAsync(
+        tokens_per_expert_and_peer.data_ptr<int>(), 0,
+        num_local_experts * world_size * sizeof(int), stream));
 
     globals G {
         .topk = kittens::py::tensor_to_gl<globals::topk_gl>(topk_all),
@@ -179,13 +234,35 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
         .expert_padding = expert_padding,
     };
 
-    auto stream = at::cuda::getCurrentCUDAStream();
     kittens::py::global_kernel<config, globals, scheduler::count_kernel>
         <<<(G.topk.numel() + config::NUM_THREADS - 1) / config::NUM_THREADS, config::NUM_THREADS, num_local_experts * world_size * sizeof(int), stream>>>(G);
     kittens::py::global_kernel<config, globals, scheduler::pad_kernel>
         <<<num_local_experts, 1, 0, stream>>>(G);
     kittens::py::global_kernel<config, globals, scheduler::schedule_kernel>
         <<<num_local_experts * world_size, config::NUM_THREADS, world_size * sizeof(int), stream>>>(G);
+    CUDACHECK(cudaGetLastError());
+}
+
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> schedule(
+    const at::Tensor &topk_all,
+    const int num_local_experts,
+    const int schedule_capacity,
+    const int rank,
+    const int expert_padding
+) {
+    at::Tensor schedule_peer_rank = at::empty(
+        {schedule_capacity}, topk_all.options().dtype(at::kInt));
+    at::Tensor schedule_peer_token_idx = at::empty(
+        {schedule_capacity}, topk_all.options().dtype(at::kInt));
+    at::Tensor num_tokens = at::empty({1}, topk_all.options().dtype(at::kInt));
+    at::Tensor tokens_per_expert = at::empty(
+        {num_local_experts}, topk_all.options().dtype(at::kInt));
+    at::Tensor tokens_per_expert_and_peer = at::empty(
+        {num_local_experts * topk_all.size(0)},
+        topk_all.options().dtype(at::kInt));
+    schedule_out(
+        topk_all, schedule_peer_rank, schedule_peer_token_idx, num_tokens,
+        tokens_per_expert, tokens_per_expert_and_peer, rank, expert_padding);
 
     return {schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert};
 }

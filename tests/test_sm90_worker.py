@@ -31,6 +31,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_grouped_contiguous_out"), (
         "SM90 build did not register fp8_block_grouped_contiguous_out"
     )
+    assert hasattr(_C, "fp8_block_build_schedule_out"), (
+        "SM90 build did not register fused FP8 scheduling"
+    )
     assert hasattr(_C, "fp8_block_routed_dispatch_out"), (
         "SM90 build did not register fp8_block_routed_dispatch_out"
     )
@@ -77,6 +80,7 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        num_local_experts=num_local_experts,
     )
     token_indices = torch.arange(num_local_tokens, device=device)
     destination_ranks = token_indices % world_size
@@ -90,6 +94,16 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         top_experts,
         num_local_experts=num_local_experts,
         expert_padding=expert_padding,
+    )
+    assert schedule.peer_rank.data_ptr() == workspace.schedule_peer_rank.data_ptr()
+    assert (
+        schedule.peer_token_idx.data_ptr()
+        == workspace.schedule_peer_token_idx.data_ptr()
+    )
+    assert schedule.num_tokens.data_ptr() == workspace.schedule_num_tokens.data_ptr()
+    assert (
+        schedule.tokens_per_expert.data_ptr()
+        == workspace.schedule_tokens_per_expert.data_ptr()
     )
 
     x = torch.empty(
@@ -279,6 +293,7 @@ def test_sm90_fp8_block_empty_routes(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        num_local_experts=2,
     )
     schedule = functional.build_schedule(
         workspace,

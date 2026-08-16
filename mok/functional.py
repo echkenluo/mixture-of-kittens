@@ -14,6 +14,7 @@ from .ops import (
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
+    fp8_block_build_schedule_out,
     fp8_block_grouped_contiguous_out,
     fp8_block_routed_combine_reduce_out,
     fp8_block_routed_combine_out,
@@ -104,6 +105,7 @@ class MoKFP8RouteWorkspace:
     num_local_tokens: int
     hidden_size: int
     topk: int
+    num_local_experts: int
     schedule_capacity: int
     x_buffer: torch.Tensor
     x_buffer_handle: Any
@@ -118,6 +120,11 @@ class MoKFP8RouteWorkspace:
     routed_x: torch.Tensor
     routed_x_scale: torch.Tensor
     m_indices: torch.Tensor
+    schedule_peer_rank: torch.Tensor
+    schedule_peer_token_idx: torch.Tensor
+    schedule_num_tokens: torch.Tensor
+    schedule_tokens_per_expert: torch.Tensor
+    schedule_tokens_per_expert_and_peer: torch.Tensor
     all_gather_top_experts_buffer: torch.Tensor
     all_gather_top_experts_buffer_handle: Any
     all_gather_top_experts_buffer_multicast_ptr: int
@@ -130,7 +137,7 @@ class MoKFP8RouteWorkspace:
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
 _FP8_ROUTE_WORKSPACE_CACHE: dict[
-    tuple[str, int, int, int, int, int], MoKFP8RouteWorkspace
+    tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
 ] = {}
 
 
@@ -346,6 +353,7 @@ def create_fp8_route_workspace(
     num_local_tokens: int,
     hidden_size: int,
     topk: int,
+    num_local_experts: int,
 ) -> MoKFP8RouteWorkspace:
     """Create SM90 storage for production FP8 dispatch and BF16 combine."""
     validate_workspace_args(
@@ -364,6 +372,8 @@ def create_fp8_route_workspace(
     device = torch.device("cuda", device_index)
     if torch.cuda.get_device_capability(device) != (9, 0):
         raise NotImplementedError("the production FP8 route workspace requires SM90")
+    if type(num_local_experts) is not int or num_local_experts <= 0:
+        raise ValueError("num_local_experts must be a positive integer")
     group_name = group.group_name
     ep_rank = dist.get_rank(group=group)
     ep_size = dist.get_world_size(group=group)
@@ -373,7 +383,9 @@ def create_fp8_route_workspace(
     schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
 
     local_shape = torch.tensor(
-        [num_local_tokens, hidden_size, topk], dtype=torch.int64, device=device
+        [num_local_tokens, hidden_size, topk, num_local_experts],
+        dtype=torch.int64,
+        device=device,
     )
     gathered_shapes = torch.empty(
         ep_size * local_shape.numel(), dtype=torch.int64, device=device
@@ -382,7 +394,8 @@ def create_fp8_route_workspace(
     gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
     if not torch.all(gathered_shapes == local_shape).item():
         raise ValueError(
-            "MoK requires identical token, hidden, and top-k shapes on every EP rank"
+            "MoK requires identical token, hidden, top-k, and local-expert "
+            "shapes on every EP rank"
         )
 
     x_buffer = symm_mem.empty(
@@ -443,6 +456,17 @@ def create_fp8_route_workspace(
     m_indices = torch.empty(
         schedule_capacity, dtype=torch.int32, device=device
     )
+    schedule_peer_rank = torch.empty(
+        schedule_capacity, dtype=torch.int32, device=device
+    )
+    schedule_peer_token_idx = torch.empty_like(schedule_peer_rank)
+    schedule_num_tokens = torch.empty(1, dtype=torch.int32, device=device)
+    schedule_tokens_per_expert = torch.empty(
+        num_local_experts, dtype=torch.int32, device=device
+    )
+    schedule_tokens_per_expert_and_peer = torch.empty(
+        num_local_experts * ep_size, dtype=torch.int32, device=device
+    )
 
     all_gather_top_experts_buffer = symm_mem.empty(
         ep_size,
@@ -480,6 +504,7 @@ def create_fp8_route_workspace(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        num_local_experts=num_local_experts,
         schedule_capacity=schedule_capacity,
         x_buffer=x_buffer,
         x_buffer_handle=x_buffer_handle,
@@ -494,6 +519,13 @@ def create_fp8_route_workspace(
         routed_x=routed_x,
         routed_x_scale=routed_x_scale,
         m_indices=m_indices,
+        schedule_peer_rank=schedule_peer_rank,
+        schedule_peer_token_idx=schedule_peer_token_idx,
+        schedule_num_tokens=schedule_num_tokens,
+        schedule_tokens_per_expert=schedule_tokens_per_expert,
+        schedule_tokens_per_expert_and_peer=(
+            schedule_tokens_per_expert_and_peer
+        ),
         all_gather_top_experts_buffer=all_gather_top_experts_buffer,
         all_gather_top_experts_buffer_handle=all_gather_top_experts_buffer_handle,
         all_gather_top_experts_buffer_multicast_ptr=(
@@ -515,6 +547,7 @@ def get_fp8_route_workspace(
     num_local_tokens: int,
     hidden_size: int,
     topk: int,
+    num_local_experts: int,
 ) -> MoKFP8RouteWorkspace:
     """Return a cached production FP8 route workspace."""
     validate_workspace_args(
@@ -530,6 +563,8 @@ def get_fp8_route_workspace(
         device.index if device.index is not None else torch.cuda.current_device()
     )
     ep_size = dist.get_world_size(group=group)
+    if type(num_local_experts) is not int or num_local_experts <= 0:
+        raise ValueError("num_local_experts must be a positive integer")
     schedule_capacity_factor = max(
         2, math.ceil(ep_size * config.schedule_capacity_multiplier)
     )
@@ -539,6 +574,7 @@ def get_fp8_route_workspace(
         num_local_tokens,
         hidden_size,
         topk,
+        num_local_experts,
         schedule_capacity_factor,
     )
     cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
@@ -552,6 +588,7 @@ def get_fp8_route_workspace(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        num_local_experts=num_local_experts,
     )
     _FP8_ROUTE_WORKSPACE_CACHE[cache_key] = workspace
     return workspace
@@ -644,7 +681,7 @@ def build_schedule(
     Inputs:
         workspace:         MoKWorkspace
         config:            MoKConfig
-        top_experts:       int64 [num_local_tokens, topk]
+        top_experts:       int32 or int64 [num_local_tokens, topk]
         num_local_experts: int
 
     Outputs:
@@ -684,18 +721,55 @@ def build_schedule(
         raise ValueError("all_gather_top_experts_chunk_bytes must divide one rank's route-buffer bytes")
     if not top_experts.is_cuda or top_experts.device != workspace.device:
         raise ValueError("top_experts must be on the workspace CUDA device")
-    if top_experts.dtype != torch.int64:
-        raise TypeError("top_experts must have dtype torch.int64")
+    if top_experts.dtype not in (torch.int32, torch.int64):
+        raise TypeError("top_experts must have dtype torch.int32 or torch.int64")
     if not top_experts.is_contiguous():
         raise ValueError("top_experts must be contiguous")
     if tuple(top_experts.shape) != (workspace.num_local_tokens, workspace.topk):
         raise ValueError("top_experts must have shape (num_local_tokens, topk)")
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
+    if (
+        isinstance(workspace, MoKFP8RouteWorkspace)
+        and num_local_experts != workspace.num_local_experts
+    ):
+        raise ValueError(
+            "num_local_experts must match the FP8 route workspace"
+        )
     if type(expert_padding) is not int or expert_padding not in (64, 128, 256):
         raise ValueError("expert_padding must be one of 64, 128, 256")
 
-    top_experts_int32 = top_experts.to(torch.int32)
+    top_experts_int32 = (
+        top_experts
+        if top_experts.dtype == torch.int32
+        else top_experts.to(torch.int32)
+    )
+    if isinstance(workspace, MoKFP8RouteWorkspace):
+        fp8_block_build_schedule_out(
+            top_experts_int32,
+            workspace.all_gather_top_experts_buffer,
+            workspace.all_gather_top_experts_buffer_multicast_ptr,
+            workspace.ep_rank,
+            config.all_gather_top_experts_chunk_bytes,
+            workspace.barrier_buffer,
+            workspace.barrier_buffer_ptrs,
+            workspace.barrier_buffer_multicast_ptr,
+            workspace.barrier_target,
+            workspace.schedule_peer_rank,
+            workspace.schedule_peer_token_idx,
+            workspace.schedule_num_tokens,
+            workspace.schedule_tokens_per_expert,
+            workspace.schedule_tokens_per_expert_and_peer,
+            expert_padding,
+        )
+        return MoKSchedule(
+            peer_rank=workspace.schedule_peer_rank,
+            peer_token_idx=workspace.schedule_peer_token_idx,
+            num_tokens=workspace.schedule_num_tokens,
+            tokens_per_expert=workspace.schedule_tokens_per_expert,
+            expert_padding=expert_padding,
+        )
+
     all_gather_top_experts(
         top_experts_int32, workspace.all_gather_top_experts_buffer,
         workspace.all_gather_top_experts_buffer_multicast_ptr, workspace.ep_rank,

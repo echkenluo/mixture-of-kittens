@@ -169,6 +169,142 @@ def schedule(
     )
 
 
+@torch.library.custom_op(
+    "mok::fp8_block_build_schedule_out",
+    mutates_args=(
+        "all_gather_buffer",
+        "barrier_buffer",
+        "barrier_target",
+        "schedule_peer_rank",
+        "schedule_peer_token_idx",
+        "num_tokens",
+        "tokens_per_expert",
+        "tokens_per_expert_and_peer",
+    ),
+)
+def fp8_block_build_schedule_out(
+    top_experts: torch.Tensor,
+    all_gather_buffer: torch.Tensor,
+    all_gather_multicast_ptr: int,
+    rank: int,
+    chunk_bytes: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    tokens_per_expert_and_peer: torch.Tensor,
+    expert_padding: int,
+) -> None:
+    """All-gather and build an FP8 route schedule into caller storage."""
+    if (
+        not top_experts.is_cuda
+        or top_experts.dtype != torch.int32
+        or not top_experts.is_contiguous()
+        or top_experts.ndim != 2
+        or any(size <= 0 for size in top_experts.shape)
+    ):
+        raise ValueError("top_experts must be contiguous CUDA int32 [T,topk]")
+    if (
+        not all_gather_buffer.is_cuda
+        or all_gather_buffer.device != top_experts.device
+        or all_gather_buffer.dtype != torch.int32
+        or not all_gather_buffer.is_contiguous()
+        or all_gather_buffer.ndim != 3
+        or tuple(all_gather_buffer.shape[1:]) != tuple(top_experts.shape)
+    ):
+        raise ValueError(
+            "all_gather_buffer must be contiguous CUDA int32 [ep_size,T,topk]"
+        )
+    ep_size = all_gather_buffer.shape[0]
+    if ep_size not in (4, 8, 16, 32, 64):
+        raise ValueError("all_gather_buffer ep_size must be one of 4, 8, 16, 32, 64")
+    if type(all_gather_multicast_ptr) is not int or all_gather_multicast_ptr <= 0:
+        raise TypeError("all_gather_multicast_ptr must be a positive integer")
+    if type(rank) is not int or not 0 <= rank < ep_size:
+        raise ValueError("rank must be an integer in [0,ep_size)")
+    if (
+        type(chunk_bytes) is not int
+        or chunk_bytes <= 0
+        or chunk_bytes % 16 != 0
+        or top_experts.numel() * top_experts.element_size() % chunk_bytes != 0
+    ):
+        raise ValueError("chunk_bytes must be M16 and divide one rank's route bytes")
+    _validate_pointer_list(barrier_buffer_ptrs, "barrier_buffer_ptrs")
+    if len(barrier_buffer_ptrs) != ep_size:
+        raise ValueError("barrier and all-gather EP sizes must match")
+    if (
+        type(barrier_buffer_multicast_ptr) is not int
+        or barrier_buffer_multicast_ptr <= 0
+    ):
+        raise TypeError("barrier_buffer_multicast_ptr must be a positive integer")
+    for name, tensor, shape in (
+        ("barrier_buffer", barrier_buffer, (1,)),
+        ("barrier_target", barrier_target, (1,)),
+        ("num_tokens", num_tokens, (1,)),
+    ):
+        if (
+            not tensor.is_cuda
+            or tensor.device != top_experts.device
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tuple(tensor.shape) != shape
+        ):
+            raise ValueError(
+                f"{name} must be contiguous CUDA int32 with shape {shape}"
+            )
+    schedule_capacity = schedule_peer_rank.numel()
+    if schedule_capacity <= 0 or schedule_capacity % 256 != 0:
+        raise ValueError("schedule capacity must be positive and M256 aligned")
+    num_local_experts = tokens_per_expert.numel()
+    for name, tensor, shape in (
+        ("schedule_peer_rank", schedule_peer_rank, (schedule_capacity,)),
+        ("schedule_peer_token_idx", schedule_peer_token_idx, (schedule_capacity,)),
+        ("tokens_per_expert", tokens_per_expert, (num_local_experts,)),
+        (
+            "tokens_per_expert_and_peer",
+            tokens_per_expert_and_peer,
+            (num_local_experts * ep_size,),
+        ),
+    ):
+        if (
+            not tensor.is_cuda
+            or tensor.device != top_experts.device
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tuple(tensor.shape) != shape
+        ):
+            raise ValueError(
+                f"{name} must be contiguous CUDA int32 with shape {shape}"
+            )
+    if num_local_experts <= 0:
+        raise ValueError("tokens_per_expert must be nonempty")
+    if type(expert_padding) is not int or expert_padding not in (64, 128, 256):
+        raise ValueError("expert_padding must be one of 64, 128, 256")
+    if not hasattr(_C, "fp8_block_build_schedule_out"):
+        raise RuntimeError("the loaded MoK extension lacks fused FP8 scheduling")
+    _C.fp8_block_build_schedule_out(
+        top_experts,
+        all_gather_buffer,
+        all_gather_multicast_ptr,
+        rank,
+        chunk_bytes,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+        tokens_per_expert_and_peer,
+        expert_padding,
+    )
+
+
 def _validate_pointer_list(pointers: list[int], name: str) -> None:
     if not isinstance(pointers, list) or any(
         type(pointer) is not int or pointer <= 0 for pointer in pointers

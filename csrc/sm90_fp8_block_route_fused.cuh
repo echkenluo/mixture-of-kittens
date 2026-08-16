@@ -2,6 +2,7 @@
 
 #if defined(KITTENS_SM90)
 
+#include "scheduler.cuh"
 #include "sm90_fp8_block_routed.cuh"
 #include "utils.cuh"
 
@@ -27,6 +28,67 @@ inline void check_barrier(
         barrier_buffer_ptrs, "barrier_buffer_ptrs");
     TORCH_CHECK(barrier_buffer_multicast_ptr > 0,
                 "barrier multicast pointer must be positive");
+}
+
+inline void build_schedule_out(
+    const at::Tensor &top_experts,
+    const at::Tensor &all_gather_buffer,
+    int64_t all_gather_multicast_ptr, int64_t rank, int64_t chunk_bytes,
+    const at::Tensor &barrier_buffer,
+    const std::vector<int64_t> &barrier_buffer_ptrs,
+    int64_t barrier_buffer_multicast_ptr,
+    const at::Tensor &barrier_target,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+    const at::Tensor &tokens_per_expert_and_peer,
+    int64_t expert_padding) {
+    TORCH_CHECK(
+        top_experts.dim() == 2 && top_experts.is_cuda()
+            && top_experts.scalar_type() == at::kInt
+            && top_experts.is_contiguous()
+            && top_experts.size(0) > 0 && top_experts.size(1) > 0,
+        "top_experts must be contiguous CUDA int32 [T,topk]");
+    TORCH_CHECK(
+        all_gather_buffer.dim() == 3 && all_gather_buffer.is_cuda()
+            && all_gather_buffer.device() == top_experts.device()
+            && all_gather_buffer.scalar_type() == at::kInt
+            && all_gather_buffer.is_contiguous()
+            && all_gather_buffer.size(1) == top_experts.size(0)
+            && all_gather_buffer.size(2) == top_experts.size(1),
+        "all_gather_buffer must be contiguous CUDA int32 [ep_size,T,topk]");
+    const int64_t ep_size = all_gather_buffer.size(0);
+    TORCH_CHECK(
+        ep_size == 4 || ep_size == 8 || ep_size == 16
+            || ep_size == 32 || ep_size == 64,
+        "all_gather_buffer ep_size must be one of 4, 8, 16, 32, 64");
+    TORCH_CHECK(rank >= 0 && rank < ep_size, "rank must be in [0,ep_size)");
+    TORCH_CHECK(all_gather_multicast_ptr > 0,
+                "all-gather multicast pointer must be positive");
+    TORCH_CHECK(
+        chunk_bytes > 0 && chunk_bytes % 16 == 0
+            && top_experts.numel() * top_experts.element_size()
+                % chunk_bytes == 0,
+        "chunk_bytes must be M16 and divide one rank's route bytes");
+    check_barrier(
+        barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, barrier_target,
+        top_experts.device());
+    TORCH_CHECK(static_cast<int64_t>(barrier_buffer_ptrs.size()) == ep_size,
+                "barrier and all-gather EP sizes must match");
+
+    c10::cuda::CUDAGuard device_guard(top_experts.device());
+    utils::all_gather_top_experts::entrypoint(
+        top_experts, all_gather_buffer, all_gather_multicast_ptr,
+        static_cast<int>(rank), static_cast<int>(chunk_bytes));
+    utils::barrier_all::entrypoint(
+        barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, barrier_target);
+    scheduler::schedule_out(
+        all_gather_buffer, schedule_peer_rank, schedule_peer_token_idx,
+        num_tokens, tokens_per_expert, tokens_per_expert_and_peer,
+        static_cast<int>(rank), static_cast<int>(expert_padding));
 }
 
 inline void dispatch_copy_out(
