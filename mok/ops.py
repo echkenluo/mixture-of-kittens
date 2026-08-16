@@ -390,6 +390,149 @@ def fp8_block_routed_combine_out(
 
 
 @torch.library.custom_op(
+    "mok::fp8_block_grouped_contiguous_out",
+    mutates_args=("output",),
+)
+def fp8_block_grouped_contiguous_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run an SM90 FP8/K128 expert-major grouped GEMM into caller storage."""
+    if input.ndim != 2 or not input.is_cuda or not input.is_contiguous():
+        raise ValueError("input must be contiguous CUDA [M,K]")
+    if input.dtype != torch.float8_e4m3fn:
+        raise TypeError("input must use torch.float8_e4m3fn")
+    total_m, reduction = input.shape
+    if total_m < 64 or total_m % 64 != 0:
+        raise ValueError("input M must be at least 64 and divisible by 64")
+    if reduction < 128 or reduction % 128 != 0:
+        raise ValueError("input K must be at least 128 and divisible by 128")
+    if (
+        weight.ndim != 3
+        or not weight.is_cuda
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("weight must be contiguous CUDA float8_e4m3fn [E,N,K]")
+    experts, output_size, weight_reduction = weight.shape
+    if experts <= 0 or output_size < 128 or output_size % 128 != 0:
+        raise ValueError("weight E must be positive and N must be N128 aligned")
+    if weight_reduction != reduction:
+        raise ValueError("input and weight reduction dimensions must match")
+    expected_input_scale_shape = (total_m, reduction // 128)
+    expected_weight_scale_shape = (
+        experts,
+        output_size // 128,
+        reduction // 128,
+    )
+    if (
+        not input_scale.is_cuda
+        or input_scale.dtype != torch.float32
+        or not input_scale.is_contiguous()
+        or tuple(input_scale.shape) != expected_input_scale_shape
+    ):
+        raise ValueError(
+            "input_scale must be contiguous CUDA float32 "
+            f"{expected_input_scale_shape}"
+        )
+    if (
+        not weight_scale.is_cuda
+        or weight_scale.dtype != torch.float32
+        or not weight_scale.is_contiguous()
+        or tuple(weight_scale.shape) != expected_weight_scale_shape
+    ):
+        raise ValueError(
+            "weight_scale must be contiguous CUDA float32 "
+            f"{expected_weight_scale_shape}"
+        )
+    if (
+        not m_indices.is_cuda
+        or m_indices.dtype != torch.int32
+        or not m_indices.is_contiguous()
+        or tuple(m_indices.shape) != (total_m,)
+    ):
+        raise ValueError("m_indices must be contiguous CUDA int32 [M]")
+    if (
+        output.ndim != 2
+        or not output.is_cuda
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+        or tuple(output.shape) != (total_m, output_size)
+    ):
+        raise ValueError("output must be contiguous CUDA bfloat16 [M,N]")
+    tensors = (weight, input_scale, weight_scale, m_indices, output)
+    if any(tensor.device != input.device for tensor in tensors):
+        raise ValueError("all grouped GEMM tensors must share one device")
+    if torch.cuda.get_device_capability(input.device) != (9, 0):
+        raise NotImplementedError("FP8 grouped contiguous GEMM currently requires SM90")
+    if not hasattr(_C, "fp8_block_grouped_contiguous_out"):
+        raise RuntimeError("the loaded MoK extension lacks FP8 grouped GEMM")
+
+    _C.fp8_block_grouped_contiguous_out(
+        input, weight, input_scale, weight_scale, m_indices, output
+    )
+
+
+@torch.library.custom_op(
+    "mok::routed_epilogue_out",
+    mutates_args=("output",),
+)
+def routed_epilogue_out(
+    combine_buffer: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Reduce route slots with router weights into caller-owned BF16 output."""
+    if (
+        output.ndim != 2
+        or not output.is_cuda
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+    ):
+        raise ValueError("output must be contiguous CUDA bfloat16 [T,H]")
+    num_tokens, hidden_size = output.shape
+    if num_tokens < 512 or num_tokens % 256 != 0:
+        raise ValueError("output T must be at least 512 and divisible by 256")
+    if hidden_size <= 0 or hidden_size % 256 != 0:
+        raise ValueError("output H must be positive and divisible by 256")
+    if (
+        topk_weights.ndim != 2
+        or not topk_weights.is_cuda
+        or topk_weights.dtype != torch.float32
+        or not topk_weights.is_contiguous()
+        or topk_weights.shape[0] != num_tokens
+    ):
+        raise ValueError("topk_weights must be contiguous CUDA float32 [T,topk]")
+    topk = topk_weights.shape[1]
+    if not 0 < topk <= 255:
+        raise ValueError("topk must be in [1,255]")
+    device_properties = torch.cuda.get_device_properties(output.device)
+    dynamic_smem_bytes = 2 * (topk * 2048 + topk * 4) + 1024
+    if dynamic_smem_bytes > device_properties.shared_memory_per_block_optin:
+        raise ValueError("topk requires more dynamic shared memory than the device supports")
+    if (
+        combine_buffer.ndim != 2
+        or not combine_buffer.is_cuda
+        or combine_buffer.dtype != torch.bfloat16
+        or not combine_buffer.is_contiguous()
+        or tuple(combine_buffer.shape) != (num_tokens * topk, hidden_size)
+    ):
+        raise ValueError("combine_buffer must be contiguous CUDA bfloat16 [T*topk,H]")
+    if combine_buffer.device != output.device or topk_weights.device != output.device:
+        raise ValueError("all routed epilogue tensors must share one device")
+    if torch.cuda.get_device_capability(output.device) != (9, 0):
+        raise NotImplementedError("routed epilogue currently requires SM90")
+    if not hasattr(_C, "routed_epilogue_out"):
+        raise RuntimeError("the loaded MoK extension lacks routed epilogue")
+
+    _C.routed_epilogue_out(combine_buffer, topk_weights, output)
+
+
+@torch.library.custom_op(
     "mok::mxfp8_quantize", mutates_args=(),
     schema="(Tensor x_bf16, bool return_normal, bool return_transposed) -> (Tensor?, Tensor?, Tensor?, Tensor?)",
 )

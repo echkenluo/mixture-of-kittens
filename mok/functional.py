@@ -14,9 +14,11 @@ from .ops import (
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
+    fp8_block_grouped_contiguous_out,
     fp8_block_routed_combine_out,
     fp8_block_routed_dispatch_out,
     fwd_epilogue,
+    routed_epilogue_out,
     schedule,
 )
 
@@ -109,6 +111,7 @@ class MoKFP8RouteWorkspace:
     combine_buffer: torch.Tensor
     combine_buffer_handle: Any
     combine_buffer_ptrs: list[int]
+    output: torch.Tensor
     routed_x: torch.Tensor
     routed_x_scale: torch.Tensor
     m_indices: torch.Tensor
@@ -410,6 +413,13 @@ def create_fp8_route_workspace(
         for peer_rank in range(ep_size)
     ]
 
+    output = torch.empty(
+        num_local_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
     routed_x = torch.empty(
         schedule_capacity,
         hidden_size,
@@ -472,6 +482,7 @@ def create_fp8_route_workspace(
         combine_buffer=combine_buffer,
         combine_buffer_handle=combine_buffer_handle,
         combine_buffer_ptrs=combine_buffer_ptrs,
+        output=output,
         routed_x=routed_x,
         routed_x_scale=routed_x_scale,
         m_indices=m_indices,
@@ -695,8 +706,15 @@ def dispatch_fp8_block(
     schedule: MoKSchedule,
     x: torch.Tensor,
     x_scale: torch.Tensor,
+    *,
+    trim_to_active_rows: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Copy and dispatch production FP8/K128 activations on the current stream."""
+    """Copy and dispatch production FP8/K128 activations on the current stream.
+
+    ``trim_to_active_rows`` pays one device-to-host synchronization to read
+    ``schedule.num_tokens``. Storage remains capacity-sized, while downstream
+    compute receives views containing only the padded rows with real routes.
+    """
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
     if not isinstance(schedule, MoKSchedule):
@@ -728,6 +746,21 @@ def dispatch_fp8_block(
             "x_scale must be contiguous CUDA float32 with shape "
             f"{expected_scale_shape}"
         )
+    if type(trim_to_active_rows) is not bool:
+        raise TypeError("trim_to_active_rows must be a bool")
+    active_rows = (
+        int(schedule.num_tokens.item())
+        if trim_to_active_rows
+        else workspace.schedule_capacity
+    )
+    if (
+        active_rows < 0
+        or active_rows > workspace.schedule_capacity
+        or (active_rows != 0 and active_rows % 256 != 0)
+    ):
+        raise RuntimeError(
+            "schedule num_tokens must be zero or an M256 value within capacity"
+        )
 
     workspace.x_buffer.copy_(x)
     workspace.x_scale_buffer.copy_(x_scale)
@@ -737,21 +770,25 @@ def dispatch_fp8_block(
         workspace.barrier_buffer_multicast_ptr,
         workspace.barrier_target,
     )
-    fp8_block_routed_dispatch_out(
-        workspace.x_buffer,
-        workspace.x_buffer_ptrs,
-        workspace.x_scale_buffer,
-        workspace.x_scale_buffer_ptrs,
-        workspace.routed_x,
-        workspace.routed_x_scale,
-        workspace.m_indices,
-        schedule.peer_rank,
-        schedule.peer_token_idx,
-        schedule.num_tokens,
-        schedule.tokens_per_expert,
-        workspace.topk,
-    )
-    return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
+    routed_x = workspace.routed_x[:active_rows]
+    routed_x_scale = workspace.routed_x_scale[:active_rows]
+    m_indices = workspace.m_indices[:active_rows]
+    if active_rows:
+        fp8_block_routed_dispatch_out(
+            workspace.x_buffer,
+            workspace.x_buffer_ptrs,
+            workspace.x_scale_buffer,
+            workspace.x_scale_buffer_ptrs,
+            routed_x,
+            routed_x_scale,
+            m_indices,
+            schedule.peer_rank[:active_rows],
+            schedule.peer_token_idx[:active_rows],
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            workspace.topk,
+        )
+    return routed_x, routed_x_scale, m_indices
 
 
 def combine_fp8_block(
@@ -764,28 +801,42 @@ def combine_fp8_block(
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
-    expected_shape = (workspace.schedule_capacity, workspace.hidden_size)
     if (
         not routed_y.is_cuda
         or routed_y.device != workspace.device
         or routed_y.dtype != torch.bfloat16
         or not routed_y.is_contiguous()
-        or tuple(routed_y.shape) != expected_shape
+        or routed_y.ndim != 2
+        or routed_y.shape[1] != workspace.hidden_size
+        or routed_y.shape[0] > workspace.schedule_capacity
+        or (routed_y.shape[0] != 0 and routed_y.shape[0] % 256 != 0)
     ):
         raise ValueError(
-            "routed_y must be contiguous CUDA bfloat16 with shape "
-            f"{expected_shape}"
+            "routed_y must be contiguous CUDA bfloat16 [M,H] with M zero or "
+            "M256 and no larger than schedule capacity"
         )
 
-    fp8_block_routed_combine_out(
-        routed_y,
-        workspace.combine_buffer,
-        workspace.combine_buffer_ptrs,
-        schedule.peer_rank,
-        schedule.peer_token_idx,
-        schedule.num_tokens,
-        workspace.topk,
+    # Every rank must finish clearing its local target before any peer starts
+    # remote stores.  This makes invalid/padded route slots deterministic and
+    # prevents a late clear on one rank from erasing an early peer write.
+    workspace.combine_buffer.zero_()
+    barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
     )
+    active_rows = routed_y.shape[0]
+    if active_rows:
+        fp8_block_routed_combine_out(
+            routed_y,
+            workspace.combine_buffer,
+            workspace.combine_buffer_ptrs,
+            schedule.peer_rank[:active_rows],
+            schedule.peer_token_idx[:active_rows],
+            schedule.num_tokens,
+            workspace.topk,
+        )
     barrier_all(
         workspace.barrier_buffer,
         workspace.barrier_buffer_ptrs,
@@ -793,6 +844,53 @@ def combine_fp8_block(
         workspace.barrier_target,
     )
     return workspace.combine_buffer
+
+
+def grouped_gemm_fp8_block_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run the public caller-owned SM90 contiguous expert GEMM."""
+    fp8_block_grouped_contiguous_out(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        m_indices,
+        output,
+    )
+    return output
+
+
+def reduce_fp8_block_routes(
+    workspace: MoKFP8RouteWorkspace,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Apply router weights to returned route slots without a shared addend."""
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    expected_shape = (workspace.num_local_tokens, workspace.topk)
+    if (
+        not topk_weights.is_cuda
+        or topk_weights.device != workspace.device
+        or topk_weights.dtype != torch.float32
+        or not topk_weights.is_contiguous()
+        or tuple(topk_weights.shape) != expected_shape
+    ):
+        raise ValueError(
+            "topk_weights must be contiguous CUDA float32 with shape "
+            f"{expected_shape}"
+        )
+    routed_epilogue_out(
+        workspace.combine_buffer,
+        topk_weights,
+        workspace.output,
+    )
+    return workspace.output
 
 
 def validate_inputs(

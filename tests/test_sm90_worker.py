@@ -37,9 +37,14 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_routed_combine_out"), (
         "SM90 build did not register fp8_block_routed_combine_out"
     )
+    assert hasattr(_C, "routed_epilogue_out"), (
+        "SM90 build did not register routed_epilogue_out"
+    )
 
 
+@pytest.mark.parametrize("active_only", [False, True], ids=["capacity", "active"])
 def test_sm90_fp8_block_routed_dispatch_combine(
+    active_only: bool,
     context: tuple[int, int, torch.device]
 ) -> None:
     rank, world_size, device = context
@@ -102,17 +107,24 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         + token_indices[:, None] * 100
         + scale_columns[None, :]
     )
-    workspace.combine_buffer.fill_(float("nan"))
-
     capacity = workspace.schedule_capacity
+    valid_rows = int(schedule.num_tokens.item())
+    workspace.routed_x.fill_(7)
+    workspace.routed_x_scale.fill_(-999)
+    workspace.m_indices.fill_(-777)
+    workspace.combine_buffer.fill_(float("nan"))
     routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
         workspace,
         schedule,
         x,
         x_scale,
+        trim_to_active_rows=active_only,
     )
 
-    valid_rows = int(schedule.num_tokens.item())
+    returned_rows = valid_rows if active_only else capacity
+    assert routed_x.shape[0] == returned_rows
+    assert routed_x_scale.shape[0] == returned_rows
+    assert m_indices.shape[0] == returned_rows
     peer_ranks = schedule.peer_rank[:valid_rows].to(torch.int64)
     peer_tokens = schedule.peer_token_idx[:valid_rows].to(torch.int64)
     valid = peer_ranks >= 0
@@ -148,16 +160,11 @@ def test_sm90_fp8_block_routed_dispatch_combine(
                 ).sum()
             ),
             int((routed_x_scale[:valid_rows] != expected_scale).sum()),
+            int((workspace.routed_x[valid_rows:] != (7 if active_only else 0)).sum()),
             int(
                 (
-                    routed_x[valid_rows:].view(torch.uint8)
-                    != torch.zeros_like(routed_x[valid_rows:]).view(torch.uint8)
-                ).sum()
-            ),
-            int(
-                (
-                    routed_x_scale[valid_rows:]
-                    != torch.zeros_like(routed_x_scale[valid_rows:])
+                    workspace.routed_x_scale[valid_rows:]
+                    != (-999 if active_only else 0)
                 ).sum()
             ),
             int((m_indices != expected_m_indices).sum()),
@@ -181,7 +188,7 @@ def test_sm90_fp8_block_routed_dispatch_combine(
     assert not dispatch_mismatches.any().item()
 
     routed_y = torch.zeros(
-        capacity, hidden_size, dtype=torch.bfloat16, device=device
+        returned_rows, hidden_size, dtype=torch.bfloat16, device=device
     )
     routed_y[:valid_rows] = (
         rank * 32
@@ -210,6 +217,75 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         flush=True,
     )
     assert not combine_mismatches.any().item()
+
+
+def test_sm90_fp8_block_empty_routes(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, world_size, device = context
+    require_sm90(device)
+    assert world_size in (4, 8, 16, 32, 64)
+
+    num_local_tokens, hidden_size, topk = 512, 256, 1
+    config = functional.MoKConfig(schedule_capacity_multiplier=1.0)
+    workspace = functional.get_fp8_route_workspace(
+        config,
+        dist.group.WORLD,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    schedule = functional.build_schedule(
+        workspace,
+        config,
+        torch.full(
+            (num_local_tokens, topk),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        ),
+        num_local_experts=2,
+    )
+    active_rows = int(schedule.num_tokens.item())
+    assert active_rows == 0
+
+    x = torch.zeros(
+        (num_local_tokens, hidden_size),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_scale = torch.ones(
+        (num_local_tokens, hidden_size // 128),
+        dtype=torch.float32,
+        device=device,
+    )
+    routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=True,
+    )
+    assert routed_x.shape == (0, hidden_size)
+    assert routed_x_scale.shape == (0, hidden_size // 128)
+    assert m_indices.shape == (0,)
+
+    workspace.combine_buffer.fill_(float("nan"))
+    combine_buffer = functional.combine_fp8_block(
+        workspace,
+        schedule,
+        torch.empty((0, hidden_size), dtype=torch.bfloat16, device=device),
+    )
+    output = functional.reduce_fp8_block_routes(
+        workspace,
+        torch.zeros(
+            (num_local_tokens, topk), dtype=torch.float32, device=device
+        ),
+    )
+    torch.cuda.synchronize(device)
+    assert not combine_buffer.any().item()
+    assert not output.any().item()
 
 
 def test_sm90_fp8_block_routed_rejects_invalid_inputs(
@@ -286,6 +362,65 @@ def test_sm90_fp8_block_routed_rejects_invalid_inputs(
         ops.fp8_block_routed_combine_out(
             routed_y, combine_buffer, [1],
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, 1,
+        )
+
+
+def test_sm90_routed_epilogue_numeric(
+    context: tuple[int, int, torch.device]
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+    num_tokens, hidden_size, topk = 512, 256, 3
+    token = torch.arange(num_tokens, device=device, dtype=torch.float32)
+    column = torch.arange(hidden_size, device=device, dtype=torch.float32)
+    route = torch.arange(topk, device=device, dtype=torch.float32)
+    combine_buffer = (
+        token[:, None, None] * 0.03125
+        + route[None, :, None] * 0.5
+        + (column[None, None, :] % 17) * 0.015625
+        + rank * 0.25
+    ).to(torch.bfloat16).reshape(num_tokens * topk, hidden_size)
+    topk_weights = torch.tensor(
+        [0.25, 0.5, 0.125], dtype=torch.float32, device=device
+    ).expand(num_tokens, -1).contiguous()
+    output = torch.full(
+        (num_tokens, hidden_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    ops.routed_epilogue_out(combine_buffer, topk_weights, output)
+    reference = (
+        combine_buffer.view(num_tokens, topk, hidden_size).float()
+        * topk_weights[:, :, None]
+    ).sum(dim=1).to(torch.bfloat16)
+    torch.testing.assert_close(output, reference, rtol=0, atol=0.03125)
+
+
+def test_sm90_routed_epilogue_rejects_invalid_inputs(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, _, device = context
+    require_sm90(device)
+    combine_buffer = torch.empty(
+        (1024, 256), dtype=torch.bfloat16, device=device
+    )
+    topk_weights = torch.ones((512, 2), dtype=torch.float32, device=device)
+    output = torch.empty((512, 256), dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(ValueError, match="float32"):
+        ops.routed_epilogue_out(
+            combine_buffer, topk_weights.to(torch.bfloat16), output
+        )
+    with pytest.raises(ValueError, match=r"\[T\*topk,H\]"):
+        ops.routed_epilogue_out(
+            combine_buffer[:512].contiguous(), topk_weights, output
+        )
+    with pytest.raises(ValueError, match="at least 512"):
+        ops.routed_epilogue_out(
+            combine_buffer[:512].contiguous(),
+            topk_weights[:256].contiguous(),
+            output[:256].contiguous(),
         )
 
 
@@ -636,7 +771,7 @@ def test_sm90_fp8_block_grouped_contiguous_output(
         output = torch.empty(
             (sum(rows), n), dtype=torch.bfloat16, device=device
         )
-        actual = _C.fp8_block_grouped_contiguous_out(
+        actual = functional.grouped_gemm_fp8_block_out(
             a, b, a_scale, b_scale, m_indices, output
         )
     stream.synchronize()
@@ -663,8 +798,8 @@ def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
     m_indices = torch.zeros((128,), dtype=torch.int32, device=device)
     output = torch.empty((128, 128), dtype=torch.bfloat16, device=device)
 
-    with pytest.raises(RuntimeError, match="M must"):
-        _C.fp8_block_grouped_contiguous_out(
+    with pytest.raises(ValueError, match="M must"):
+        ops.fp8_block_grouped_contiguous_out(
             a[:32].contiguous(),
             b,
             a_scale[:32].contiguous(),
@@ -672,11 +807,11 @@ def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
             m_indices[:32].contiguous(),
             output[:32].contiguous(),
         )
-    with pytest.raises(RuntimeError, match="m_indices must be int32"):
-        _C.fp8_block_grouped_contiguous_out(
+    with pytest.raises(ValueError, match="m_indices must be.*int32"):
+        ops.fp8_block_grouped_contiguous_out(
             a, b, a_scale, b_scale, m_indices.to(torch.int64), output
         )
-    with pytest.raises(RuntimeError, match="D must have shape"):
-        _C.fp8_block_grouped_contiguous_out(
+    with pytest.raises(ValueError, match=r"output must be.*\[M,N\]"):
+        ops.fp8_block_grouped_contiguous_out(
             a, b, a_scale, b_scale, m_indices, output[:, :64]
         )

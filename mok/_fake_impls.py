@@ -73,6 +73,27 @@ def _fp8_block_routed_combine_out_fake(
     return None
 
 
+@torch.library.register_fake("mok::fp8_block_grouped_contiguous_out")
+def _fp8_block_grouped_contiguous_out_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+@torch.library.register_fake("mok::routed_epilogue_out")
+def _routed_epilogue_out_fake(
+    combine_buffer: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
 @torch.library.register_fake("mok::mxfp8_quantize")
 def _mxfp8_quantize_fake(
     x_bf16: torch.Tensor,

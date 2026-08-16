@@ -114,6 +114,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+    m.def("routed_epilogue_out", &utils::routed_epilogue_out, "",
+          pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
+          pybind11::arg("output"));
     m.def("bwd_epilogue", &utils::bwd_epilogue, "",
           pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
 }

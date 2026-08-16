@@ -19,6 +19,12 @@ assert hasattr(torch.ops.mok, "fp8_block_routed_dispatch_out"), (
 assert hasattr(torch.ops.mok, "fp8_block_routed_combine_out"), (
     "FP8 routed combine registration missing"
 )
+assert hasattr(torch.ops.mok, "fp8_block_grouped_contiguous_out"), (
+    "FP8 grouped contiguous registration missing"
+)
+assert hasattr(torch.ops.mok, "routed_epilogue_out"), (
+    "routed epilogue registration missing"
+)
 print("GATE|import_and_registration|OK")
 # 2) fake implementations used by graph capture/compilation
 with FakeTensorMode():
@@ -33,6 +39,16 @@ with FakeTensorMode():
     tokens_per_expert = torch.empty((2,), device="cuda", dtype=torch.int32)
     routed_y = torch.empty((512, 256), device="cuda", dtype=torch.bfloat16)
     combine_buffer = torch.empty((512, 256), device="cuda", dtype=torch.bfloat16)
+    grouped_weight = torch.empty(
+        (2, 256, 256), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    grouped_weight_scale = torch.empty(
+        (2, 2, 2), device="cuda", dtype=torch.float32
+    )
+    grouped_output = torch.empty(
+        (512, 256), device="cuda", dtype=torch.bfloat16
+    )
+    topk_weights = torch.empty((512, 1), device="cuda", dtype=torch.float32)
     pointers = [1, 1, 1, 1]
     torch.ops.mok.fp8_block_routed_dispatch_out(
         x_fp8, pointers, x_scale, pointers, routed_x, routed_x_scale,
@@ -42,6 +58,13 @@ with FakeTensorMode():
     torch.ops.mok.fp8_block_routed_combine_out(
         routed_y, combine_buffer, pointers, schedule_rank, schedule_token,
         num_tokens, 1,
+    )
+    torch.ops.mok.fp8_block_grouped_contiguous_out(
+        routed_x, grouped_weight, routed_x_scale, grouped_weight_scale,
+        m_indices, grouped_output,
+    )
+    torch.ops.mok.routed_epilogue_out(
+        combine_buffer, topk_weights, grouped_output,
     )
 print("GATE|fp8_route_fake|OK")
 # 3) direct device check
