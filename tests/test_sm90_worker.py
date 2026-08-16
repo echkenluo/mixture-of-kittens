@@ -1,7 +1,10 @@
 import pytest
 import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 from mok import _C
+from mok import functional, ops
 
 
 def require_sm90(device: torch.device) -> None:
@@ -29,6 +32,311 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_grouped_contiguous_out"), (
         "SM90 build did not register fp8_block_grouped_contiguous_out"
     )
+    assert hasattr(_C, "fp8_block_routed_dispatch_out"), (
+        "SM90 build did not register fp8_block_routed_dispatch_out"
+    )
+    assert hasattr(_C, "fp8_block_routed_combine_out"), (
+        "SM90 build did not register fp8_block_routed_combine_out"
+    )
+
+
+def test_sm90_fp8_block_routed_dispatch_combine(
+    context: tuple[int, int, torch.device]
+) -> None:
+    rank, world_size, device = context
+    require_sm90(device)
+    assert world_size in (4, 8, 16, 32, 64)
+
+    num_local_tokens = 512
+    hidden_size = 256
+    topk = 1
+    num_local_experts = 2
+    config = functional.MoKConfig(
+        fwd_num_comm_sms=2,
+        bwd_num_comm_sms=2,
+        minibatch_size=256,
+        macrobatch_size=4096,
+        schedule_capacity_multiplier=1.0,
+    )
+    workspace = functional.create_workspace(
+        config,
+        dist.group.WORLD,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    token_indices = torch.arange(num_local_tokens, device=device)
+    destination_ranks = token_indices % world_size
+    local_experts = ((token_indices // world_size) % 4 == 0).to(torch.int64)
+    top_experts = (
+        destination_ranks * num_local_experts + local_experts
+    ).view(-1, 1)
+    schedule = functional.build_schedule(
+        workspace,
+        config,
+        top_experts,
+        num_local_experts=num_local_experts,
+    )
+
+    group_name = dist.group.WORLD.group_name
+    x = symm_mem.empty(
+        num_local_tokens,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_scale = symm_mem.empty(
+        num_local_tokens,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    combine_buffer = symm_mem.empty(
+        num_local_tokens * topk,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    x_handle = symm_mem.rendezvous(x, group_name)
+    x_scale_handle = symm_mem.rendezvous(x_scale, group_name)
+    combine_handle = symm_mem.rendezvous(combine_buffer, group_name)
+    x_ptrs = [int(x_handle.buffer_ptrs[peer]) for peer in range(world_size)]
+    x_scale_ptrs = [
+        int(x_scale_handle.buffer_ptrs[peer]) for peer in range(world_size)
+    ]
+    combine_ptrs = [
+        int(combine_handle.buffer_ptrs[peer]) for peer in range(world_size)
+    ]
+
+    columns = torch.arange(hidden_size, device=device)
+    x.copy_(
+        ((token_indices[:, None] * hidden_size + columns[None, :]) % 31 - 15)
+        .add(rank * 0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    scale_columns = torch.arange(hidden_size // 128, device=device)
+    x_scale.copy_(
+        rank * 10000
+        + token_indices[:, None] * 100
+        + scale_columns[None, :]
+    )
+    combine_buffer.fill_(float("nan"))
+    ops.barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+    )
+
+    capacity = workspace.schedule_capacity
+    routed_x = torch.empty(
+        capacity, hidden_size, dtype=torch.float8_e4m3fn, device=device
+    )
+    routed_x_scale = torch.empty(
+        capacity, hidden_size // 128, dtype=torch.float32, device=device
+    )
+    m_indices = torch.empty(capacity, dtype=torch.int32, device=device)
+    _C.fp8_block_routed_dispatch_out(
+        x,
+        x_ptrs,
+        x_scale,
+        x_scale_ptrs,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        topk,
+    )
+
+    valid_rows = int(schedule.num_tokens.item())
+    peer_ranks = schedule.peer_rank[:valid_rows].to(torch.int64)
+    peer_tokens = schedule.peer_token_idx[:valid_rows].to(torch.int64)
+    valid = peer_ranks >= 0
+    expected_x = torch.zeros_like(routed_x[:valid_rows])
+    expected_scale = torch.zeros_like(routed_x_scale[:valid_rows])
+    expected_x[valid] = (
+        (
+            peer_tokens[valid, None] * hidden_size + columns[None, :]
+        )
+        % 31
+        - 15
+    ).add(peer_ranks[valid, None] * 0.25).to(torch.float8_e4m3fn)
+    expected_scale[valid] = (
+        peer_ranks[valid, None] * 10000
+        + peer_tokens[valid, None] * 100
+        + scale_columns[None, :]
+    ).to(torch.float32)
+    expected_tokens_per_expert = torch.tensor(
+        [512, 256], dtype=torch.int32, device=device
+    )
+    expected_m_indices = torch.zeros_like(m_indices)
+    expected_m_indices[:valid_rows] = torch.repeat_interleave(
+        torch.arange(num_local_experts, dtype=torch.int32, device=device),
+        schedule.tokens_per_expert,
+        output_size=valid_rows,
+    )
+    dispatch_mismatches = torch.tensor(
+        [
+            int(
+                (
+                    routed_x[:valid_rows].view(torch.uint8)
+                    != expected_x.view(torch.uint8)
+                ).sum()
+            ),
+            int((routed_x_scale[:valid_rows] != expected_scale).sum()),
+            int(
+                (
+                    routed_x[valid_rows:].view(torch.uint8)
+                    != torch.zeros_like(routed_x[valid_rows:]).view(torch.uint8)
+                ).sum()
+            ),
+            int(
+                (
+                    routed_x_scale[valid_rows:]
+                    != torch.zeros_like(routed_x_scale[valid_rows:])
+                ).sum()
+            ),
+            int((m_indices != expected_m_indices).sum()),
+            int(
+                (
+                    schedule.tokens_per_expert
+                    != expected_tokens_per_expert
+                ).sum()
+            ),
+            int(valid.sum() != num_local_tokens),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(dispatch_mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"ROUTED_DISPATCH_MISMATCH|rank={rank}|values="
+        f"{dispatch_mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not dispatch_mismatches.any().item()
+
+    routed_y = torch.zeros(
+        capacity, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    routed_y[:valid_rows] = (
+        rank * 32
+        + expected_m_indices[:valid_rows].to(torch.int64) * 16
+        + (peer_tokens % 16)
+    ).to(torch.bfloat16)[:, None]
+    _C.fp8_block_routed_combine_out(
+        routed_y,
+        combine_buffer,
+        combine_ptrs,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        topk,
+    )
+    ops.barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+    )
+    expected_combine = (
+        destination_ranks.to(torch.bfloat16) * 32
+        + local_experts.to(torch.bfloat16) * 16
+        + (token_indices % 16).to(torch.bfloat16)
+    )[:, None].expand(-1, hidden_size)
+    combine_mismatches = torch.tensor(
+        [int((combine_buffer != expected_combine).sum())],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(combine_mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"ROUTED_COMBINE_MISMATCH|rank={rank}|values="
+        f"{combine_mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not combine_mismatches.any().item()
+
+
+def test_sm90_fp8_block_routed_rejects_invalid_inputs(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, _, device = context
+    require_sm90(device)
+
+    num_local_tokens = 512
+    hidden_size = 256
+    capacity = 512
+    x = torch.ones(
+        (num_local_tokens, hidden_size), device=device
+    ).to(torch.float8_e4m3fn)
+    x_scale = torch.ones(
+        (num_local_tokens, hidden_size // 128), device=device
+    )
+    routed_x = torch.empty(
+        (capacity, hidden_size), dtype=torch.float8_e4m3fn, device=device
+    )
+    routed_x_scale = torch.empty(
+        (capacity, hidden_size // 128), device=device
+    )
+    m_indices = torch.empty(capacity, dtype=torch.int32, device=device)
+    schedule_peer_rank = torch.full(
+        (capacity,), -1, dtype=torch.int32, device=device
+    )
+    schedule_peer_token_idx = torch.full_like(schedule_peer_rank, -1)
+    num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+    tokens_per_expert = torch.zeros(2, dtype=torch.int32, device=device)
+    pointer_list = [1, 1, 1, 1]
+
+    with pytest.raises(RuntimeError, match="float8_e4m3fn"):
+        _C.fp8_block_routed_dispatch_out(
+            x.float(), pointer_list, x_scale, pointer_list,
+            routed_x, routed_x_scale, m_indices,
+            schedule_peer_rank, schedule_peer_token_idx,
+            num_tokens, tokens_per_expert, 1,
+        )
+    with pytest.raises(RuntimeError, match="x_scale must"):
+        _C.fp8_block_routed_dispatch_out(
+            x, pointer_list, x_scale.bfloat16(), pointer_list,
+            routed_x, routed_x_scale, m_indices,
+            schedule_peer_rank, schedule_peer_token_idx,
+            num_tokens, tokens_per_expert, 1,
+        )
+    with pytest.raises(RuntimeError, match="x_ptrs length"):
+        _C.fp8_block_routed_dispatch_out(
+            x, [1], x_scale, pointer_list,
+            routed_x, routed_x_scale, m_indices,
+            schedule_peer_rank, schedule_peer_token_idx,
+            num_tokens, tokens_per_expert, 1,
+        )
+    with pytest.raises(RuntimeError, match="nonempty vector"):
+        _C.fp8_block_routed_dispatch_out(
+            x, pointer_list, x_scale, pointer_list,
+            routed_x, routed_x_scale, m_indices,
+            schedule_peer_rank, schedule_peer_token_idx,
+            num_tokens, tokens_per_expert[:0], 1,
+        )
+
+    routed_y = torch.empty(
+        (capacity, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    combine_buffer = torch.empty(
+        (num_local_tokens, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(RuntimeError, match="bfloat16"):
+        _C.fp8_block_routed_combine_out(
+            routed_y.float(), combine_buffer, pointer_list,
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, 1,
+        )
+    with pytest.raises(RuntimeError, match="combine_buffer_ptrs length"):
+        _C.fp8_block_routed_combine_out(
+            routed_y, combine_buffer, [1],
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, 1,
+        )
 
 
 @pytest.mark.parametrize("is_ab", [True, False], ids=["AB", "ABt"])

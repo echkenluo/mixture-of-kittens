@@ -1,6 +1,7 @@
 #include "mok_megakernel.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
+#include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 #include "utils.cuh"
 
@@ -93,6 +94,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input"), pybind11::arg("weight"),
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("m_indices"), pybind11::arg("output"));
+    m.def("fp8_block_routed_dispatch_out",
+          &mok_sm90::fp8_block_routed::dispatch_out, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("x_scale"), pybind11::arg("x_scale_ptrs"),
+          pybind11::arg("routed_x"), pybind11::arg("routed_x_scale"),
+          pybind11::arg("m_indices"),
+          pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("tokens_per_expert"), pybind11::arg("topk"));
+    m.def("fp8_block_routed_combine_out",
+          &mok_sm90::fp8_block_routed::combine_out, "",
+          pybind11::arg("routed_y"), pybind11::arg("combine_buffer"),
+          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("topk"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
