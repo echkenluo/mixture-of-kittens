@@ -383,10 +383,15 @@ struct globals {
     int n_tiles;
 };
 
-__global__ __launch_bounds__(128, 1)
+__cluster_dims__(2, 1, 1) __launch_bounds__(128, 1)
+__global__
 void kernel(const __grid_constant__ globals g) {
-    const int n_tile = blockIdx.x % g.n_tiles;
-    const int m_tile = blockIdx.x / g.n_tiles;
+    const int cta_rank = cluster_ctarank();
+    const int n_pairs = g.n_tiles / 2;
+    const int cluster_idx = clusterIdx().x;
+    const int n_tile_base = 2 * (cluster_idx % n_pairs);
+    const int n_tile = n_tile_base + cta_rank;
+    const int m_tile = cluster_idx / n_pairs;
     const int global_row_base = m_tile * 64;
     if (g.num_tokens != nullptr && global_row_base >= g.num_tokens[0])
         return;
@@ -398,22 +403,66 @@ void kernel(const __grid_constant__ globals g) {
     auto &a_smem = al.allocate<a_st, PIPE_DEPTH>();
     auto &b_smem = al.allocate<b_st, PIPE_DEPTH>();
     d_st &d_smem = al.allocate<d_st>();
+    __shared__ semaphore inputs_arrived[PIPE_DEPTH];
+    __shared__ semaphore inputs_finished[PIPE_DEPTH];
+    __shared__ semaphore inputs_ready[PIPE_DEPTH];
+
+    if (threadIdx.x < PIPE_DEPTH) {
+        init_semaphore(inputs_arrived[threadIdx.x], 0, 1);
+        init_semaphore(inputs_finished[threadIdx.x], 0, 1);
+        init_semaphore(inputs_ready[threadIdx.x], 0, 2);
+    }
+    everyone::tma::cluster::sync();
 
     acc_rt total;
-    warpgroup::load_async(a_smem[0], g.A, {m_tile, 0});
-    warpgroup::load_async(b_smem[0], g.B, {expert, n_tile, 0});
+    uint32_t phasebits = 0xFFFF0000;
+    uint32_t ready_phase = 0;
+    if (threadIdx.x == 0) {
+        wait(inputs_finished[0], get_phasebit<1>(phasebits, 0));
+        update_phasebit<1>(phasebits, 0);
+        tma::cluster::expect_bytes(
+            inputs_arrived[0], sizeof(a_st) + sizeof(b_st));
+        tma::cluster::load_async(
+            b_smem[0], g.B, {expert, n_tile, 0}, inputs_arrived[0],
+            static_cast<uint16_t>(1 << cta_rank));
+        tma::cluster::arrive(inputs_ready[0], 0);
+        if (cta_rank == 0) {
+            wait(inputs_ready[0], get_phasebit<0>(ready_phase, 0));
+            update_phasebit<0>(ready_phase, 0);
+            tma::cluster::load_async(
+                a_smem[0], g.A, {m_tile, 0}, inputs_arrived[0], 0b11);
+        }
+    }
     for (int kb = 0; kb < g.k_blocks; ++kb) {
         const int stage = kb % PIPE_DEPTH;
-        warpgroup::load_async_wait<0>(0);
+        wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+        update_phasebit<0>(phasebits, stage);
 
         acc_rt partial;
         warpgroup::mm_ABt(partial, a_smem[stage], b_smem[stage]);
         if (kb + 1 < g.k_blocks) {
             const int next_stage = (kb + 1) % PIPE_DEPTH;
-            warpgroup::load_async(a_smem[next_stage], g.A,
-                                  {m_tile, kb + 1});
-            warpgroup::load_async(b_smem[next_stage], g.B,
-                                  {expert, n_tile, kb + 1});
+            if (threadIdx.x == 0) {
+                wait(inputs_finished[next_stage],
+                     get_phasebit<1>(phasebits, next_stage));
+                update_phasebit<1>(phasebits, next_stage);
+                tma::cluster::expect_bytes(
+                    inputs_arrived[next_stage],
+                    sizeof(a_st) + sizeof(b_st));
+                tma::cluster::load_async(
+                    b_smem[next_stage], g.B,
+                    {expert, n_tile, kb + 1}, inputs_arrived[next_stage],
+                    static_cast<uint16_t>(1 << cta_rank));
+                tma::cluster::arrive(inputs_ready[next_stage], 0);
+                if (cta_rank == 0) {
+                    wait(inputs_ready[next_stage],
+                         get_phasebit<0>(ready_phase, next_stage));
+                    update_phasebit<0>(ready_phase, next_stage);
+                    tma::cluster::load_async(
+                        a_smem[next_stage], g.A, {m_tile, kb + 1},
+                        inputs_arrived[next_stage], 0b11);
+                }
+            }
         }
         warpgroup::mma_async_wait<0>();
 
@@ -433,6 +482,8 @@ void kernel(const __grid_constant__ globals g) {
         else
             warpgroup::add(total, total, partial);
         warpgroup::sync(0);
+        if (threadIdx.x == 0)
+            tma::cluster::arrive(inputs_finished[stage], cta_rank);
     }
 
     rt_bf<16, 64> out;

@@ -182,7 +182,10 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         )
         * expert_padding
     ).to(torch.int32)
-    expected_m_indices = torch.zeros_like(m_indices)
+    # Dispatch deliberately leaves the inactive capacity tail untouched.  The
+    # dynamic grouped GEMM consumes only ``schedule.num_tokens`` rows, so
+    # clearing that tail would restore the decode overhead this path avoids.
+    expected_m_indices = torch.full_like(m_indices, -777)
     expected_m_indices[:valid_rows] = torch.repeat_interleave(
         torch.arange(num_local_experts, dtype=torch.int32, device=device),
         schedule.tokens_per_expert,
@@ -197,11 +200,11 @@ def test_sm90_fp8_block_routed_dispatch_combine(
                 ).sum()
             ),
             int((routed_x_scale[:valid_rows] != expected_scale).sum()),
-            int((workspace.routed_x[valid_rows:] != (7 if active_only else 0)).sum()),
+            int((workspace.routed_x[valid_rows:] != 7).sum()),
             int(
                 (
                     workspace.routed_x_scale[valid_rows:]
-                    != (-999 if active_only else 0)
+                    != -999
                 ).sum()
             ),
             int((m_indices != expected_m_indices).sum()),
@@ -868,14 +871,15 @@ def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
         )
 
 
+@pytest.mark.parametrize("k", (256, 7168))
 def test_sm90_fp8_block_grouped_contiguous_output(
-    context: tuple[int, int, torch.device]
+    context: tuple[int, int, torch.device], k: int
 ) -> None:
     rank, _, device = context
     require_sm90(device)
     generator = torch.Generator(device=device).manual_seed(20260820 + rank)
     stream = torch.cuda.Stream(device=device)
-    experts, max_m, n, k = 2, 256, 128, 256
+    experts, max_m, n = 2, 256, 128
     rows = (128, 256)
     with torch.cuda.stream(stream):
         a_grouped = torch.randn(
