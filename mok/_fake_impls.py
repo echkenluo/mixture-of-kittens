@@ -30,6 +30,7 @@ def _schedule_fake(
     num_local_experts: int,
     schedule_capacity: int,
     rank: int,
+    expert_padding: int = 256,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # schedule_peer_rank, schedule_peer_token_idx
     torch.Tensor, torch.Tensor,  # num_tokens, tokens_per_expert

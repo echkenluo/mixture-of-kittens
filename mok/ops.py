@@ -116,6 +116,7 @@ def schedule(
     num_local_experts: int,
     schedule_capacity: int,
     rank: int,
+    expert_padding: int = 256,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -156,8 +157,16 @@ def schedule(
         raise ValueError("schedule_capacity must hold at least one rank's routed tokens")
     if type(rank) is not int or not 0 <= rank < ep_size:
         raise ValueError("rank must be an integer in [0, ep_size)")
+    if type(expert_padding) is not int or expert_padding not in (64, 128, 256):
+        raise ValueError("expert_padding must be one of 64, 128, 256")
 
-    return _C.schedule(topk_all, num_local_experts, schedule_capacity, rank)
+    return _C.schedule(
+        topk_all,
+        num_local_experts,
+        schedule_capacity,
+        rank,
+        expert_padding,
+    )
 
 
 def _validate_pointer_list(pointers: list[int], name: str) -> None:
@@ -235,8 +244,8 @@ def fp8_block_routed_dispatch_out(
     if routed_x.ndim != 2 or routed_x.shape[1] != hidden_size:
         raise ValueError("routed_x must have shape (schedule_capacity, hidden_size)")
     schedule_capacity = routed_x.shape[0]
-    if schedule_capacity <= 0 or schedule_capacity % 256 != 0:
-        raise ValueError("schedule_capacity must be positive and divisible by 256")
+    if schedule_capacity <= 0 or schedule_capacity % 64 != 0:
+        raise ValueError("schedule_capacity must be positive and divisible by 64")
     if (
         not routed_x.is_cuda
         or routed_x.dtype != torch.float8_e4m3fn
@@ -337,11 +346,11 @@ def fp8_block_routed_combine_out(
     schedule_capacity, hidden_size = routed_y.shape
     if (
         schedule_capacity <= 0
-        or schedule_capacity % 256 != 0
+        or schedule_capacity % 64 != 0
         or hidden_size < 128
         or hidden_size % 128 != 0
     ):
-        raise ValueError("routed_y must have M256 capacity and K128 hidden size")
+        raise ValueError("routed_y must have M64 capacity and K128 hidden size")
     if (
         combine_buffer.ndim != 2
         or not combine_buffer.is_cuda

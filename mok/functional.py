@@ -39,6 +39,7 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor     # (schedule_capacity,) int32
     num_tokens: torch.Tensor         # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    expert_padding: int = 256        # () int
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +629,7 @@ def build_schedule(
     top_experts: torch.Tensor,
     *,
     num_local_experts: int,
+    expert_padding: int = 256,
 ) -> MoKSchedule:
     """All-gathers routing choices and builds this rank's padded expert schedule.
 
@@ -682,6 +684,8 @@ def build_schedule(
         raise ValueError("top_experts must have shape (num_local_tokens, topk)")
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
+    if type(expert_padding) is not int or expert_padding not in (64, 128, 256):
+        raise ValueError("expert_padding must be one of 64, 128, 256")
 
     top_experts_int32 = top_experts.to(torch.int32)
     all_gather_top_experts(
@@ -694,10 +698,11 @@ def build_schedule(
     (schedule_peer_rank, schedule_peer_token_idx,
      num_tokens, tokens_per_expert) = schedule(
         workspace.all_gather_top_experts_buffer, num_local_experts,
-        workspace.schedule_capacity, workspace.ep_rank)
+        workspace.schedule_capacity, workspace.ep_rank, expert_padding)
     return MoKSchedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
+        expert_padding=expert_padding,
     )
 
 
@@ -756,10 +761,11 @@ def dispatch_fp8_block(
     if (
         active_rows < 0
         or active_rows > workspace.schedule_capacity
-        or (active_rows != 0 and active_rows % 256 != 0)
+        or (active_rows != 0 and active_rows % schedule.expert_padding != 0)
     ):
         raise RuntimeError(
-            "schedule num_tokens must be zero or an M256 value within capacity"
+            "schedule num_tokens must be zero or expert-padding aligned "
+            "within capacity"
         )
 
     workspace.x_buffer.copy_(x)
@@ -809,11 +815,14 @@ def combine_fp8_block(
         or routed_y.ndim != 2
         or routed_y.shape[1] != workspace.hidden_size
         or routed_y.shape[0] > workspace.schedule_capacity
-        or (routed_y.shape[0] != 0 and routed_y.shape[0] % 256 != 0)
+        or (
+            routed_y.shape[0] != 0
+            and routed_y.shape[0] % schedule.expert_padding != 0
+        )
     ):
         raise ValueError(
             "routed_y must be contiguous CUDA bfloat16 [M,H] with M zero or "
-            "M256 and no larger than schedule capacity"
+            "expert-padding aligned and no larger than schedule capacity"
         )
 
     # Every rank must finish clearing its local target before any peer starts

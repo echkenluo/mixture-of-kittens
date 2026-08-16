@@ -13,7 +13,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("barrier_buffer"), pybind11::arg("barrier_buffer_ptrs"),
           pybind11::arg("barrier_buffer_multicast_ptr"), pybind11::arg("target"));
     m.def("schedule", &scheduler::schedule, "",
-          pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
+          pybind11::arg("topk_all"), pybind11::arg("num_local_experts"),
+          pybind11::arg("schedule_capacity"), pybind11::arg("rank"),
+          pybind11::arg("expert_padding") = 256);
     m.def("mxfp8_quantize", &mxfp8_quantize::mxfp8_quantize_entrypoint, "",
           pybind11::arg("x_bf16"),
           pybind11::arg("return_normal"), pybind11::arg("return_transposed"));

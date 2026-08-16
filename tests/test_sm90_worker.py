@@ -43,8 +43,10 @@ def require_sm90(device: torch.device) -> None:
 
 
 @pytest.mark.parametrize("active_only", [False, True], ids=["capacity", "active"])
+@pytest.mark.parametrize("expert_padding", [256, 64], ids=["m256", "m64"])
 def test_sm90_fp8_block_routed_dispatch_combine(
     active_only: bool,
+    expert_padding: int,
     context: tuple[int, int, torch.device]
 ) -> None:
     rank, world_size, device = context
@@ -81,6 +83,7 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         config,
         top_experts,
         num_local_experts=num_local_experts,
+        expert_padding=expert_padding,
     )
 
     x = torch.empty(
@@ -142,9 +145,18 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         + peer_tokens[valid, None] * 100
         + scale_columns[None, :]
     ).to(torch.float32)
-    expected_tokens_per_expert = torch.tensor(
-        [512, 256], dtype=torch.int32, device=device
+    route_counts = torch.bincount(
+        local_experts,
+        minlength=num_local_experts,
     )
+    expected_tokens_per_expert = (
+        torch.div(
+            route_counts + expert_padding - 1,
+            expert_padding,
+            rounding_mode="floor",
+        )
+        * expert_padding
+    ).to(torch.int32)
     expected_m_indices = torch.zeros_like(m_indices)
     expected_m_indices[:valid_rows] = torch.repeat_interleave(
         torch.arange(num_local_experts, dtype=torch.int32, device=device),

@@ -205,9 +205,11 @@ def test_schedule(context: tuple[int, int, torch.device]) -> None:
         world_size, -1, -1).contiguous()
 
     actual = schedule(
-        topk_all, num_local_experts, schedule_capacity, rank)
+        topk_all, num_local_experts, schedule_capacity, rank,
+        expert_padding=64)
     reference = run_schedule_reference(
-        topk_all, num_local_experts, schedule_capacity, rank)
+        topk_all, num_local_experts, schedule_capacity, rank,
+        expert_padding=64)
     valid_tokens = reference[0] >= 0
     for name, expected, result in (
         ("peer_rank", reference[0], actual[0]),
@@ -216,7 +218,7 @@ def test_schedule(context: tuple[int, int, torch.device]) -> None:
         ("tokens_per_expert", reference[3], actual[3]),
     ):
         check_correctness(
-            f"Minimum schedule capacity/{name}",
+            f"M64 schedule/{name}",
             expected,
             result,
             EXACT_TOLERANCE,
@@ -241,6 +243,7 @@ def test_schedule(context: tuple[int, int, torch.device]) -> None:
         ("schedule capacity alignment", {"schedule_capacity": 128}, ValueError),
         ("schedule capacity size", {"schedule_capacity": 256}, ValueError),
         ("rank", {"rank": world_size}, ValueError),
+        ("expert padding", {"expert_padding": 32}, ValueError),
     ):
         try:
             schedule(**(valid_kwargs | overrides))

@@ -11,7 +11,6 @@ using namespace kittens;
 namespace scheduler {
 
 struct config {
-    static constexpr int EXPERT_PADDING = 256; // row alignment for contiguous grouped GEMM
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr int NUM_THREADS = 1024;
     static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
@@ -29,6 +28,7 @@ struct globals {
     index_gl tokens_per_expert_and_peer; // (num_local_experts * world_size,) per-(local_expert, peer_rank) token counts, must be zero-initialized
 
     int rank;                            // this (destination) rank
+    int expert_padding;                  // row alignment required by the consumer
 };
 
 // Stage 1: Count the number of tokens routed from each peer rank to each local expert
@@ -62,19 +62,21 @@ static __device__ __forceinline__ void count_kernel(const globals &G) {
             atomicAdd(&G.tokens_per_expert_and_peer[{i}], tokens_per_expert_and_peer[i]);
 }
 
-// Stage 2: Pad each expert's total token count by EXPERT_PADDING and accumulate the total count
+// Stage 2: Pad each expert's total token count for the selected consumer.
 static __device__ __forceinline__ void pad_kernel(const globals &G) {
     const int local_expert = blockIdx.x;
     const int world_size = G.topk.depth();
     int num_tokens = 0;
     for (int peer_rank = 0; peer_rank < world_size; ++peer_rank)
         num_tokens += G.tokens_per_expert_and_peer[{local_expert * world_size + peer_rank}];
-    const int padded_num_tokens = (num_tokens + config::EXPERT_PADDING - 1) / config::EXPERT_PADDING * config::EXPERT_PADDING;
+    const int padded_num_tokens =
+        (num_tokens + G.expert_padding - 1) / G.expert_padding
+        * G.expert_padding;
     G.tokens_per_expert[{local_expert}] = padded_num_tokens;
     atomicAdd(&G.num_tokens[{0}], padded_num_tokens);
 }
 
-// Stage 3: Schedule each token into its expert's 256-padded segment
+// Stage 3: Schedule each token into its expert's padded segment.
 static __device__ __forceinline__ void schedule_kernel(const globals &G) {
     const int world_size = G.topk.depth();
     const int num_local_tokens = G.topk.rows();
@@ -150,8 +152,13 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
     const at::Tensor &topk_all,
     const int num_local_experts,
     const int schedule_capacity,
-    const int rank
+    const int rank,
+    const int expert_padding
 ) {
+    TORCH_CHECK(
+        expert_padding == 64 || expert_padding == 128
+            || expert_padding == 256,
+        "expert_padding must be one of 64, 128, 256");
     const int world_size = static_cast<int>(topk_all.size(0));
 
     at::Tensor schedule_peer_rank = at::empty({schedule_capacity}, topk_all.options().dtype(at::kInt));
@@ -169,6 +176,7 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
         .tokens_per_expert = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert),
         .tokens_per_expert_and_peer =kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert_and_peer),
         .rank = rank,
+        .expert_padding = expert_padding,
     };
 
     auto stream = at::cuda::getCurrentCUDAStream();

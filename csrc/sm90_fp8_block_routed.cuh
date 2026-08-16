@@ -107,9 +107,9 @@ void dispatch_kernel(const __grid_constant__ dispatch_globals g) {
                 offset = next;
             }
         }
-        // num_tokens is padded to 256 and schedule_capacity is also M256
-        // aligned, so assigning tail rows to expert 0 cannot mix experts in
-        // an M64 tile consumed by the contiguous GEMM.
+        // Expert segments and schedule capacity are M64 aligned, so assigning
+        // tail rows to expert 0 cannot mix experts in a tile consumed by the
+        // contiguous GEMM.
         g.m_indices[row] = expert;
     }
 }
@@ -243,8 +243,8 @@ inline void dispatch_out(
                     && routed_x.size(1) == hidden_size,
                 "routed_x must be contiguous CUDA float8_e4m3fn [capacity,H]");
     const int64_t schedule_capacity = routed_x.size(0);
-    TORCH_CHECK(schedule_capacity > 0 && schedule_capacity % 256 == 0,
-                "schedule capacity must be positive and M256 aligned");
+    TORCH_CHECK(schedule_capacity > 0 && schedule_capacity % 64 == 0,
+                "schedule capacity must be positive and M64 aligned");
     TORCH_CHECK(routed_x_scale.dim() == 2 && routed_x_scale.is_cuda()
                     && routed_x_scale.scalar_type() == at::kFloat
                     && routed_x_scale.is_contiguous()
@@ -314,9 +314,9 @@ inline void combine_out(
                 "routed_y must be contiguous CUDA bfloat16 [capacity,H]");
     const int64_t schedule_capacity = routed_y.size(0);
     const int64_t hidden_size = routed_y.size(1);
-    TORCH_CHECK(schedule_capacity > 0 && schedule_capacity % 256 == 0
+    TORCH_CHECK(schedule_capacity > 0 && schedule_capacity % 64 == 0
                     && hidden_size >= 128 && hidden_size % 128 == 0,
-                "routed_y must have M256 capacity and K128 hidden size");
+                "routed_y must have M64 capacity and K128 hidden size");
     TORCH_CHECK(combine_buffer.dim() == 2 && combine_buffer.is_cuda()
                     && combine_buffer.scalar_type() == at::kBFloat16
                     && combine_buffer.is_contiguous()
