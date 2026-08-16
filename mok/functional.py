@@ -15,7 +15,9 @@ from .ops import (
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fp8_block_grouped_contiguous_out,
+    fp8_block_routed_combine_reduce_out,
     fp8_block_routed_combine_out,
+    fp8_block_routed_dispatch_copy_out,
     fp8_block_routed_dispatch_out,
     fwd_epilogue,
     routed_epilogue_out,
@@ -768,32 +770,29 @@ def dispatch_fp8_block(
             "within capacity"
         )
 
-    workspace.x_buffer.copy_(x)
-    workspace.x_scale_buffer.copy_(x_scale)
-    barrier_all(
+    routed_x = workspace.routed_x[:active_rows]
+    routed_x_scale = workspace.routed_x_scale[:active_rows]
+    m_indices = workspace.m_indices[:active_rows]
+    fp8_block_routed_dispatch_copy_out(
+        x,
+        workspace.x_buffer,
+        workspace.x_buffer_ptrs,
+        x_scale,
+        workspace.x_scale_buffer,
+        workspace.x_scale_buffer_ptrs,
         workspace.barrier_buffer,
         workspace.barrier_buffer_ptrs,
         workspace.barrier_buffer_multicast_ptr,
         workspace.barrier_target,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule.peer_rank[:active_rows],
+        schedule.peer_token_idx[:active_rows],
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        workspace.topk,
     )
-    routed_x = workspace.routed_x[:active_rows]
-    routed_x_scale = workspace.routed_x_scale[:active_rows]
-    m_indices = workspace.m_indices[:active_rows]
-    if active_rows:
-        fp8_block_routed_dispatch_out(
-            workspace.x_buffer,
-            workspace.x_buffer_ptrs,
-            workspace.x_scale_buffer,
-            workspace.x_scale_buffer_ptrs,
-            routed_x,
-            routed_x_scale,
-            m_indices,
-            schedule.peer_rank[:active_rows],
-            schedule.peer_token_idx[:active_rows],
-            schedule.num_tokens,
-            schedule.tokens_per_expert,
-            workspace.topk,
-        )
     return routed_x, routed_x_scale, m_indices
 
 
@@ -898,6 +897,65 @@ def reduce_fp8_block_routes(
         workspace.combine_buffer,
         topk_weights,
         workspace.output,
+    )
+    return workspace.output
+
+
+def combine_reduce_fp8_block_routes(
+    workspace: MoKFP8RouteWorkspace,
+    schedule: MoKSchedule,
+    routed_y: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Combine remote BF16 rows and reduce route slots in one host call."""
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    expected_weights_shape = (workspace.num_local_tokens, workspace.topk)
+    if (
+        not routed_y.is_cuda
+        or routed_y.device != workspace.device
+        or routed_y.dtype != torch.bfloat16
+        or not routed_y.is_contiguous()
+        or routed_y.ndim != 2
+        or routed_y.shape[1] != workspace.hidden_size
+        or routed_y.shape[0] > workspace.schedule_capacity
+        or (
+            routed_y.shape[0] != 0
+            and routed_y.shape[0] % schedule.expert_padding != 0
+        )
+    ):
+        raise ValueError(
+            "routed_y must be contiguous CUDA bfloat16 [M,H] with M zero or "
+            "expert-padding aligned and no larger than schedule capacity"
+        )
+    if (
+        not topk_weights.is_cuda
+        or topk_weights.device != workspace.device
+        or topk_weights.dtype != torch.float32
+        or not topk_weights.is_contiguous()
+        or tuple(topk_weights.shape) != expected_weights_shape
+    ):
+        raise ValueError(
+            "topk_weights must be contiguous CUDA float32 with shape "
+            f"{expected_weights_shape}"
+        )
+    active_rows = routed_y.shape[0]
+    fp8_block_routed_combine_reduce_out(
+        routed_y,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        schedule.peer_rank[:active_rows],
+        schedule.peer_token_idx[:active_rows],
+        schedule.num_tokens,
+        topk_weights,
+        workspace.output,
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+        workspace.topk,
     )
     return workspace.output
 

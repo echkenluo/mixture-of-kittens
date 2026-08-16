@@ -37,6 +37,12 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_routed_combine_out"), (
         "SM90 build did not register fp8_block_routed_combine_out"
     )
+    assert hasattr(_C, "fp8_block_routed_dispatch_copy_out"), (
+        "SM90 build did not register fused FP8 dispatch"
+    )
+    assert hasattr(_C, "fp8_block_routed_combine_reduce_out"), (
+        "SM90 build did not register fused FP8 combine/reduce"
+    )
     assert hasattr(_C, "routed_epilogue_out"), (
         "SM90 build did not register routed_epilogue_out"
     )
@@ -230,6 +236,27 @@ def test_sm90_fp8_block_routed_dispatch_combine(
     )
     assert not combine_mismatches.any().item()
 
+    workspace.combine_buffer.fill_(float("nan"))
+    fused_output = functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        routed_y,
+        torch.ones(
+            (num_local_tokens, topk), dtype=torch.float32, device=device
+        ),
+    )
+    fused_mismatches = torch.tensor(
+        [int((fused_output != expected_combine).sum())],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(fused_mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"ROUTED_FUSED_MISMATCH|rank={rank}|values="
+        f"{fused_mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not fused_mismatches.any().item()
 
 def test_sm90_fp8_block_empty_routes(
     context: tuple[int, int, torch.device]
@@ -298,6 +325,17 @@ def test_sm90_fp8_block_empty_routes(
     torch.cuda.synchronize(device)
     assert not combine_buffer.any().item()
     assert not output.any().item()
+
+    fused_output = functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        torch.empty((0, hidden_size), dtype=torch.bfloat16, device=device),
+        torch.zeros(
+            (num_local_tokens, topk), dtype=torch.float32, device=device
+        ),
+    )
+    torch.cuda.synchronize(device)
+    assert not fused_output.any().item()
 
 
 def test_sm90_fp8_block_routed_rejects_invalid_inputs(

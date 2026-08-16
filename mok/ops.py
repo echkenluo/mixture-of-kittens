@@ -399,6 +399,102 @@ def fp8_block_routed_combine_out(
 
 
 @torch.library.custom_op(
+    "mok::fp8_block_routed_dispatch_copy_out",
+    mutates_args=(
+        "x_buffer",
+        "x_scale_buffer",
+        "barrier_buffer",
+        "barrier_target",
+        "routed_x",
+        "routed_x_scale",
+        "m_indices",
+    ),
+)
+def fp8_block_routed_dispatch_copy_out(
+    x: torch.Tensor,
+    x_buffer: torch.Tensor,
+    x_buffer_ptrs: list[int],
+    x_scale: torch.Tensor,
+    x_scale_buffer: torch.Tensor,
+    x_scale_buffer_ptrs: list[int],
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    routed_x: torch.Tensor,
+    routed_x_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    topk: int,
+) -> None:
+    """Copy symmetric inputs, synchronize peers, and dispatch in one call."""
+    if not hasattr(_C, "fp8_block_routed_dispatch_copy_out"):
+        raise RuntimeError("the loaded MoK extension lacks fused FP8 dispatch")
+    _C.fp8_block_routed_dispatch_copy_out(
+        x,
+        x_buffer,
+        x_buffer_ptrs,
+        x_scale,
+        x_scale_buffer,
+        x_scale_buffer_ptrs,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+        topk,
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_routed_combine_reduce_out",
+    mutates_args=("combine_buffer", "output", "barrier_buffer", "barrier_target"),
+)
+def fp8_block_routed_combine_reduce_out(
+    routed_y: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_buffer_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    topk: int,
+) -> None:
+    """Clear, combine, synchronize, and reduce routed rows in one call."""
+    if not hasattr(_C, "fp8_block_routed_combine_reduce_out"):
+        raise RuntimeError("the loaded MoK extension lacks fused FP8 combine")
+    _C.fp8_block_routed_combine_reduce_out(
+        routed_y,
+        combine_buffer,
+        combine_buffer_ptrs,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        topk_weights,
+        output,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        topk,
+    )
+
+
+@torch.library.custom_op(
     "mok::fp8_block_grouped_contiguous_out",
     mutates_args=("output",),
 )

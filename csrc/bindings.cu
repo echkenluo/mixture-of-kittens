@@ -4,6 +4,7 @@
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 #include "utils.cuh"
+#include "sm90_fp8_block_route_fused.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::entrypoint, "",
@@ -113,6 +114,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"),
           pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("topk"));
+    m.def("fp8_block_routed_dispatch_copy_out",
+          &mok_sm90::fp8_block_route_fused::dispatch_copy_out, "",
+          pybind11::arg("x"), pybind11::arg("x_buffer"),
+          pybind11::arg("x_buffer_ptrs"), pybind11::arg("x_scale"),
+          pybind11::arg("x_scale_buffer"),
+          pybind11::arg("x_scale_buffer_ptrs"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"), pybind11::arg("routed_x"),
+          pybind11::arg("routed_x_scale"), pybind11::arg("m_indices"),
+          pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("tokens_per_expert"), pybind11::arg("topk"));
+    m.def("fp8_block_routed_combine_reduce_out",
+          &mok_sm90::fp8_block_route_fused::combine_reduce_out, "",
+          pybind11::arg("routed_y"), pybind11::arg("combine_buffer"),
+          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("topk_weights"),
+          pybind11::arg("output"), pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"), pybind11::arg("topk"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
