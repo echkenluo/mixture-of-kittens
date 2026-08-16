@@ -7,10 +7,10 @@
 // expert results back to the source rank/route slot.
 //
 // These kernels deliberately preserve the device-resident MoK schedule: they
-// never read num_tokens on the host.  The first implementation launches over
-// schedule_capacity and masks rows beyond num_tokens.  A later persistent
-// megakernel integration will replace this launch shape while keeping the same
-// data contract.
+// never read num_tokens on the host.  Dispatch keeps its one-CTA-per-row launch
+// shape, but exits at the device-resident active-row count before touching the
+// unused capacity tail.  This preserves CUDA Graph replay and the copy kernel's
+// row parallelism without paying for unnecessary tail writes.
 #if defined(KITTENS_SM90)
 
 #include <ATen/ATen.h>
@@ -49,11 +49,13 @@ void dispatch_kernel(const __grid_constant__ dispatch_globals g) {
     const int row = blockIdx.x;
     if (row >= g.schedule_capacity)
         return;
-
-    const int valid_rows = g.num_tokens[0];
-    const int peer_rank = row < valid_rows ? g.schedule_peer_rank[row] : -1;
-    const int peer_token_idx =
-        row < valid_rows ? g.schedule_peer_token_idx[row] : -1;
+    const int device_rows = g.num_tokens[0];
+    const int valid_rows =
+        device_rows < g.schedule_capacity ? device_rows : g.schedule_capacity;
+    if (row >= valid_rows)
+        return;
+    const int peer_rank = g.schedule_peer_rank[row];
+    const int peer_token_idx = g.schedule_peer_token_idx[row];
     const bool valid = peer_rank >= 0 && peer_rank < g.ep_size
                        && peer_token_idx >= 0
                        && peer_token_idx < g.num_local_tokens * g.topk;
@@ -96,20 +98,17 @@ void dispatch_kernel(const __grid_constant__ dispatch_globals g) {
     if (threadIdx.x == 0) {
         int expert = 0;
         int offset = 0;
-        if (row < valid_rows) {
-            for (int candidate = 0; candidate < g.num_local_experts;
-                 ++candidate) {
-                const int next = offset + g.tokens_per_expert[candidate];
-                if (row < next) {
-                    expert = candidate;
-                    break;
-                }
-                offset = next;
+        for (int candidate = 0; candidate < g.num_local_experts;
+             ++candidate) {
+            const int next = offset + g.tokens_per_expert[candidate];
+            if (row < next) {
+                expert = candidate;
+                break;
             }
+            offset = next;
         }
-        // Expert segments and schedule capacity are M64 aligned, so assigning
-        // tail rows to expert 0 cannot mix experts in a tile consumed by the
-        // contiguous GEMM.
+        // Expert segments and active-row count are M64 aligned. Rows past
+        // valid_rows are never consumed by the dynamic grouped GEMM.
         g.m_indices[row] = expert;
     }
 }
