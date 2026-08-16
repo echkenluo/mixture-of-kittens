@@ -5,9 +5,8 @@ the DeepSeek-V4 Hopper contract: E4M3 values, per-row K128 activation scales,
 per-N128/K128 weight scales, and expert-major masked rows.  Scale layout
 conversion for DeepGEMM is setup and excluded from timing.
 
-The MoK test binding allocates its BF16 output on every call while DeepGEMM
-writes into a preallocated output.  The asymmetry is recorded in the JSON and
-makes this an implementation canary, not a formal winner claim.
+The benchmark records both the original allocating MoK binding and the
+preallocated-output binding used for a boundary-matched DeepGEMM comparison.
 """
 
 import hashlib
@@ -113,6 +112,7 @@ def summarize(samples: list[float], effective_flops: int) -> dict:
 
 def main() -> None:
     assert hasattr(_C, "sm90_fp8_block_grouped_test")
+    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test")
     assert K % 128 == 0 and N % 128 == 0 and MAX_M % 64 == 0
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -142,6 +142,7 @@ def main() -> None:
     dg_output = torch.empty(
         (EXPERTS, MAX_M, N), dtype=torch.bfloat16, device=device
     )
+    mok_pipe_output = torch.empty_like(dg_output)
 
     def run_mok_sync():
         return _C.sm90_fp8_block_grouped_test(
@@ -151,6 +152,11 @@ def main() -> None:
     def run_mok_pipelined():
         return _C.sm90_fp8_block_grouped_pipelined_test(
             a, b, a_scale, b_scale, masked_m
+        )
+
+    def run_mok_pipelined_out():
+        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+            a, b, a_scale, b_scale, masked_m, mok_pipe_output
         )
 
     def run_deepgemm():
@@ -164,7 +170,7 @@ def main() -> None:
         return dg_output
 
     # One untimed numerical gate before any performance claim.
-    mok_output = run_mok_pipelined()
+    mok_output = run_mok_pipelined_out()
     run_deepgemm()
     torch.cuda.synchronize()
     abs_max = 0.0
@@ -187,7 +193,9 @@ def main() -> None:
     effective_flops = 2 * sum(valid_rows) * N * K
     mok_sync_a = time_calls(run_mok_sync)
     mok_pipe_a = time_calls(run_mok_pipelined)
+    mok_pipe_out_a = time_calls(run_mok_pipelined_out)
     deepgemm_samples = time_calls(run_deepgemm)
+    mok_pipe_out_a2 = time_calls(run_mok_pipelined_out)
     mok_pipe_a2 = time_calls(run_mok_pipelined)
     mok_sync_a2 = time_calls(run_mok_sync)
 
@@ -202,7 +210,7 @@ def main() -> None:
         check=False,
     ).stdout.strip().splitlines()
     record = {
-        "schema": "bench-sm90-fp8-grouped.v1",
+        "schema": "bench-sm90-fp8-grouped.v2",
         "shape": {
             "experts": EXPERTS,
             "max_m": MAX_M,
@@ -223,18 +231,25 @@ def main() -> None:
             "order": [
                 "mok_sync_a",
                 "mok_pipe_a",
+                "mok_pipe_out_a",
                 "deepgemm",
+                "mok_pipe_out_a2",
                 "mok_pipe_a2",
                 "mok_sync_a2",
             ],
             "mok_boundary": "binding + output allocation + grouped kernel",
+            "mok_preallocated_boundary": (
+                "binding + grouped kernel into preallocated output"
+            ),
             "deepgemm_boundary": "binding + grouped kernel into preallocated output",
             "scale_layout_conversion": "excluded for both implementations",
         },
         "results": {
             "mok_sync_a": summarize(mok_sync_a, effective_flops),
             "mok_pipe_a": summarize(mok_pipe_a, effective_flops),
+            "mok_pipe_out_a": summarize(mok_pipe_out_a, effective_flops),
             "deepgemm": summarize(deepgemm_samples, effective_flops),
+            "mok_pipe_out_a2": summarize(mok_pipe_out_a2, effective_flops),
             "mok_pipe_a2": summarize(mok_pipe_a2, effective_flops),
             "mok_sync_a2": summarize(mok_sync_a2, effective_flops),
         },
@@ -254,7 +269,9 @@ def main() -> None:
         "BENCH|fp8_grouped"
         f"|mok_sync_a={record['results']['mok_sync_a']['p50_ms']:.4f}ms"
         f"|mok_pipe_a={record['results']['mok_pipe_a']['p50_ms']:.4f}ms"
+        f"|mok_pipe_out_a={record['results']['mok_pipe_out_a']['p50_ms']:.4f}ms"
         f"|deepgemm={record['results']['deepgemm']['p50_ms']:.4f}ms"
+        f"|mok_pipe_out_a2={record['results']['mok_pipe_out_a2']['p50_ms']:.4f}ms"
         f"|mok_pipe_a2={record['results']['mok_pipe_a2']['p50_ms']:.4f}ms"
         f"|mok_sync_a2={record['results']['mok_sync_a2']['p50_ms']:.4f}ms"
         f"|rel={rel_maxnorm:.6g}|out={OUTPUT}"

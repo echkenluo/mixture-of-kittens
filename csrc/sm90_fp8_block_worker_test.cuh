@@ -236,9 +236,9 @@ void kernel(const __grid_constant__ globals g) {
 }
 
 template <bool PIPELINED>
-inline at::Tensor entry_impl(at::Tensor A, at::Tensor B,
-                             at::Tensor A_scale, at::Tensor B_scale,
-                             at::Tensor masked_m) {
+inline at::Tensor entry_impl_out(at::Tensor A, at::Tensor B,
+                                 at::Tensor A_scale, at::Tensor B_scale,
+                                 at::Tensor masked_m, at::Tensor D) {
     TORCH_CHECK(A.dim() == 3 && B.dim() == 3,
                 "A and B must have shapes [E,max_m,K] and [E,N,K]");
     kittens::py::tensor_check<a_gl>(A);
@@ -266,8 +266,6 @@ inline at::Tensor entry_impl(at::Tensor A, at::Tensor B,
     TORCH_CHECK(A_scale.is_contiguous() && B_scale.is_contiguous()
                     && masked_m.is_contiguous(),
                 "scales and masked_m must be contiguous");
-    kittens::py::device_check(A, B, A_scale, B_scale, masked_m);
-
     const int k_blocks = k / 128;
     TORCH_CHECK(A_scale.dim() == 3 && A_scale.size(0) == experts
                     && A_scale.size(1) == max_m
@@ -279,10 +277,17 @@ inline at::Tensor entry_impl(at::Tensor A, at::Tensor B,
                 "B_scale must have shape [E,N/128,K/128]");
     TORCH_CHECK(masked_m.dim() == 1 && masked_m.size(0) == experts,
                 "masked_m must have shape [E]");
+    TORCH_CHECK(D.dim() == 3 && D.size(0) == experts
+                    && D.size(1) == max_m && D.size(2) == n,
+                "D must have shape [E,max_m,N]");
+    TORCH_CHECK(D.is_cuda() && D.scalar_type() == at::ScalarType::BFloat16,
+                "D must be a CUDA bfloat16 tensor");
+    TORCH_CHECK(D.is_contiguous(), "D must be contiguous");
+    kittens::py::tensor_check<d_gl>(D);
+    kittens::py::device_check(A, B, A_scale, B_scale, masked_m);
+    kittens::py::device_check(A, D);
 
     c10::cuda::CUDAGuard device_guard(A.device());
-    auto D = at::empty({experts, max_m, n},
-                       A.options().dtype(at::ScalarType::BFloat16));
     const int m_tiles = max_m / 64;
     const int n_tiles = n / 64;
     globals g{
@@ -309,6 +314,18 @@ inline at::Tensor entry_impl(at::Tensor A, at::Tensor B,
     return D;
 }
 
+template <bool PIPELINED>
+inline at::Tensor entry_impl(at::Tensor A, at::Tensor B,
+                             at::Tensor A_scale, at::Tensor B_scale,
+                             at::Tensor masked_m) {
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3,
+                "A and B must have shapes [E,max_m,K] and [E,N,K]");
+    auto D = at::empty({A.size(0), A.size(1), B.size(1)},
+                       A.options().dtype(at::ScalarType::BFloat16));
+    return entry_impl_out<PIPELINED>(
+        A, B, A_scale, B_scale, masked_m, D);
+}
+
 inline at::Tensor entry(at::Tensor A, at::Tensor B,
                         at::Tensor A_scale, at::Tensor B_scale,
                         at::Tensor masked_m) {
@@ -319,6 +336,18 @@ inline at::Tensor entry_pipelined(at::Tensor A, at::Tensor B,
                                   at::Tensor A_scale, at::Tensor B_scale,
                                   at::Tensor masked_m) {
     return entry_impl<true>(A, B, A_scale, B_scale, masked_m);
+}
+
+inline at::Tensor entry_out(at::Tensor A, at::Tensor B,
+                            at::Tensor A_scale, at::Tensor B_scale,
+                            at::Tensor masked_m, at::Tensor D) {
+    return entry_impl_out<false>(A, B, A_scale, B_scale, masked_m, D);
+}
+
+inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
+                                      at::Tensor A_scale, at::Tensor B_scale,
+                                      at::Tensor masked_m, at::Tensor D) {
+    return entry_impl_out<true>(A, B, A_scale, B_scale, masked_m, D);
 }
 
 } // namespace grouped

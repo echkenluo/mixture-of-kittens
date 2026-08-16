@@ -11,9 +11,9 @@ from the same raw activation scales and includes the TMA-layout transforms
 performed by SGLang's masked-GEMM runner.  Weight-scale transforms are setup,
 matching weights that have already been prepared by model loading.
 
-The current MoK test binding allocates each GEMM output while DeepGEMM writes
-to preallocated outputs.  Both the asymmetry and every timing boundary are
-recorded, so this is a component/layer canary rather than an E2E winner claim.
+Both paths write to preallocated GEMM outputs.  Every timing boundary is
+recorded, so this is a fair routed-expert compute canary rather than an E2E
+winner claim.
 """
 
 import hashlib
@@ -157,7 +157,7 @@ def main() -> None:
             "FP8_MLP_BINARY_BUILD_COMMIT is required to bind the loaded SO "
             "to its clean build source"
         )
-    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_test")
+    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test")
     assert HIDDEN % 128 == 0
     assert INTERMEDIATE % 128 == 0
     assert (2 * INTERMEDIATE) % 128 == 0
@@ -220,6 +220,7 @@ def main() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    mok_gateup_output = torch.empty_like(dg_gateup)
     mok_activation = torch.empty(
         (EXPERTS, MAX_M, INTERMEDIATE),
         dtype=torch.float8_e4m3fn,
@@ -235,6 +236,7 @@ def main() -> None:
     dg_down = torch.empty(
         (EXPERTS, MAX_M, HIDDEN), dtype=torch.bfloat16, device=device
     )
+    mok_down_output = torch.empty_like(dg_down)
 
     def activate(
         gateup: torch.Tensor, output: torch.Tensor, output_scale: torch.Tensor
@@ -254,8 +256,13 @@ def main() -> None:
         return output
 
     def run_mok_gateup() -> torch.Tensor:
-        return _C.sm90_fp8_block_grouped_pipelined_test(
-            hidden, w13, hidden_scale, w13_scale, masked_m
+        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+            hidden,
+            w13,
+            hidden_scale,
+            w13_scale,
+            masked_m,
+            mok_gateup_output,
         )
 
     def run_deepgemm_gateup_prepared() -> torch.Tensor:
@@ -270,8 +277,13 @@ def main() -> None:
         return dg_gateup
 
     def run_mok_down() -> torch.Tensor:
-        return _C.sm90_fp8_block_grouped_pipelined_test(
-            mok_activation, w2, mok_activation_scale, w2_scale, masked_m
+        return _C.sm90_fp8_block_grouped_pipelined_out_test(
+            mok_activation,
+            w2,
+            mok_activation_scale,
+            w2_scale,
+            masked_m,
+            mok_down_output,
         )
 
     def run_deepgemm_down_prepared() -> torch.Tensor:
@@ -412,8 +424,7 @@ def main() -> None:
                 "components",
             ],
             "mok_boundary": (
-                "two binding/output allocations + two grouped GEMMs + "
-                "production activation"
+                "two preallocated grouped GEMMs + production activation"
             ),
             "deepgemm_boundary": (
                 "two preallocated grouped GEMMs + production activation + "

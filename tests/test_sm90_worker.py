@@ -17,6 +17,12 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_test"), (
         "SM90 build did not register sm90_fp8_block_grouped_pipelined_test"
     )
+    assert hasattr(_C, "sm90_fp8_block_grouped_out_test"), (
+        "SM90 build did not register sm90_fp8_block_grouped_out_test"
+    )
+    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_out_test"), (
+        "SM90 build did not register sm90_fp8_block_grouped_pipelined_out_test"
+    )
 
 
 @pytest.mark.parametrize("is_ab", [True, False], ids=["AB", "ABt"])
@@ -220,6 +226,53 @@ def test_sm90_fp8_block_grouped_numeric(
     assert max_rel.item() < 0.025, f"max_rel={max_rel.item():.6f}"
 
 
+@pytest.mark.parametrize(
+    "impl_name",
+    [
+        "sm90_fp8_block_grouped_out_test",
+        "sm90_fp8_block_grouped_pipelined_out_test",
+    ],
+    ids=["sync", "cpasync-2stage"],
+)
+def test_sm90_fp8_block_grouped_preallocated_output(
+    context: tuple[int, int, torch.device], impl_name: str
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+    generator = torch.Generator(device=device).manual_seed(20260818 + rank)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        a = torch.randn(
+            (2, 64, 256), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        b = torch.randn(
+            (2, 128, 256), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        a_scale = torch.rand(
+            (2, 64, 2), generator=generator, device=device
+        ) * 0.09 + 0.01
+        b_scale = torch.rand(
+            (2, 1, 2), generator=generator, device=device
+        ) * 0.09 + 0.01
+        masked_m = torch.tensor((64, 32), dtype=torch.int32, device=device)
+        expected = _C.sm90_fp8_block_grouped_pipelined_test(
+            a, b, a_scale, b_scale, masked_m
+        )
+        output = torch.full(
+            (2, 64, 128), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        actual = getattr(_C, impl_name)(
+            a, b, a_scale, b_scale, masked_m, output
+        )
+    stream.synchronize()
+
+    assert actual.data_ptr() == output.data_ptr()
+    for expert, rows in enumerate((64, 32)):
+        torch.testing.assert_close(
+            actual[expert, :rows], expected[expert, :rows], rtol=0, atol=0
+        )
+
+
 def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
     context: tuple[int, int, torch.device]
 ) -> None:
@@ -250,4 +303,20 @@ def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
     with pytest.raises(RuntimeError, match="masked_m must be int32"):
         _C.sm90_fp8_block_grouped_test(
             a, b, a_scale, b_scale, masked_m.to(torch.int64)
+        )
+    output = torch.empty((2, 64, 128), dtype=torch.bfloat16, device=device)
+    with pytest.raises(RuntimeError, match="D must have shape"):
+        _C.sm90_fp8_block_grouped_pipelined_out_test(
+            a, b, a_scale, b_scale, masked_m, output[:, :, :64]
+        )
+    with pytest.raises(RuntimeError, match="CUDA bfloat16"):
+        _C.sm90_fp8_block_grouped_pipelined_out_test(
+            a, b, a_scale, b_scale, masked_m, output.float()
+        )
+    noncontiguous = torch.empty(
+        (2, 128, 64), dtype=torch.bfloat16, device=device
+    ).transpose(1, 2)
+    with pytest.raises(RuntimeError, match="D must be contiguous"):
+        _C.sm90_fp8_block_grouped_pipelined_out_test(
+            a, b, a_scale, b_scale, masked_m, noncontiguous
         )
