@@ -107,8 +107,11 @@ def aligned_rows() -> list[int]:
             "FP8_CONTIG_MLP_PATTERN length must divide FP8_CONTIG_MLP_EXPERTS"
         )
     rows = PATTERN * (EXPERTS // len(PATTERN))
-    if any(value < 0 or value % 64 for value in rows):
-        raise ValueError("every active expert segment must be M64 aligned")
+    if any(value < 0 or value % 128 for value in rows):
+        raise ValueError(
+            "DeepGEMM comparison requires every active expert segment to be "
+            "M128 aligned"
+        )
     if not any(rows):
         raise ValueError("at least one expert must have a non-zero segment")
     return rows
