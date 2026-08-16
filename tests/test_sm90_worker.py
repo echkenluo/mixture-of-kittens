@@ -26,6 +26,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_grouped_pipelined_out"), (
         "SM90 build did not register fp8_block_grouped_pipelined_out"
     )
+    assert hasattr(_C, "fp8_block_grouped_contiguous_out"), (
+        "SM90 build did not register fp8_block_grouped_contiguous_out"
+    )
 
 
 @pytest.mark.parametrize("is_ab", [True, False], ids=["AB", "ABt"])
@@ -322,4 +325,100 @@ def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
     with pytest.raises(RuntimeError, match="D must be contiguous"):
         _C.fp8_block_grouped_pipelined_out(
             a, b, a_scale, b_scale, masked_m, noncontiguous
+        )
+
+
+def test_sm90_fp8_block_grouped_contiguous_output(
+    context: tuple[int, int, torch.device]
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+    generator = torch.Generator(device=device).manual_seed(20260820 + rank)
+    stream = torch.cuda.Stream(device=device)
+    experts, max_m, n, k = 2, 256, 128, 256
+    rows = (128, 256)
+    with torch.cuda.stream(stream):
+        a_grouped = torch.randn(
+            (experts, max_m, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        b = torch.randn(
+            (experts, n, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        a_scale_grouped = torch.rand(
+            (experts, max_m, k // 128), generator=generator, device=device
+        ) * 0.09 + 0.01
+        b_scale = torch.rand(
+            (experts, n // 128, k // 128), generator=generator, device=device
+        ) * 0.09 + 0.01
+        masked_m = torch.tensor(rows, dtype=torch.int32, device=device)
+        reference_grouped = _C.fp8_block_grouped_pipelined_out(
+            a_grouped,
+            b,
+            a_scale_grouped,
+            b_scale,
+            masked_m,
+            torch.empty(
+                (experts, max_m, n), dtype=torch.bfloat16, device=device
+            ),
+        )
+
+        a = torch.cat(
+            [a_grouped[expert, :valid] for expert, valid in enumerate(rows)]
+        ).contiguous()
+        a_scale = torch.cat(
+            [
+                a_scale_grouped[expert, :valid]
+                for expert, valid in enumerate(rows)
+            ]
+        ).contiguous()
+        m_indices = torch.repeat_interleave(
+            torch.arange(experts, dtype=torch.int32, device=device),
+            torch.tensor(rows, dtype=torch.int64, device=device),
+        )
+        output = torch.empty(
+            (sum(rows), n), dtype=torch.bfloat16, device=device
+        )
+        actual = _C.fp8_block_grouped_contiguous_out(
+            a, b, a_scale, b_scale, m_indices, output
+        )
+    stream.synchronize()
+
+    reference = torch.cat(
+        [
+            reference_grouped[expert, :valid]
+            for expert, valid in enumerate(rows)
+        ]
+    )
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, _, device = context
+    require_sm90(device)
+    a = torch.ones((128, 128), device=device).to(torch.float8_e4m3fn)
+    b = torch.ones((2, 128, 128), device=device).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((128, 1), device=device)
+    b_scale = torch.ones((2, 1, 1), device=device)
+    m_indices = torch.zeros((128,), dtype=torch.int32, device=device)
+    output = torch.empty((128, 128), dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(RuntimeError, match="M must"):
+        _C.fp8_block_grouped_contiguous_out(
+            a[:32].contiguous(),
+            b,
+            a_scale[:32].contiguous(),
+            b_scale,
+            m_indices[:32].contiguous(),
+            output[:32].contiguous(),
+        )
+    with pytest.raises(RuntimeError, match="m_indices must be int32"):
+        _C.fp8_block_grouped_contiguous_out(
+            a, b, a_scale, b_scale, m_indices.to(torch.int64), output
+        )
+    with pytest.raises(RuntimeError, match="D must have shape"):
+        _C.fp8_block_grouped_contiguous_out(
+            a, b, a_scale, b_scale, m_indices, output[:, :64]
         )

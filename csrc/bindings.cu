@@ -88,6 +88,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input"), pybind11::arg("weight"),
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("masked_m"), pybind11::arg("output"));
+    m.def("fp8_block_grouped_contiguous_out",
+          &mok_sm90::fp8_block_test::contiguous::entry_pipelined_out, "",
+          pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("output"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

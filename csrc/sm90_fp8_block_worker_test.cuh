@@ -352,6 +352,171 @@ inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
 
 } // namespace grouped
 
+// Contiguous expert-grouped form matching DeepGEMM's normal-DeepEP contract:
+//
+//   A         [M, K]               FP8 E4M3
+//   B         [E, N, K]            FP8 E4M3
+//   A_scale   [M, K/128]           float32
+//   B_scale   [E, N/128, K/128]    float32
+//   m_indices [M]                  int32 expert id per row
+//   D         [M, N]               BF16
+//
+// DeepEP normal dispatch aligns every expert segment to 128 rows.  Therefore
+// each M64 tile belongs to exactly one expert and its first m_indices entry is
+// sufficient to select B.  Keeping A/D compact avoids an expert-major padding
+// conversion in the production Prefill path.
+namespace contiguous {
+using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_st>;
+using b_gl = gl<fp8e4m3, 1, -1, -1, -1, b_st>;
+using d_gl = gl<bf16, 1, 1, -1, -1, d_st>;
+
+struct globals {
+    a_gl A;
+    b_gl B;
+    d_gl D;
+    const float *A_scale;
+    const float *B_scale;
+    const int *m_indices;
+    int n;
+    int k_blocks;
+    int n_tiles;
+};
+
+__global__ __launch_bounds__(128, 1)
+void kernel(const __grid_constant__ globals g) {
+    const int n_tile = blockIdx.x % g.n_tiles;
+    const int m_tile = blockIdx.x / g.n_tiles;
+    const int global_row_base = m_tile * 64;
+    const int expert = g.m_indices[global_row_base];
+
+    extern __shared__ int __shm[];
+    shared_allocator al((int *)&__shm[0]);
+    constexpr int PIPE_DEPTH = 2;
+    auto &a_smem = al.allocate<a_st, PIPE_DEPTH>();
+    auto &b_smem = al.allocate<b_st, PIPE_DEPTH>();
+    d_st &d_smem = al.allocate<d_st>();
+
+    acc_rt total;
+    warpgroup::load_async(a_smem[0], g.A, {m_tile, 0});
+    warpgroup::load_async(b_smem[0], g.B, {expert, n_tile, 0});
+    for (int kb = 0; kb < g.k_blocks; ++kb) {
+        const int stage = kb % PIPE_DEPTH;
+        warpgroup::load_async_wait<0>(0);
+
+        acc_rt partial;
+        warpgroup::mm_ABt(partial, a_smem[stage], b_smem[stage]);
+        if (kb + 1 < g.k_blocks) {
+            const int next_stage = (kb + 1) % PIPE_DEPTH;
+            warpgroup::load_async(a_smem[next_stage], g.A,
+                                  {m_tile, kb + 1});
+            warpgroup::load_async(b_smem[next_stage], g.B,
+                                  {expert, n_tile, kb + 1});
+        }
+        warpgroup::mma_async_wait<0>();
+
+        typename acc_rt::col_vec row_scale;
+        const int local_row = warpid() * 16 + laneid() / 4;
+        const int global_row = global_row_base + local_row;
+        const float b_scale =
+            g.B_scale[(expert * (g.n / 128) + n_tile / 2) * g.k_blocks + kb];
+        row_scale[0][0].x =
+            g.A_scale[global_row * g.k_blocks + kb] * b_scale;
+        row_scale[0][0].y =
+            g.A_scale[(global_row + 8) * g.k_blocks + kb] * b_scale;
+        warpgroup::mul_row(partial, partial, row_scale);
+
+        if (kb == 0)
+            warp::copy(total, partial);
+        else
+            warpgroup::add(total, total, partial);
+        warpgroup::sync(0);
+    }
+
+    rt_bf<16, 64> out;
+    warp::copy(out, total);
+    warpgroup::store(d_smem, out);
+    warpgroup::sync(0);
+    warpgroup::store(g.D, d_smem, {m_tile, n_tile});
+}
+
+inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
+                                      at::Tensor A_scale,
+                                      at::Tensor B_scale,
+                                      at::Tensor m_indices, at::Tensor D) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 3,
+                "A and B must have shapes [M,K] and [E,N,K]");
+    kittens::py::tensor_check<a_gl>(A);
+    kittens::py::tensor_check<b_gl>(B);
+    const int total_m = (int)A.size(0);
+    const int experts = (int)B.size(0);
+    const int n = (int)B.size(1);
+    const int k = (int)A.size(1);
+    TORCH_CHECK(experts > 0 && B.size(2) == k,
+                "A and B K dimensions must match");
+    TORCH_CHECK(total_m >= 64 && total_m % 64 == 0,
+                "M must be positive and divisible by 64");
+    TORCH_CHECK(n >= 128 && n % 128 == 0,
+                "N must be positive and divisible by 128");
+    TORCH_CHECK(k >= 128 && k % 128 == 0,
+                "K must be positive and divisible by 128");
+
+    TORCH_CHECK(A_scale.is_cuda() && B_scale.is_cuda()
+                    && m_indices.is_cuda(),
+                "scales and m_indices must be CUDA tensors");
+    TORCH_CHECK(A_scale.scalar_type() == at::ScalarType::Float
+                    && B_scale.scalar_type() == at::ScalarType::Float,
+                "A_scale and B_scale must be float32");
+    TORCH_CHECK(m_indices.scalar_type() == at::ScalarType::Int,
+                "m_indices must be int32");
+    TORCH_CHECK(A_scale.is_contiguous() && B_scale.is_contiguous()
+                    && m_indices.is_contiguous(),
+                "scales and m_indices must be contiguous");
+    const int k_blocks = k / 128;
+    TORCH_CHECK(A_scale.dim() == 2 && A_scale.size(0) == total_m
+                    && A_scale.size(1) == k_blocks,
+                "A_scale must have shape [M,K/128]");
+    TORCH_CHECK(B_scale.dim() == 3 && B_scale.size(0) == experts
+                    && B_scale.size(1) == n / 128
+                    && B_scale.size(2) == k_blocks,
+                "B_scale must have shape [E,N/128,K/128]");
+    TORCH_CHECK(m_indices.dim() == 1 && m_indices.size(0) == total_m,
+                "m_indices must have shape [M]");
+    TORCH_CHECK(D.dim() == 2 && D.size(0) == total_m && D.size(1) == n,
+                "D must have shape [M,N]");
+    TORCH_CHECK(D.is_cuda() && D.scalar_type() == at::ScalarType::BFloat16,
+                "D must be a CUDA bfloat16 tensor");
+    TORCH_CHECK(D.is_contiguous(), "D must be contiguous");
+    kittens::py::tensor_check<d_gl>(D);
+    kittens::py::device_check(A, B, A_scale, B_scale, m_indices);
+    kittens::py::device_check(A, D);
+
+    c10::cuda::CUDAGuard device_guard(A.device());
+    const int m_tiles = total_m / 64;
+    const int n_tiles = n / 64;
+    globals g{
+        kittens::py::tensor_to_gl<a_gl>(A),
+        kittens::py::tensor_to_gl<b_gl>(B),
+        kittens::py::tensor_to_gl<d_gl>(D),
+        A_scale.data_ptr<float>(),
+        B_scale.data_ptr<float>(),
+        m_indices.data_ptr<int>(),
+        n,
+        k_blocks,
+        n_tiles,
+    };
+    constexpr int PIPE_DEPTH = 2;
+    constexpr int SMEM =
+        PIPE_DEPTH * (sizeof(a_st) + sizeof(b_st)) + sizeof(d_st) + 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
+    CUDACHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    kernel<<<m_tiles * n_tiles, 128, SMEM, stream>>>(g);
+    CUDACHECK(cudaGetLastError());
+    return D;
+}
+
+} // namespace contiguous
+
 } // namespace fp8_block_test
 } // namespace mok_sm90
 #endif
