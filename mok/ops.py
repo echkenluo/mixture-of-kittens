@@ -142,9 +142,9 @@ def schedule(
     ep_size, num_local_tokens, topk = topk_all.shape
     if ep_size not in (4, 8, 16, 32, 64):
         raise ValueError("topk_all ep_size must be one of 4, 8, 16, 32, 64")
-    if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+    if num_local_tokens < 256 or num_local_tokens % 256 != 0:
         raise ValueError(
-            "topk_all num_local_tokens must be at least 512 and divisible by 256"
+            "topk_all num_local_tokens must be at least 256 and divisible by 256"
         )
     if not 0 < topk <= 255:
         raise ValueError("topk_all topk must be in [1, 255]")
@@ -600,8 +600,8 @@ def routed_epilogue_out(
     ):
         raise ValueError("output must be contiguous CUDA bfloat16 [T,H]")
     num_tokens, hidden_size = output.shape
-    if num_tokens < 512 or num_tokens % 256 != 0:
-        raise ValueError("output T must be at least 512 and divisible by 256")
+    if num_tokens < 256 or num_tokens % 256 != 0:
+        raise ValueError("output T must be at least 256 and divisible by 256")
     if hidden_size <= 0 or hidden_size % 256 != 0:
         raise ValueError("output H must be positive and divisible by 256")
     if (

@@ -258,15 +258,20 @@ def test_sm90_fp8_block_routed_dispatch_combine(
     )
     assert not fused_mismatches.any().item()
 
+
+@pytest.mark.parametrize("num_local_tokens", [256, 512])
 def test_sm90_fp8_block_empty_routes(
-    context: tuple[int, int, torch.device]
+    context: tuple[int, int, torch.device], num_local_tokens: int
 ) -> None:
     _, world_size, device = context
     require_sm90(device)
     assert world_size in (4, 8, 16, 32, 64)
 
-    num_local_tokens, hidden_size, topk = 512, 256, 1
-    config = functional.MoKConfig(schedule_capacity_multiplier=1.0)
+    hidden_size, topk = 256, 1
+    config = functional.MoKConfig(
+        schedule_capacity_multiplier=1.0,
+        all_gather_top_experts_chunk_bytes=1024,
+    )
     workspace = functional.get_fp8_route_workspace(
         config,
         dist.group.WORLD,
@@ -466,11 +471,11 @@ def test_sm90_routed_epilogue_rejects_invalid_inputs(
         ops.routed_epilogue_out(
             combine_buffer[:512].contiguous(), topk_weights, output
         )
-    with pytest.raises(ValueError, match="at least 512"):
+    with pytest.raises(ValueError, match="at least 256"):
         ops.routed_epilogue_out(
-            combine_buffer[:512].contiguous(),
-            topk_weights[:256].contiguous(),
-            output[:256].contiguous(),
+            combine_buffer[:256].contiguous(),
+            topk_weights[:128].contiguous(),
+            output[:128].contiguous(),
         )
 
 
