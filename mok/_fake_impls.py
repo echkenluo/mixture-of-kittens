@@ -107,6 +107,19 @@ def _fp8_block_grouped_contiguous_out_fake(
     return None
 
 
+@torch.library.register_fake("mok::fp8_block_grouped_contiguous_dynamic_out")
+def _fp8_block_grouped_contiguous_dynamic_out_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
 @torch.library.register_fake("mok::routed_epilogue_out")
 def _routed_epilogue_out_fake(
     combine_buffer: torch.Tensor,

@@ -16,6 +16,7 @@ from .ops import (
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fp8_block_build_schedule_out,
     fp8_block_grouped_contiguous_out,
+    fp8_block_grouped_contiguous_dynamic_out,
     fp8_block_routed_combine_reduce_out,
     fp8_block_routed_combine_out,
     fp8_block_routed_dispatch_copy_out,
@@ -949,6 +950,28 @@ def grouped_gemm_fp8_block_out(
         input_scale,
         weight_scale,
         m_indices,
+        output,
+    )
+    return output
+
+
+def grouped_gemm_fp8_block_dynamic_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run grouped GEMM while reading the valid-row count on the device."""
+    fp8_block_grouped_contiguous_dynamic_out(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        m_indices,
+        num_tokens,
         output,
     )
     return output

@@ -630,19 +630,15 @@ def fp8_block_routed_combine_reduce_out(
     )
 
 
-@torch.library.custom_op(
-    "mok::fp8_block_grouped_contiguous_out",
-    mutates_args=("output",),
-)
-def fp8_block_grouped_contiguous_out(
+def _validate_fp8_block_grouped_contiguous(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     m_indices: torch.Tensor,
     output: torch.Tensor,
+    num_tokens: torch.Tensor | None = None,
 ) -> None:
-    """Run an SM90 FP8/K128 expert-major grouped GEMM into caller storage."""
     if input.ndim != 2 or not input.is_cuda or not input.is_contiguous():
         raise ValueError("input must be contiguous CUDA [M,K]")
     if input.dtype != torch.float8_e4m3fn:
@@ -708,13 +704,77 @@ def fp8_block_grouped_contiguous_out(
     tensors = (weight, input_scale, weight_scale, m_indices, output)
     if any(tensor.device != input.device for tensor in tensors):
         raise ValueError("all grouped GEMM tensors must share one device")
+    if num_tokens is not None and (
+        not num_tokens.is_cuda
+        or num_tokens.device != input.device
+        or num_tokens.dtype != torch.int32
+        or not num_tokens.is_contiguous()
+        or tuple(num_tokens.shape) != (1,)
+    ):
+        raise ValueError("num_tokens must be contiguous CUDA int32 [1]")
     if torch.cuda.get_device_capability(input.device) != (9, 0):
         raise NotImplementedError("FP8 grouped contiguous GEMM currently requires SM90")
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_grouped_contiguous_out",
+    mutates_args=("output",),
+)
+def fp8_block_grouped_contiguous_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run an SM90 FP8/K128 expert-major grouped GEMM into caller storage."""
+    _validate_fp8_block_grouped_contiguous(
+        input, weight, input_scale, weight_scale, m_indices, output
+    )
     if not hasattr(_C, "fp8_block_grouped_contiguous_out"):
         raise RuntimeError("the loaded MoK extension lacks FP8 grouped GEMM")
 
     _C.fp8_block_grouped_contiguous_out(
         input, weight, input_scale, weight_scale, m_indices, output
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_grouped_contiguous_dynamic_out",
+    mutates_args=("output",),
+)
+def fp8_block_grouped_contiguous_dynamic_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run grouped GEMM over device-selected valid rows in caller storage."""
+    _validate_fp8_block_grouped_contiguous(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        m_indices,
+        output,
+        num_tokens,
+    )
+    if not hasattr(_C, "fp8_block_grouped_contiguous_dynamic_out"):
+        raise RuntimeError(
+            "the loaded MoK extension lacks dynamic FP8 grouped GEMM"
+        )
+    _C.fp8_block_grouped_contiguous_dynamic_out(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        m_indices,
+        num_tokens,
+        output,
     )
 
 

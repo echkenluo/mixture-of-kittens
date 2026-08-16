@@ -377,6 +377,7 @@ struct globals {
     const float *A_scale;
     const float *B_scale;
     const int *m_indices;
+    const int *num_tokens;
     int n;
     int k_blocks;
     int n_tiles;
@@ -387,6 +388,8 @@ void kernel(const __grid_constant__ globals g) {
     const int n_tile = blockIdx.x % g.n_tiles;
     const int m_tile = blockIdx.x / g.n_tiles;
     const int global_row_base = m_tile * 64;
+    if (g.num_tokens != nullptr && global_row_base >= g.num_tokens[0])
+        return;
     const int expert = g.m_indices[global_row_base];
 
     extern __shared__ int __shm[];
@@ -439,10 +442,9 @@ void kernel(const __grid_constant__ globals g) {
     warpgroup::store(g.D, d_smem, {m_tile, n_tile});
 }
 
-inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
-                                      at::Tensor A_scale,
-                                      at::Tensor B_scale,
-                                      at::Tensor m_indices, at::Tensor D) {
+inline at::Tensor entry_pipelined_out_impl(
+    at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale,
+    at::Tensor m_indices, const at::Tensor *num_tokens, at::Tensor D) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 3,
                 "A and B must have shapes [M,K] and [E,N,K]");
     kittens::py::tensor_check<a_gl>(A);
@@ -489,6 +491,16 @@ inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
     kittens::py::tensor_check<d_gl>(D);
     kittens::py::device_check(A, B, A_scale, B_scale, m_indices);
     kittens::py::device_check(A, D);
+    if (num_tokens != nullptr) {
+        TORCH_CHECK(
+            num_tokens->is_cuda()
+                && num_tokens->scalar_type() == at::ScalarType::Int
+                && num_tokens->is_contiguous()
+                && num_tokens->dim() == 1 && num_tokens->numel() == 1,
+            "num_tokens must be contiguous CUDA int32 [1]");
+        TORCH_CHECK(num_tokens->device() == A.device(),
+                    "num_tokens must share the input device");
+    }
 
     c10::cuda::CUDAGuard device_guard(A.device());
     const int m_tiles = total_m / 64;
@@ -500,6 +512,7 @@ inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
         A_scale.data_ptr<float>(),
         B_scale.data_ptr<float>(),
         m_indices.data_ptr<int>(),
+        num_tokens == nullptr ? nullptr : num_tokens->data_ptr<int>(),
         n,
         k_blocks,
         n_tiles,
@@ -513,6 +526,21 @@ inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
     kernel<<<m_tiles * n_tiles, 128, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());
     return D;
+}
+
+inline at::Tensor entry_pipelined_out(at::Tensor A, at::Tensor B,
+                                      at::Tensor A_scale,
+                                      at::Tensor B_scale,
+                                      at::Tensor m_indices, at::Tensor D) {
+    return entry_pipelined_out_impl(
+        A, B, A_scale, B_scale, m_indices, nullptr, D);
+}
+
+inline at::Tensor entry_pipelined_dynamic_out(
+    at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale,
+    at::Tensor m_indices, at::Tensor num_tokens, at::Tensor D) {
+    return entry_pipelined_out_impl(
+        A, B, A_scale, B_scale, m_indices, &num_tokens, D);
 }
 
 } // namespace contiguous

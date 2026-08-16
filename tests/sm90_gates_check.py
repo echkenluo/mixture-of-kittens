@@ -22,6 +22,9 @@ assert hasattr(torch.ops.mok, "fp8_block_routed_combine_out"), (
 assert hasattr(torch.ops.mok, "fp8_block_grouped_contiguous_out"), (
     "FP8 grouped contiguous registration missing"
 )
+assert hasattr(torch.ops.mok, "fp8_block_grouped_contiguous_dynamic_out"), (
+    "dynamic FP8 grouped contiguous registration missing"
+)
 assert hasattr(torch.ops.mok, "fp8_block_build_schedule_out"), (
     "FP8 fused schedule registration missing"
 )
@@ -80,6 +83,10 @@ with FakeTensorMode():
     torch.ops.mok.fp8_block_grouped_contiguous_out(
         routed_x, grouped_weight, routed_x_scale, grouped_weight_scale,
         m_indices, grouped_output,
+    )
+    torch.ops.mok.fp8_block_grouped_contiguous_dynamic_out(
+        routed_x, grouped_weight, routed_x_scale, grouped_weight_scale,
+        m_indices, num_tokens, grouped_output,
     )
     torch.ops.mok.routed_epilogue_out(
         combine_buffer, topk_weights, grouped_output,

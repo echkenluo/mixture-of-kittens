@@ -31,6 +31,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "fp8_block_grouped_contiguous_out"), (
         "SM90 build did not register fp8_block_grouped_contiguous_out"
     )
+    assert hasattr(_C, "fp8_block_grouped_contiguous_dynamic_out"), (
+        "SM90 build did not register fp8_block_grouped_contiguous_dynamic_out"
+    )
     assert hasattr(_C, "fp8_block_build_schedule_out"), (
         "SM90 build did not register fused FP8 scheduling"
     )
@@ -856,6 +859,94 @@ def test_sm90_fp8_block_grouped_contiguous_output(
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
+def test_sm90_fp8_block_grouped_contiguous_dynamic_output(
+    context: tuple[int, int, torch.device]
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+    generator = torch.Generator(device=device).manual_seed(20260821 + rank)
+    stream = torch.cuda.Stream(device=device)
+    experts, capacity, active_rows, n, k = 2, 512, 384, 128, 256
+    expert_rows = (128, 256)
+    sentinel = 101.0
+    with torch.cuda.stream(stream):
+        a_grouped = torch.randn(
+            (experts, 256, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        b = torch.randn(
+            (experts, n, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        a_scale_grouped = torch.rand(
+            (experts, 256, k // 128), generator=generator, device=device
+        ) * 0.09 + 0.01
+        b_scale = torch.rand(
+            (experts, n // 128, k // 128), generator=generator, device=device
+        ) * 0.09 + 0.01
+
+        active_a = torch.cat(
+            [
+                a_grouped[expert, :valid]
+                for expert, valid in enumerate(expert_rows)
+            ]
+        ).contiguous()
+        active_a_scale = torch.cat(
+            [
+                a_scale_grouped[expert, :valid]
+                for expert, valid in enumerate(expert_rows)
+            ]
+        ).contiguous()
+        active_m_indices = torch.repeat_interleave(
+            torch.arange(experts, dtype=torch.int32, device=device),
+            torch.tensor(expert_rows, dtype=torch.int64, device=device),
+        )
+        reference = functional.grouped_gemm_fp8_block_out(
+            active_a,
+            b,
+            active_a_scale,
+            b_scale,
+            active_m_indices,
+            torch.empty((active_rows, n), dtype=torch.bfloat16, device=device),
+        )
+
+        a = torch.empty(
+            (capacity, k), dtype=torch.float8_e4m3fn, device=device
+        )
+        a[:active_rows].copy_(active_a)
+        a_scale = torch.empty(
+            (capacity, k // 128), dtype=torch.float32, device=device
+        )
+        a_scale[:active_rows].copy_(active_a_scale)
+        m_indices = torch.full(
+            (capacity,), -1, dtype=torch.int32, device=device
+        )
+        m_indices[:active_rows].copy_(active_m_indices)
+        num_tokens = torch.tensor(
+            [active_rows], dtype=torch.int32, device=device
+        )
+        output = torch.full(
+            (capacity, n), sentinel, dtype=torch.bfloat16, device=device
+        )
+        actual = functional.grouped_gemm_fp8_block_dynamic_out(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indices,
+            num_tokens,
+            output,
+        )
+    stream.synchronize()
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual[:active_rows], reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[active_rows:],
+        torch.full_like(actual[active_rows:], sentinel),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
     context: tuple[int, int, torch.device]
 ) -> None:
@@ -884,4 +975,14 @@ def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
     with pytest.raises(ValueError, match=r"output must be.*\[M,N\]"):
         ops.fp8_block_grouped_contiguous_out(
             a, b, a_scale, b_scale, m_indices, output[:, :64]
+        )
+    with pytest.raises(ValueError, match="num_tokens must be.*int32"):
+        ops.fp8_block_grouped_contiguous_dynamic_out(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indices,
+            torch.tensor([128], dtype=torch.int64, device=device),
+            output,
         )
