@@ -176,8 +176,10 @@ static __host__ void schedule_out(
         world_size == 4 || world_size == 8 || world_size == 16
             || world_size == 32 || world_size == 64,
         "topk_all ep_size must be one of 4, 8, 16, 32, 64");
-    TORCH_CHECK(num_local_tokens >= 256 && num_local_tokens % 256 == 0,
-                "topk_all T must be at least 256 and divisible by 256");
+    // The scheduler grid-strides over the route tensor and has no M256 token
+    // dependency. Consumer-specific alignment is carried by expert_padding
+    // and schedule_capacity instead.
+    TORCH_CHECK(num_local_tokens > 0, "topk_all T must be positive");
     TORCH_CHECK(topk > 0 && topk <= 255, "topk must be in [1,255]");
     TORCH_CHECK(num_local_experts > 0, "num_local_experts must be positive");
     TORCH_CHECK(rank >= 0 && rank < world_size, "rank must be in [0,ep_size)");

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -348,6 +350,78 @@ def test_sm90_fp8_block_empty_routes(
     torch.cuda.synchronize(device)
     assert not combine_buffer.any().item()
     assert not output.any().item()
+
+    fused_output = functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        torch.empty((0, hidden_size), dtype=torch.bfloat16, device=device),
+        torch.zeros(
+            (num_local_tokens, topk), dtype=torch.float32, device=device
+        ),
+    )
+    torch.cuda.synchronize(device)
+    assert not fused_output.any().item()
+
+
+@pytest.mark.parametrize("num_local_tokens", [2, 4])
+def test_sm90_fp8_block_small_empty_routes(
+    context: tuple[int, int, torch.device], num_local_tokens: int
+) -> None:
+    _, world_size, device = context
+    require_sm90(device)
+    assert world_size in (4, 8, 16, 32, 64)
+
+    hidden_size, topk = 256, 6
+    route_rows = num_local_tokens * topk
+    capacity_factor = max(2, 256 // math.gcd(route_rows, 256))
+    config = functional.MoKConfig(
+        schedule_capacity_multiplier=capacity_factor / world_size,
+        all_gather_top_experts_chunk_bytes=16,
+    )
+    workspace = functional.get_fp8_route_workspace(
+        config,
+        dist.group.WORLD,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        num_local_experts=2,
+    )
+    assert workspace.schedule_capacity % 256 == 0
+    schedule = functional.build_schedule(
+        workspace,
+        config,
+        torch.full(
+            (num_local_tokens, topk),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        ),
+        num_local_experts=2,
+        expert_padding=64,
+    )
+    assert int(schedule.num_tokens.item()) == 0
+
+    x = torch.zeros(
+        (num_local_tokens, hidden_size),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_scale = torch.ones(
+        (num_local_tokens, hidden_size // 128),
+        dtype=torch.float32,
+        device=device,
+    )
+    routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=True,
+    )
+    assert routed_x.shape == (0, hidden_size)
+    assert routed_x_scale.shape == (0, hidden_size // 128)
+    assert m_indices.shape == (0,)
 
     fused_output = functional.combine_reduce_fp8_block_routes(
         workspace,

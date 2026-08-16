@@ -151,6 +151,7 @@ def validate_workspace_args(
     hidden_size: int,
     topk: int,
     min_num_local_tokens: int = 512,
+    num_local_tokens_alignment: int = 256,
 ) -> None:
     """Validates the arguments used to create or retrieve a workspace.
 
@@ -194,13 +195,21 @@ def validate_workspace_args(
                 "being brought up (MXFP8 and backward are not implemented). "
                 "Set MOK_SM90_EXPERIMENTAL=1 to proceed.")
     device_properties = torch.cuda.get_device_properties(device)
+    if (
+        type(num_local_tokens_alignment) is not int
+        or num_local_tokens_alignment <= 0
+    ):
+        raise ValueError("num_local_tokens_alignment must be a positive integer")
     if type(num_local_tokens) is not int or num_local_tokens < min_num_local_tokens:
         raise ValueError(
             "num_local_tokens must be an integer at least "
             f"{min_num_local_tokens}"
         )
-    if num_local_tokens % 256 != 0:
-        raise ValueError("num_local_tokens must be divisible by 256")
+    if num_local_tokens % num_local_tokens_alignment != 0:
+        raise ValueError(
+            "num_local_tokens must be divisible by "
+            f"{num_local_tokens_alignment}"
+        )
     if type(hidden_size) is not int or hidden_size <= 0:
         raise ValueError("hidden_size must be a positive integer")
     if hidden_size % 256 != 0:
@@ -364,7 +373,8 @@ def create_fp8_route_workspace(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
-        min_num_local_tokens=256,
+        min_num_local_tokens=2,
+        num_local_tokens_alignment=2,
     )
 
     device_index = (
@@ -558,7 +568,8 @@ def get_fp8_route_workspace(
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
-        min_num_local_tokens=256,
+        min_num_local_tokens=2,
+        num_local_tokens_alignment=2,
     )
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
