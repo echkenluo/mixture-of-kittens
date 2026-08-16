@@ -1,7 +1,6 @@
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 
 from mok import _C
 from mok import functional, ops
@@ -58,7 +57,7 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         macrobatch_size=4096,
         schedule_capacity_multiplier=1.0,
     )
-    workspace = functional.create_workspace(
+    workspace = functional.get_fp8_route_workspace(
         config,
         dist.group.WORLD,
         device=device,
@@ -79,36 +78,18 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         num_local_experts=num_local_experts,
     )
 
-    group_name = dist.group.WORLD.group_name
-    x = symm_mem.empty(
+    x = torch.empty(
         num_local_tokens,
         hidden_size,
         dtype=torch.float8_e4m3fn,
         device=device,
     )
-    x_scale = symm_mem.empty(
+    x_scale = torch.empty(
         num_local_tokens,
         hidden_size // 128,
         dtype=torch.float32,
         device=device,
     )
-    combine_buffer = symm_mem.empty(
-        num_local_tokens * topk,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    x_handle = symm_mem.rendezvous(x, group_name)
-    x_scale_handle = symm_mem.rendezvous(x_scale, group_name)
-    combine_handle = symm_mem.rendezvous(combine_buffer, group_name)
-    x_ptrs = [int(x_handle.buffer_ptrs[peer]) for peer in range(world_size)]
-    x_scale_ptrs = [
-        int(x_scale_handle.buffer_ptrs[peer]) for peer in range(world_size)
-    ]
-    combine_ptrs = [
-        int(combine_handle.buffer_ptrs[peer]) for peer in range(world_size)
-    ]
-
     columns = torch.arange(hidden_size, device=device)
     x.copy_(
         ((token_indices[:, None] * hidden_size + columns[None, :]) % 31 - 15)
@@ -121,35 +102,14 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         + token_indices[:, None] * 100
         + scale_columns[None, :]
     )
-    combine_buffer.fill_(float("nan"))
-    ops.barrier_all(
-        workspace.barrier_buffer,
-        workspace.barrier_buffer_ptrs,
-        workspace.barrier_buffer_multicast_ptr,
-        workspace.barrier_target,
-    )
+    workspace.combine_buffer.fill_(float("nan"))
 
     capacity = workspace.schedule_capacity
-    routed_x = torch.empty(
-        capacity, hidden_size, dtype=torch.float8_e4m3fn, device=device
-    )
-    routed_x_scale = torch.empty(
-        capacity, hidden_size // 128, dtype=torch.float32, device=device
-    )
-    m_indices = torch.empty(capacity, dtype=torch.int32, device=device)
-    _C.fp8_block_routed_dispatch_out(
+    routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
+        workspace,
+        schedule,
         x,
-        x_ptrs,
         x_scale,
-        x_scale_ptrs,
-        routed_x,
-        routed_x_scale,
-        m_indices,
-        schedule.peer_rank,
-        schedule.peer_token_idx,
-        schedule.num_tokens,
-        schedule.tokens_per_expert,
-        topk,
     )
 
     valid_rows = int(schedule.num_tokens.item())
@@ -228,20 +188,10 @@ def test_sm90_fp8_block_routed_dispatch_combine(
         + expected_m_indices[:valid_rows].to(torch.int64) * 16
         + (peer_tokens % 16)
     ).to(torch.bfloat16)[:, None]
-    _C.fp8_block_routed_combine_out(
+    combine_buffer = functional.combine_fp8_block(
+        workspace,
+        schedule,
         routed_y,
-        combine_buffer,
-        combine_ptrs,
-        schedule.peer_rank,
-        schedule.peer_token_idx,
-        schedule.num_tokens,
-        topk,
-    )
-    ops.barrier_all(
-        workspace.barrier_buffer,
-        workspace.barrier_buffer_ptrs,
-        workspace.barrier_buffer_multicast_ptr,
-        workspace.barrier_target,
     )
     expected_combine = (
         destination_ranks.to(torch.bfloat16) * 32
@@ -292,29 +242,29 @@ def test_sm90_fp8_block_routed_rejects_invalid_inputs(
     tokens_per_expert = torch.zeros(2, dtype=torch.int32, device=device)
     pointer_list = [1, 1, 1, 1]
 
-    with pytest.raises(RuntimeError, match="float8_e4m3fn"):
-        _C.fp8_block_routed_dispatch_out(
+    with pytest.raises(TypeError, match="float8_e4m3fn"):
+        ops.fp8_block_routed_dispatch_out(
             x.float(), pointer_list, x_scale, pointer_list,
             routed_x, routed_x_scale, m_indices,
             schedule_peer_rank, schedule_peer_token_idx,
             num_tokens, tokens_per_expert, 1,
         )
-    with pytest.raises(RuntimeError, match="x_scale must"):
-        _C.fp8_block_routed_dispatch_out(
+    with pytest.raises(ValueError, match="x_scale must"):
+        ops.fp8_block_routed_dispatch_out(
             x, pointer_list, x_scale.bfloat16(), pointer_list,
             routed_x, routed_x_scale, m_indices,
             schedule_peer_rank, schedule_peer_token_idx,
             num_tokens, tokens_per_expert, 1,
         )
-    with pytest.raises(RuntimeError, match="x_ptrs length"):
-        _C.fp8_block_routed_dispatch_out(
+    with pytest.raises(ValueError, match="x_ptrs length"):
+        ops.fp8_block_routed_dispatch_out(
             x, [1], x_scale, pointer_list,
             routed_x, routed_x_scale, m_indices,
             schedule_peer_rank, schedule_peer_token_idx,
             num_tokens, tokens_per_expert, 1,
         )
-    with pytest.raises(RuntimeError, match="nonempty vector"):
-        _C.fp8_block_routed_dispatch_out(
+    with pytest.raises(ValueError, match="nonempty CUDA int32 vector"):
+        ops.fp8_block_routed_dispatch_out(
             x, pointer_list, x_scale, pointer_list,
             routed_x, routed_x_scale, m_indices,
             schedule_peer_rank, schedule_peer_token_idx,
@@ -327,13 +277,13 @@ def test_sm90_fp8_block_routed_rejects_invalid_inputs(
     combine_buffer = torch.empty(
         (num_local_tokens, hidden_size), dtype=torch.bfloat16, device=device
     )
-    with pytest.raises(RuntimeError, match="bfloat16"):
-        _C.fp8_block_routed_combine_out(
+    with pytest.raises(TypeError, match="bfloat16"):
+        ops.fp8_block_routed_combine_out(
             routed_y.float(), combine_buffer, pointer_list,
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, 1,
         )
-    with pytest.raises(RuntimeError, match="combine_buffer_ptrs length"):
-        _C.fp8_block_routed_combine_out(
+    with pytest.raises(ValueError, match="combine_buffer_ptrs length"):
+        ops.fp8_block_routed_combine_out(
             routed_y, combine_buffer, [1],
             schedule_peer_rank, schedule_peer_token_idx, num_tokens, 1,
         )

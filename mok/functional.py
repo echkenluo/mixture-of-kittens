@@ -14,6 +14,8 @@ from .ops import (
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
+    fp8_block_routed_combine_out,
+    fp8_block_routed_dispatch_out,
     fwd_epilogue,
     schedule,
 )
@@ -86,7 +88,44 @@ class MoKWorkspace:
     barrier_target: torch.Tensor                      # (1,) int32
 
 
+@dataclass(slots=True)
+class MoKFP8RouteWorkspace:
+    """Caller-owned production FP8 dispatch/combine storage for SM90."""
+
+    group_name: str
+    ep_rank: int
+    ep_size: int
+    device: torch.device
+    num_local_tokens: int
+    hidden_size: int
+    topk: int
+    schedule_capacity: int
+    x_buffer: torch.Tensor
+    x_buffer_handle: Any
+    x_buffer_ptrs: list[int]
+    x_scale_buffer: torch.Tensor
+    x_scale_buffer_handle: Any
+    x_scale_buffer_ptrs: list[int]
+    combine_buffer: torch.Tensor
+    combine_buffer_handle: Any
+    combine_buffer_ptrs: list[int]
+    routed_x: torch.Tensor
+    routed_x_scale: torch.Tensor
+    m_indices: torch.Tensor
+    all_gather_top_experts_buffer: torch.Tensor
+    all_gather_top_experts_buffer_handle: Any
+    all_gather_top_experts_buffer_multicast_ptr: int
+    barrier_buffer: torch.Tensor
+    barrier_buffer_handle: Any
+    barrier_buffer_ptrs: list[int]
+    barrier_buffer_multicast_ptr: int
+    barrier_target: torch.Tensor
+
+
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
+_FP8_ROUTE_WORKSPACE_CACHE: dict[
+    tuple[str, int, int, int, int, int], MoKFP8RouteWorkspace
+] = {}
 
 
 def validate_workspace_args(
@@ -289,6 +328,215 @@ def create_workspace(
     return workspace
 
 
+def create_fp8_route_workspace(
+    config: MoKConfig,
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    num_local_tokens: int,
+    hidden_size: int,
+    topk: int,
+) -> MoKFP8RouteWorkspace:
+    """Create SM90 storage for production FP8 dispatch and BF16 combine."""
+    validate_workspace_args(
+        config,
+        group,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    device = torch.device("cuda", device_index)
+    if torch.cuda.get_device_capability(device) != (9, 0):
+        raise NotImplementedError("the production FP8 route workspace requires SM90")
+    group_name = group.group_name
+    ep_rank = dist.get_rank(group=group)
+    ep_size = dist.get_world_size(group=group)
+    schedule_capacity_factor = max(
+        2, math.ceil(ep_size * config.schedule_capacity_multiplier)
+    )
+    schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
+
+    local_shape = torch.tensor(
+        [num_local_tokens, hidden_size, topk], dtype=torch.int64, device=device
+    )
+    gathered_shapes = torch.empty(
+        ep_size * local_shape.numel(), dtype=torch.int64, device=device
+    )
+    dist.all_gather_into_tensor(gathered_shapes, local_shape, group=group)
+    gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
+    if not torch.all(gathered_shapes == local_shape).item():
+        raise ValueError(
+            "MoK requires identical token, hidden, and top-k shapes on every EP rank"
+        )
+
+    x_buffer = symm_mem.empty(
+        num_local_tokens,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_buffer_handle = symm_mem.rendezvous(x_buffer, group_name)
+    x_buffer_ptrs = [
+        int(x_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    x_scale_buffer = symm_mem.empty(
+        num_local_tokens,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    x_scale_buffer_handle = symm_mem.rendezvous(x_scale_buffer, group_name)
+    x_scale_buffer_ptrs = [
+        int(x_scale_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    combine_buffer = symm_mem.empty(
+        num_local_tokens * topk,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    combine_buffer_handle = symm_mem.rendezvous(combine_buffer, group_name)
+    combine_buffer_ptrs = [
+        int(combine_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    routed_x = torch.empty(
+        schedule_capacity,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    routed_x_scale = torch.empty(
+        schedule_capacity,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    m_indices = torch.empty(
+        schedule_capacity, dtype=torch.int32, device=device
+    )
+
+    all_gather_top_experts_buffer = symm_mem.empty(
+        ep_size,
+        num_local_tokens,
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    all_gather_top_experts_buffer_handle = symm_mem.rendezvous(
+        all_gather_top_experts_buffer, group_name
+    )
+    all_gather_top_experts_buffer_multicast_ptr = int(
+        all_gather_top_experts_buffer_handle.multicast_ptr
+    )
+
+    barrier_buffer = symm_mem.empty(1, dtype=torch.int32, device=device)
+    barrier_buffer.zero_()
+    barrier_buffer_handle = symm_mem.rendezvous(barrier_buffer, group_name)
+    barrier_buffer_ptrs = [
+        int(barrier_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+    barrier_buffer_multicast_ptr = int(barrier_buffer_handle.multicast_ptr)
+    barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
+
+    dist.barrier(
+        group=group, async_op=True, device_ids=[device_index]
+    ).block_current_stream()
+
+    return MoKFP8RouteWorkspace(
+        group_name=group_name,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        schedule_capacity=schedule_capacity,
+        x_buffer=x_buffer,
+        x_buffer_handle=x_buffer_handle,
+        x_buffer_ptrs=x_buffer_ptrs,
+        x_scale_buffer=x_scale_buffer,
+        x_scale_buffer_handle=x_scale_buffer_handle,
+        x_scale_buffer_ptrs=x_scale_buffer_ptrs,
+        combine_buffer=combine_buffer,
+        combine_buffer_handle=combine_buffer_handle,
+        combine_buffer_ptrs=combine_buffer_ptrs,
+        routed_x=routed_x,
+        routed_x_scale=routed_x_scale,
+        m_indices=m_indices,
+        all_gather_top_experts_buffer=all_gather_top_experts_buffer,
+        all_gather_top_experts_buffer_handle=all_gather_top_experts_buffer_handle,
+        all_gather_top_experts_buffer_multicast_ptr=(
+            all_gather_top_experts_buffer_multicast_ptr
+        ),
+        barrier_buffer=barrier_buffer,
+        barrier_buffer_handle=barrier_buffer_handle,
+        barrier_buffer_ptrs=barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr=barrier_buffer_multicast_ptr,
+        barrier_target=barrier_target,
+    )
+
+
+def get_fp8_route_workspace(
+    config: MoKConfig,
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    num_local_tokens: int,
+    hidden_size: int,
+    topk: int,
+) -> MoKFP8RouteWorkspace:
+    """Return a cached production FP8 route workspace."""
+    validate_workspace_args(
+        config,
+        group,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    ep_size = dist.get_world_size(group=group)
+    schedule_capacity_factor = max(
+        2, math.ceil(ep_size * config.schedule_capacity_multiplier)
+    )
+    cache_key = (
+        group.group_name,
+        device_index,
+        num_local_tokens,
+        hidden_size,
+        topk,
+        schedule_capacity_factor,
+    )
+    cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
+    if cached_workspace is not None:
+        return cached_workspace
+
+    workspace = create_fp8_route_workspace(
+        config,
+        group,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    _FP8_ROUTE_WORKSPACE_CACHE[cache_key] = workspace
+    return workspace
+
+
 def get_workspace(
     config: MoKConfig,
     group: dist.ProcessGroup,
@@ -352,15 +600,19 @@ def clear_workspace_cache() -> None:
     Outputs:
         None
     """
-    for workspace in _WORKSPACE_CACHE.values():
+    workspaces = list(_WORKSPACE_CACHE.values()) + list(
+        _FP8_ROUTE_WORKSPACE_CACHE.values()
+    )
+    for workspace in workspaces:
         barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                     workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
         torch.cuda.synchronize(workspace.device)
     _WORKSPACE_CACHE.clear()
+    _FP8_ROUTE_WORKSPACE_CACHE.clear()
 
 
 def build_schedule(
-    workspace: MoKWorkspace,
+    workspace: MoKWorkspace | MoKFP8RouteWorkspace,
     config: MoKConfig,
     top_experts: torch.Tensor,
     *,
@@ -377,8 +629,8 @@ def build_schedule(
     Outputs:
         schedule: MoKSchedule
     """
-    if not isinstance(workspace, MoKWorkspace):
-        raise TypeError("workspace must be a MoKWorkspace")
+    if not isinstance(workspace, (MoKWorkspace, MoKFP8RouteWorkspace)):
+        raise TypeError("workspace must be a MoK workspace")
     if not isinstance(config, MoKConfig):
         raise TypeError("config must be a MoKConfig")
     device_properties = torch.cuda.get_device_properties(workspace.device)
@@ -436,6 +688,111 @@ def build_schedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
     )
+
+
+def dispatch_fp8_block(
+    workspace: MoKFP8RouteWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy and dispatch production FP8/K128 activations on the current stream."""
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    expected_x_shape = (workspace.num_local_tokens, workspace.hidden_size)
+    if (
+        not x.is_cuda
+        or x.device != workspace.device
+        or x.dtype != torch.float8_e4m3fn
+        or not x.is_contiguous()
+        or tuple(x.shape) != expected_x_shape
+    ):
+        raise ValueError(
+            "x must be contiguous CUDA float8_e4m3fn with shape "
+            f"{expected_x_shape}"
+        )
+    expected_scale_shape = (
+        workspace.num_local_tokens,
+        workspace.hidden_size // 128,
+    )
+    if (
+        not x_scale.is_cuda
+        or x_scale.device != workspace.device
+        or x_scale.dtype != torch.float32
+        or not x_scale.is_contiguous()
+        or tuple(x_scale.shape) != expected_scale_shape
+    ):
+        raise ValueError(
+            "x_scale must be contiguous CUDA float32 with shape "
+            f"{expected_scale_shape}"
+        )
+
+    workspace.x_buffer.copy_(x)
+    workspace.x_scale_buffer.copy_(x_scale)
+    barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+    )
+    fp8_block_routed_dispatch_out(
+        workspace.x_buffer,
+        workspace.x_buffer_ptrs,
+        workspace.x_scale_buffer,
+        workspace.x_scale_buffer_ptrs,
+        workspace.routed_x,
+        workspace.routed_x_scale,
+        workspace.m_indices,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        workspace.topk,
+    )
+    return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
+
+
+def combine_fp8_block(
+    workspace: MoKFP8RouteWorkspace,
+    schedule: MoKSchedule,
+    routed_y: torch.Tensor,
+) -> torch.Tensor:
+    """Combine BF16 routed rows and wait until all peer writes are visible."""
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    expected_shape = (workspace.schedule_capacity, workspace.hidden_size)
+    if (
+        not routed_y.is_cuda
+        or routed_y.device != workspace.device
+        or routed_y.dtype != torch.bfloat16
+        or not routed_y.is_contiguous()
+        or tuple(routed_y.shape) != expected_shape
+    ):
+        raise ValueError(
+            "routed_y must be contiguous CUDA bfloat16 with shape "
+            f"{expected_shape}"
+        )
+
+    fp8_block_routed_combine_out(
+        routed_y,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        workspace.topk,
+    )
+    barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_ptrs,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+    )
+    return workspace.combine_buffer
 
 
 def validate_inputs(

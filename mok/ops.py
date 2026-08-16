@@ -4,12 +4,11 @@ from . import _C
 
 
 def _sm90_reject(op_name: str) -> None:
-    """SM90 port supports only the BF16 forward path; fail fast at the public
-    API for everything else (codex review: env opt-in alone is not a gate)."""
+    """Fail fast for SM90 operations that have not been ported."""
     import torch
     if torch.cuda.get_device_capability() == (9, 0):
         raise NotImplementedError(
-            f"MoK SM90 port: {op_name} is not supported (BF16 forward only)")
+            f"MoK SM90 port: {op_name} is not supported")
 
 
 
@@ -159,6 +158,235 @@ def schedule(
         raise ValueError("rank must be an integer in [0, ep_size)")
 
     return _C.schedule(topk_all, num_local_experts, schedule_capacity, rank)
+
+
+def _validate_pointer_list(pointers: list[int], name: str) -> None:
+    if not isinstance(pointers, list) or any(
+        type(pointer) is not int or pointer <= 0 for pointer in pointers
+    ):
+        raise TypeError(f"{name} must be a list of positive integers")
+    if len(pointers) not in (4, 8, 16, 32, 64):
+        raise ValueError(f"{name} length must be one of 4, 8, 16, 32, 64")
+
+
+def _validate_fp8_route_schedule(
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    schedule_capacity: int,
+) -> None:
+    for name, tensor in (
+        ("schedule_peer_rank", schedule_peer_rank),
+        ("schedule_peer_token_idx", schedule_peer_token_idx),
+        ("num_tokens", num_tokens),
+    ):
+        if not tensor.is_cuda or tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must be a CUDA int32 tensor")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if tuple(schedule_peer_rank.shape) != (schedule_capacity,):
+        raise ValueError(
+            "schedule_peer_rank must have shape (schedule_capacity,)"
+        )
+    if tuple(schedule_peer_token_idx.shape) != (schedule_capacity,):
+        raise ValueError(
+            "schedule_peer_token_idx must have shape (schedule_capacity,)"
+        )
+    if tuple(num_tokens.shape) != (1,):
+        raise ValueError("num_tokens must have shape (1,)")
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_routed_dispatch_out",
+    mutates_args=("routed_x", "routed_x_scale", "m_indices"),
+)
+def fp8_block_routed_dispatch_out(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    x_scale: torch.Tensor,
+    x_scale_ptrs: list[int],
+    routed_x: torch.Tensor,
+    routed_x_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    topk: int,
+) -> None:
+    """Dispatch production FP8/K128 rows into an expert-major buffer."""
+    if x.ndim != 2 or not x.is_cuda or not x.is_contiguous():
+        raise ValueError("x must be contiguous CUDA [num_local_tokens, hidden_size]")
+    if x.dtype != torch.float8_e4m3fn:
+        raise TypeError("x must use torch.float8_e4m3fn")
+    num_local_tokens, hidden_size = x.shape
+    if num_local_tokens <= 0 or hidden_size < 128 or hidden_size % 128 != 0:
+        raise ValueError("x dimensions must be positive and hidden_size K128 aligned")
+    expected_scale_shape = (num_local_tokens, hidden_size // 128)
+    if (
+        not x_scale.is_cuda
+        or x_scale.dtype != torch.float32
+        or not x_scale.is_contiguous()
+        or tuple(x_scale.shape) != expected_scale_shape
+    ):
+        raise ValueError(
+            f"x_scale must be contiguous CUDA float32 {expected_scale_shape}"
+        )
+    if routed_x.ndim != 2 or routed_x.shape[1] != hidden_size:
+        raise ValueError("routed_x must have shape (schedule_capacity, hidden_size)")
+    schedule_capacity = routed_x.shape[0]
+    if schedule_capacity <= 0 or schedule_capacity % 256 != 0:
+        raise ValueError("schedule_capacity must be positive and divisible by 256")
+    if (
+        not routed_x.is_cuda
+        or routed_x.dtype != torch.float8_e4m3fn
+        or not routed_x.is_contiguous()
+    ):
+        raise ValueError("routed_x must be contiguous CUDA float8_e4m3fn")
+    expected_routed_scale_shape = (schedule_capacity, hidden_size // 128)
+    if (
+        not routed_x_scale.is_cuda
+        or routed_x_scale.dtype != torch.float32
+        or not routed_x_scale.is_contiguous()
+        or tuple(routed_x_scale.shape) != expected_routed_scale_shape
+    ):
+        raise ValueError(
+            "routed_x_scale must be contiguous CUDA float32 "
+            f"{expected_routed_scale_shape}"
+        )
+    if (
+        not m_indices.is_cuda
+        or m_indices.dtype != torch.int32
+        or not m_indices.is_contiguous()
+        or tuple(m_indices.shape) != (schedule_capacity,)
+    ):
+        raise ValueError(
+            "m_indices must be contiguous CUDA int32 [schedule_capacity]"
+        )
+    if (
+        not tokens_per_expert.is_cuda
+        or tokens_per_expert.dtype != torch.int32
+        or not tokens_per_expert.is_contiguous()
+        or tokens_per_expert.ndim != 1
+        or tokens_per_expert.numel() == 0
+    ):
+        raise ValueError("tokens_per_expert must be a nonempty CUDA int32 vector")
+    if type(topk) is not int or not 0 < topk <= 255:
+        raise ValueError("topk must be an integer in [1, 255]")
+    _validate_pointer_list(x_ptrs, "x_ptrs")
+    _validate_pointer_list(x_scale_ptrs, "x_scale_ptrs")
+    if len(x_ptrs) != len(x_scale_ptrs):
+        raise ValueError("x_ptrs and x_scale_ptrs must have equal length")
+    _validate_fp8_route_schedule(
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        schedule_capacity,
+    )
+    tensors = (
+        x_scale,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+    )
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("all local FP8 dispatch tensors must share one device")
+    if torch.cuda.get_device_capability(x.device) != (9, 0):
+        raise NotImplementedError("FP8 routed dispatch currently requires SM90")
+    if not hasattr(_C, "fp8_block_routed_dispatch_out"):
+        raise RuntimeError("the loaded MoK extension lacks FP8 routed dispatch")
+
+    _C.fp8_block_routed_dispatch_out(
+        x,
+        x_ptrs,
+        x_scale,
+        x_scale_ptrs,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+        topk,
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_routed_combine_out",
+    mutates_args=("combine_buffer",),
+)
+def fp8_block_routed_combine_out(
+    routed_y: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_buffer_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk: int,
+) -> None:
+    """Return routed BF16 rows to their source rank and route slot."""
+    if routed_y.ndim != 2 or not routed_y.is_cuda or not routed_y.is_contiguous():
+        raise ValueError("routed_y must be contiguous CUDA [capacity, hidden_size]")
+    if routed_y.dtype != torch.bfloat16:
+        raise TypeError("routed_y must use torch.bfloat16")
+    schedule_capacity, hidden_size = routed_y.shape
+    if (
+        schedule_capacity <= 0
+        or schedule_capacity % 256 != 0
+        or hidden_size < 128
+        or hidden_size % 128 != 0
+    ):
+        raise ValueError("routed_y must have M256 capacity and K128 hidden size")
+    if (
+        combine_buffer.ndim != 2
+        or not combine_buffer.is_cuda
+        or combine_buffer.dtype != torch.bfloat16
+        or not combine_buffer.is_contiguous()
+        or combine_buffer.shape[1] != hidden_size
+    ):
+        raise ValueError(
+            "combine_buffer must be contiguous CUDA bfloat16 [T*topk,H]"
+        )
+    if (
+        type(topk) is not int
+        or not 0 < topk <= 255
+        or combine_buffer.shape[0] % topk != 0
+    ):
+        raise ValueError("topk must divide combine_buffer rows and be in [1,255]")
+    _validate_pointer_list(combine_buffer_ptrs, "combine_buffer_ptrs")
+    _validate_fp8_route_schedule(
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        schedule_capacity,
+    )
+    tensors = (
+        combine_buffer,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+    )
+    if any(tensor.device != routed_y.device for tensor in tensors):
+        raise ValueError("all local FP8 combine tensors must share one device")
+    if torch.cuda.get_device_capability(routed_y.device) != (9, 0):
+        raise NotImplementedError("FP8 routed combine currently requires SM90")
+    if not hasattr(_C, "fp8_block_routed_combine_out"):
+        raise RuntimeError("the loaded MoK extension lacks FP8 routed combine")
+
+    _C.fp8_block_routed_combine_out(
+        routed_y,
+        combine_buffer,
+        combine_buffer_ptrs,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        topk,
+    )
 
 
 @torch.library.custom_op(

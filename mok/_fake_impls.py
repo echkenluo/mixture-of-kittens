@@ -42,6 +42,37 @@ def _schedule_fake(
     )
 
 
+@torch.library.register_fake("mok::fp8_block_routed_dispatch_out")
+def _fp8_block_routed_dispatch_out_fake(
+    x: torch.Tensor,
+    x_ptrs: list[int],
+    x_scale: torch.Tensor,
+    x_scale_ptrs: list[int],
+    routed_x: torch.Tensor,
+    routed_x_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    topk: int,
+) -> None:
+    return None
+
+
+@torch.library.register_fake("mok::fp8_block_routed_combine_out")
+def _fp8_block_routed_combine_out_fake(
+    routed_y: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_buffer_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk: int,
+) -> None:
+    return None
+
+
 @torch.library.register_fake("mok::mxfp8_quantize")
 def _mxfp8_quantize_fake(
     x_bf16: torch.Tensor,
