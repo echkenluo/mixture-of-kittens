@@ -11,6 +11,12 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "sm90_fp8_block_test"), (
         "SM90 build did not register sm90_fp8_block_test"
     )
+    assert hasattr(_C, "sm90_fp8_block_grouped_test"), (
+        "SM90 build did not register sm90_fp8_block_grouped_test"
+    )
+    assert hasattr(_C, "sm90_fp8_block_grouped_pipelined_test"), (
+        "SM90 build did not register sm90_fp8_block_grouped_pipelined_test"
+    )
 
 
 @pytest.mark.parametrize("is_ab", [True, False], ids=["AB", "ABt"])
@@ -136,3 +142,112 @@ def test_sm90_fp8_block_rejects_invalid_inputs(
         _C.sm90_fp8_block_test(a, b, a_scale, b_scale.view(1, 1))
     with pytest.raises(RuntimeError, match="float32"):
         _C.sm90_fp8_block_test(a, b, a_scale.bfloat16(), b_scale)
+
+
+@pytest.mark.parametrize(
+    ("experts", "max_m", "n", "k", "valid_rows"),
+    [
+        (2, 128, 256, 256, (64, 128)),
+        (2, 64, 128, 4096, (64, 32)),
+    ],
+)
+@pytest.mark.parametrize(
+    "impl_name",
+    [
+        "sm90_fp8_block_grouped_test",
+        "sm90_fp8_block_grouped_pipelined_test",
+    ],
+    ids=["sync", "cpasync-2stage"],
+)
+def test_sm90_fp8_block_grouped_numeric(
+    context: tuple[int, int, torch.device],
+    experts: int,
+    max_m: int,
+    n: int,
+    k: int,
+    valid_rows: tuple[int, ...],
+    impl_name: str,
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+    generator = torch.Generator(device=device).manual_seed(
+        20260817 + 100 * rank + k
+    )
+    k_blocks = k // 128
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        a = torch.randn(
+            (experts, max_m, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        b = torch.randn(
+            (experts, n, k), generator=generator, device=device
+        ).clamp(-3, 3).to(torch.float8_e4m3fn)
+        a_scale = torch.rand(
+            (experts, max_m, k_blocks), generator=generator, device=device
+        ) * 0.09 + 0.01
+        b_scale = torch.rand(
+            (experts, n // 128, k_blocks), generator=generator, device=device
+        ) * 0.09 + 0.01
+        masked_m = torch.tensor(valid_rows, dtype=torch.int32, device=device)
+
+        actual = getattr(_C, impl_name)(
+            a, b, a_scale, b_scale, masked_m
+        )
+        references = []
+        actuals = []
+        for expert, rows in enumerate(valid_rows):
+            reference = torch.zeros(
+                (rows, n), device=device, dtype=torch.float32
+            )
+            for kb in range(k_blocks):
+                sl = slice(kb * 128, (kb + 1) * 128)
+                partial = a[expert, :rows, sl].float() @ b[expert, :, sl].float().T
+                weight_scale = b_scale[expert, :, kb].repeat_interleave(128)
+                reference.add_(
+                    partial * a_scale[expert, :rows, kb, None] * weight_scale
+                )
+            references.append(reference.to(torch.bfloat16))
+            actuals.append(actual[expert, :rows])
+    stream.synchronize()
+
+    actual_valid = torch.cat(actuals)
+    reference_valid = torch.cat(references)
+    assert actual.dtype == torch.bfloat16
+    assert actual.shape == (experts, max_m, n)
+    assert torch.isfinite(actual_valid).all()
+    abs_error = (actual_valid.float() - reference_valid.float()).abs()
+    max_rel = abs_error.max() / reference_valid.float().abs().max().clamp_min(1e-6)
+    assert max_rel.item() < 0.025, f"max_rel={max_rel.item():.6f}"
+
+
+def test_sm90_fp8_block_grouped_rejects_invalid_inputs(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, _, device = context
+    require_sm90(device)
+    a = torch.ones((2, 64, 128), device=device).to(torch.float8_e4m3fn)
+    b = torch.ones((2, 128, 128), device=device).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((2, 64, 1), device=device)
+    b_scale = torch.ones((2, 1, 1), device=device)
+    masked_m = torch.tensor((64, 32), dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError, match="expert/K dimensions must match"):
+        _C.sm90_fp8_block_grouped_test(
+            a, b[:1], a_scale, b_scale, masked_m
+        )
+    with pytest.raises(RuntimeError, match="max_m must"):
+        _C.sm90_fp8_block_grouped_test(
+            a[:, :32].contiguous(),
+            b,
+            a_scale[:, :32].contiguous(),
+            b_scale,
+            masked_m,
+        )
+    with pytest.raises(RuntimeError, match="B_scale must have shape"):
+        _C.sm90_fp8_block_grouped_test(
+            a, b, a_scale, b_scale[:, :, :0], masked_m
+        )
+    with pytest.raises(RuntimeError, match="masked_m must be int32"):
+        _C.sm90_fp8_block_grouped_test(
+            a, b, a_scale, b_scale, masked_m.to(torch.int64)
+        )
