@@ -1115,11 +1115,23 @@ def gemm_combine_fused_fp8_block(
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
     out = output if output is not None else workspace.output
-    if release_lease and output is None:
-        raise ValueError(
-            "release_lease=True requires a caller-owned output tensor: the "
-            "workspace may be overwritten by a new acquirer after release"
-        )
+    if release_lease:
+        ref = workspace.output
+        if (
+            output is None
+            or output.shape != ref.shape
+            or output.dtype != ref.dtype
+            or output.device != ref.device
+            or not output.is_contiguous()
+            or output.untyped_storage().data_ptr()
+            == ref.untyped_storage().data_ptr()
+        ):
+            raise ValueError(
+                "release_lease=True requires a caller-owned output tensor "
+                "(matching shape/dtype/device, contiguous, NOT aliasing "
+                "workspace storage): the workspace may be overwritten by a "
+                "new acquirer after release"
+            )
     workspace.down_ready.zero_()
     workspace.epilogue_done.zero_()
     fp8_block_gemm_combine_fused_out(
