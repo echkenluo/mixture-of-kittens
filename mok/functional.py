@@ -1091,12 +1091,16 @@ def gemm_combine_fused_fp8_block(
     routed_y: torch.Tensor,
     topk_weights: torch.Tensor,
     release_lease: bool = False,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Down GEMM, last-arriver combine push, fused arrive, waiting epilogue.
 
     Leased-mode sub-entry.  release_lease=True is set only by the
     orchestrator that owns the lease and ends its pipeline here: the
     epilogue's last-finishing CTA then performs the owner-qualified release.
+    When releasing in-pipeline, pass a caller-owned ``output`` tensor so the
+    result does not live in the workspace after the lease is gone (a later
+    acquirer may overwrite workspace state before the caller reads it).
 
     Replaces the dynamic down GEMM + precleared combine_reduce pair.  The
     GEMM CTA that completes each M64 block last pushes the block's rows to
@@ -1110,6 +1114,12 @@ def gemm_combine_fused_fp8_block(
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
+    out = output if output is not None else workspace.output
+    if release_lease and output is None:
+        raise ValueError(
+            "release_lease=True requires a caller-owned output tensor: the "
+            "workspace may be overwritten by a new acquirer after release"
+        )
     workspace.down_ready.zero_()
     workspace.epilogue_done.zero_()
     fp8_block_gemm_combine_fused_out(
@@ -1134,7 +1144,7 @@ def gemm_combine_fused_fp8_block(
     routed_epilogue_fused_out(
         workspace.combine_buffer,
         topk_weights,
-        workspace.output,
+        out,
         workspace.barrier_buffer,
         workspace.barrier_expected_scratch,
         workspace.in_use,
@@ -1143,7 +1153,7 @@ def gemm_combine_fused_fp8_block(
         workspace.ep_rank,
         do_release=1 if release_lease else 0,
     )
-    return workspace.output
+    return out
 
 
 def combine_fp8_block(
