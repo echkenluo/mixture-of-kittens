@@ -14,9 +14,20 @@ it as its own non-zero exit).  Any timeout, missing record, or wrong field
 is a non-zero exit of this driver.
 """
 
+import os
 import re
 import subprocess
 import sys
+
+# Children run in script mode, where sys.path[0] is tests/ rather than the
+# repo root -- put the root on PYTHONPATH so `from mok import ...` resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CHILD_ENV = dict(
+    os.environ,
+    PYTHONPATH=_REPO_ROOT
+    + os.pathsep
+    + os.environ.get("PYTHONPATH", ""),
+)
 
 CASES = (
     ("reentrant", [sys.executable, "tests/_trap_case.py", "reentrant"],
@@ -42,7 +53,8 @@ def main() -> int:
     for name, cmd, want_code, want_site, want_rc in CASES:
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=600
+                cmd, capture_output=True, text=True, timeout=600,
+                env=_CHILD_ENV,
             )
         except subprocess.TimeoutExpired:
             print(f"TRAP_GATE|case={name}|verdict=TIMEOUT_HANG", flush=True)
