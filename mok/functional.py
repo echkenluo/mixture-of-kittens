@@ -143,6 +143,10 @@ class MoKFP8RouteWorkspace:
     input_expected_scratch: torch.Tensor    # (1,) int32, fused dispatch wait
     tile_ready: torch.Tensor  # (capacity/64,) int32 producer->consumer count
     down_ready: torch.Tensor  # (capacity/64,) int32 down-GEMM tile count
+    ticket_counter: torch.Tensor  # (1,) int32, K1 worker-queue head
+    worker_ticket: torch.Tensor   # (1024,) int32, per-cluster publish slots
+    trap_record: torch.Tensor     # (8,) int64 host-mapped pinned; alloc-zeroed
+    trap_record_ptr: int          # device-usable address of trap_record
 
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
@@ -520,6 +524,14 @@ def create_fp8_route_workspace(
     down_ready = torch.zeros(
         schedule_capacity // 64, dtype=torch.int32, device=device
     )
+    ticket_counter = torch.zeros(1, dtype=torch.int32, device=device)
+    worker_ticket = torch.zeros(1024, dtype=torch.int32, device=device)
+    # Host-mapped pinned trap record: readable by the CPU after a device
+    # trap poisons the context (no CUDA call needed).  Zeroed here only --
+    # never in the per-iteration prepare phase, so a competing call's
+    # first-writer record survives for post-mortem.
+    trap_record = torch.zeros(8, dtype=torch.int64).pin_memory()
+    trap_record_ptr = trap_record.data_ptr()
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -570,6 +582,10 @@ def create_fp8_route_workspace(
         input_expected_scratch=input_expected_scratch,
         tile_ready=tile_ready,
         down_ready=down_ready,
+        ticket_counter=ticket_counter,
+        worker_ticket=worker_ticket,
+        trap_record=trap_record,
+        trap_record_ptr=trap_record_ptr,
     )
 
 
@@ -932,6 +948,7 @@ def dispatch_gemm_fused_fp8_block(
     weight_scale: torch.Tensor,
     gate_up: torch.Tensor,
     copy_clusters: int = 8,
+    forced_worker_clusters: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
 
@@ -983,6 +1000,9 @@ def dispatch_gemm_fused_fp8_block(
     # which is what keeps CUDA graph replay valid with no host counters.
     workspace.input_expected_scratch.zero_()
     workspace.tile_ready.zero_()
+    # Iteration state only: trap_record and (future lease state) are never
+    # cleared here -- see the K1 redesign's zeroing contract.
+    workspace.ticket_counter.zero_()
     # Publish the symmetric input copies; they precede the fused kernel on
     # the stream, so its first-CTA arrive covers them.
     workspace.x_buffer.copy_(x)
@@ -1008,7 +1028,12 @@ def dispatch_gemm_fused_fp8_block(
         weight,
         weight_scale,
         gate_up,
-        copy_clusters,
+        ep_rank=workspace.ep_rank,
+        ticket_counter=workspace.ticket_counter,
+        worker_ticket=workspace.worker_ticket,
+        trap_record_ptr=workspace.trap_record_ptr,
+        copy_clusters=copy_clusters,
+        forced_worker_clusters=forced_worker_clusters,
     )
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
 

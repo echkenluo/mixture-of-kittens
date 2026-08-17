@@ -1,20 +1,27 @@
 #pragma once
 
 // MoK-form producer/consumer fusion, first cut: pull dispatch and the gate/up
-// contiguous grouped GEMM run inside ONE persistent kernel.  The leading
-// clusters are communication CTAs (grid-stride pull of routed rows plus the
-// input-publish barrier that used to be a separate kernel); the remaining
-// clusters are the unchanged cluster-2 TMA GEMM, except each M64 tile first
-// spins on a per-tile ready counter and therefore starts as soon as its own
-// 64 rows have landed -- data flows, no dispatch/GEMM kernel boundary, no
-// global wait.  GPU0's clock skew then delays only the tiles that contain its
-// rows instead of the whole layer.
+// contiguous grouped GEMM run inside ONE kernel, fed by a device-side ticket
+// queue over a fixed resident-worker-cluster grid.
 //
-// Deadlock safety: communication clusters occupy the front of the grid so the
-// first wave resident on the SMs always contains every producer; consumer
-// spins use nanosleep backoff.  All ready/expected slots are zeroed by the
-// dispatch-preparation phase of the same iteration, which keeps CUDA graph
-// replay valid with no host-side counters.
+// Scheduling safety (structural, does not depend on block scheduling order):
+// every worker cluster draws strictly increasing tickets from a global
+// counter, and the first `copy_clusters` tickets are copy tasks by
+// construction.  Whatever subset of workers the scheduler makes resident
+// first, the earliest-drawn tickets are copy work, so any GEMM ticket can
+// only be drawn after every copy ticket has been claimed by an already
+// resident, progressing cluster.  A GEMM tile spin therefore never waits on
+// a producer that is not resident.  Cross-rank liveness (the input-publish
+// barrier at the head of every copy task) is an SPMD precondition: rank
+// launch failure is terminated by the timeout traps below, not reasoned
+// away.  See k1-resident-worker-redesign-20260817.md for the full proof.
+//
+// Ticket protocol per cluster (lockstep): CTA rank 0 thread 0 draws the
+// ticket and publishes it to a per-cluster global slot; a cluster barrier
+// (release/acquire) makes it visible; both CTAs then enter the same task
+// kind, finish, and hit the boundary barrier before the next draw.  GEMM
+// pipeline phase bits persist across tasks (megakernel pattern) so the
+// mbarrier semaphores are initialized exactly once.
 #if defined(KITTENS_SM90)
 
 #include "sm90_fp8_block_routed.cuh"
@@ -30,6 +37,19 @@ using fp8_block_test::acc_rt;
 
 constexpr int THREADS = 128;
 constexpr int MAX_LOCAL_EXPERTS = 256;  // smem expert-segment cache bound
+
+// Trap protocol (host-mapped pinned record, 8 x u64):
+//   [0] owner/error_code (CAS from 0)  [1] site_id  [2] slot or m_tile
+//   [3] expected  [4] observed  [5] ep_rank  [6] ticket  [7] iter_count
+// Only the CAS winner writes [1..7], fences to the host, and traps; losers
+// park forever without touching the workspace and die with the kernel.
+constexpr unsigned long long ERR_TIMEOUT = 1;
+constexpr unsigned long long ERR_CONTRACT = 2;
+constexpr unsigned long long SITE_K1_INPUT_SCRATCH = 1;
+constexpr unsigned long long SITE_K1_BARRIER_FLAG = 2;
+constexpr unsigned long long SITE_K1_TILE_READY = 3;
+constexpr unsigned long long SITE_K1_CONTRACT = 6;
+constexpr unsigned long long SPIN_TRAP_ITERS = 1ull << 28;
 
 struct globals {
     // --- GEMM (consumer) side, contiguous contract.  The gl layouts have no
@@ -56,7 +76,7 @@ struct globals {
     int topk;
     int num_local_experts;
     int schedule_capacity;
-    int copy_clusters;  // communication clusters at the front of the grid
+    int copy_clusters;  // C_cluster: number of copy tickets
     // input-publish barrier (absorbs the pre-dispatch barrier kernel)
     unsigned int *barrier_flag;
     unsigned int *barrier_target;
@@ -69,15 +89,49 @@ struct globals {
     int n;
     int k_blocks;
     int n_tiles;
+    // --- resident-worker ticket queue ---
+    unsigned int *ticket_counter;   // [1], zeroed each iteration
+    unsigned int *worker_ticket;    // [>= worker clusters], publish slots
+    unsigned long long *trap_record;  // host-mapped pinned, never zeroed here
+    int total_tickets;              // copy_clusters + m_tiles * (n_tiles/2)
+    int ep_rank;                    // for trap records only
 };
 
-__device__ __forceinline__ void copy_role(const globals &g) {
-    const int copy_cta_count = g.copy_clusters * 2;
-    const int copy_cta_idx = blockIdx.x;
+__device__ __forceinline__ void park_forever() {
+    while (true) __nanosleep(1u << 20);
+}
 
-    // Absorbed input barrier: the first CTA arrives for this rank (its
-    // x_buffer copy precedes this kernel on the stream) and publishes the
-    // expected flag value; every communication CTA then waits for all ranks.
+// Winner commits the full record and aborts the kernel; losers park so the
+// winner's [1..7] stores and system fence cannot be cut short.
+__device__ __noinline__ void trap_commit(
+    const globals &g, unsigned long long code, unsigned long long site,
+    unsigned long long slot, unsigned long long expected,
+    unsigned long long observed, unsigned long long ticket,
+    unsigned long long iters) {
+    const unsigned long long prev =
+        atomicCAS(g.trap_record, 0ull, code);
+    if (prev != 0ull) park_forever();
+    g.trap_record[1] = site;
+    g.trap_record[2] = slot;
+    g.trap_record[3] = expected;
+    g.trap_record[4] = observed;
+    g.trap_record[5] = static_cast<unsigned long long>(g.ep_rank);
+    g.trap_record[6] = ticket;
+    g.trap_record[7] = iters;
+    __threadfence_system();
+    __trap();
+}
+
+__device__ __forceinline__ void copy_task(const globals &g, unsigned int ticket,
+                                          int cta_rank) {
+    const int copy_cta_count = g.copy_clusters * 2;
+    const int copy_cta_idx = static_cast<int>(ticket) * 2 + cta_rank;
+
+    // Absorbed input barrier: ticket 0's rank-0 CTA arrives for this rank
+    // BEFORE entering any wait (its x_buffer copy precedes this kernel on
+    // the stream) and publishes the expected flag value; every copy task
+    // then waits for all ranks.  The arrive-before-wait order is what the
+    // cross-rank liveness precondition in the header rests on.
     if (copy_cta_idx == 0 && threadIdx.x == 0) {
         const unsigned int expected =
             atomicAdd(g.barrier_target, static_cast<unsigned int>(g.ep_size))
@@ -90,26 +144,37 @@ __device__ __forceinline__ void copy_role(const globals &g) {
     }
     if (threadIdx.x == 0) {
         unsigned int expected;
+        unsigned long long iters = 0;
         do {
             asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
                          : "=r"(expected)
                          : "l"(g.input_expected_scratch) : "memory");
-            if (expected == 0u) __nanosleep(128);
-        } while (expected == 0u);
+            if (expected != 0u) break;
+            __nanosleep(128);
+            if (++iters >= SPIN_TRAP_ITERS)
+                trap_commit(g, ERR_TIMEOUT, SITE_K1_INPUT_SCRATCH,
+                            copy_cta_idx, 1, 0, ticket, iters);
+        } while (true);
         unsigned int value;
+        iters = 0;
         do {
             asm volatile("{ld.relaxed.sys.global.u32 %0, [%1];}"
                          : "=r"(value) : "l"(g.barrier_flag) : "memory");
-            if (value < expected) __nanosleep(128);
-        } while (value < expected);
+            if (value >= expected) break;
+            __nanosleep(128);
+            if (++iters >= SPIN_TRAP_ITERS)
+                trap_commit(g, ERR_TIMEOUT, SITE_K1_BARRIER_FLAG,
+                            copy_cta_idx, expected, value, ticket, iters);
+        } while (true);
         asm volatile("{fence.acquire.sys;}" ::: "memory");
     }
     __syncthreads();
 
-    // Cache the per-expert segment ends once per CTA: the per-row expert
+    // Cache the per-expert segment ends once per task: the per-row expert
     // lookup below then scans shared memory instead of issuing up to
-    // num_local_experts uncached global loads for every row, which was the
-    // dominant serial cost of the first version.
+    // num_local_experts uncached global loads for every row.  The leading
+    // __syncthreads above also orders any previous task's readers before
+    // this rebuild.
     __shared__ int expert_row_end[MAX_LOCAL_EXPERTS];
     if (threadIdx.x == 0) {
         int offset = 0;
@@ -194,9 +259,13 @@ __device__ __forceinline__ void copy_role(const globals &g) {
     }
 }
 
-__device__ __forceinline__ void gemm_role(const globals &g,
-                                          int gemm_cluster_idx) {
-    const int cta_rank = cluster_ctarank();
+__device__ __forceinline__ void gemm_task(
+    const globals &g, int gemm_cluster_idx, int cta_rank,
+    unsigned int ticket, uint32_t &phasebits, uint32_t &ready_phase,
+    a_st (&a_smem)[2], b_st (&b_smem)[2], d_st &d_smem,
+    semaphore (&inputs_arrived)[2], semaphore (&inputs_finished)[2],
+    semaphore (&inputs_ready)[2]) {
+    constexpr int PIPE_DEPTH = 2;
     const int n_pairs = g.n_tiles / 2;
     const int n_tile_base = 2 * (gemm_cluster_idx % n_pairs);
     const int n_tile = n_tile_base + cta_rank;
@@ -210,37 +279,23 @@ __device__ __forceinline__ void gemm_role(const globals &g,
     // expert lookup below is ordered by the acquire spin.
     if (threadIdx.x == 0) {
         unsigned int done;
+        unsigned long long iters = 0;
         do {
             asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
                          : "=r"(done)
                          : "l"(g.tile_ready + m_tile) : "memory");
-            if (done < 64u) __nanosleep(256);
-        } while (done < 64u);
+            if (done >= 64u) break;
+            __nanosleep(256);
+            if (++iters >= SPIN_TRAP_ITERS)
+                trap_commit(g, ERR_TIMEOUT, SITE_K1_TILE_READY,
+                            m_tile, 64, done, ticket, iters);
+        } while (true);
     }
     __syncthreads();
 
     const int expert = g.m_indices[global_row_base];
 
-    extern __shared__ int __shm[];
-    shared_allocator al((int *)&__shm[0]);
-    constexpr int PIPE_DEPTH = 2;
-    auto &a_smem = al.allocate<a_st, PIPE_DEPTH>();
-    auto &b_smem = al.allocate<b_st, PIPE_DEPTH>();
-    d_st &d_smem = al.allocate<d_st>();
-    __shared__ semaphore inputs_arrived[PIPE_DEPTH];
-    __shared__ semaphore inputs_finished[PIPE_DEPTH];
-    __shared__ semaphore inputs_ready[PIPE_DEPTH];
-
-    if (threadIdx.x < PIPE_DEPTH) {
-        init_semaphore(inputs_arrived[threadIdx.x], 0, 1);
-        init_semaphore(inputs_finished[threadIdx.x], 0, 1);
-        init_semaphore(inputs_ready[threadIdx.x], 0, 2);
-    }
-    everyone::tma::cluster::sync();
-
     acc_rt total;
-    uint32_t phasebits = 0xFFFF0000;
-    uint32_t ready_phase = 0;
     if (threadIdx.x == 0) {
         wait(inputs_finished[0], get_phasebit<1>(phasebits, 0));
         update_phasebit<1>(phasebits, 0);
@@ -315,15 +370,71 @@ __device__ __forceinline__ void gemm_role(const globals &g,
     warpgroup::store(d_smem, out);
     warpgroup::sync(0);
     warpgroup::store(g.D, d_smem, {m_tile, n_tile});
+    // Task-boundary drain: the direct global store above is synchronous per
+    // thread; this sync keeps slow storers ahead of the next task's d_smem
+    // writes.  The boundary cluster barrier in the worker loop covers the
+    // cross-CTA side.
+    warpgroup::sync(0);
 }
 
 __cluster_dims__(2, 1, 1) __launch_bounds__(THREADS, 1)
 __global__ void kernel(const __grid_constant__ globals g) {
-    const int cluster_idx = clusterIdx().x;
-    if (cluster_idx < g.copy_clusters)
-        copy_role(g);
-    else
-        gemm_role(g, cluster_idx - g.copy_clusters);
+    const int cta_rank = cluster_ctarank();
+    const int cluster_id = clusterIdx().x;
+
+    // Device-side contract check before the first task: num_tokens is a
+    // device-resident dynamic scalar (graph replay varies it), so the host
+    // binding cannot validate it without breaking capture.  Fail closed.
+    const int nt = g.num_tokens[0];
+    if (nt < 0 || nt > g.schedule_capacity || (nt & 63) != 0) {
+        if (threadIdx.x == 0)
+            trap_commit(g, ERR_CONTRACT, SITE_K1_CONTRACT, 0,
+                        g.schedule_capacity, nt, 0, 0);
+        park_forever();
+    }
+
+    // GEMM pipeline state lives at kernel scope and persists across tasks:
+    // semaphores are initialized exactly once, phase bits carry forward
+    // (megakernel pattern), so per-task reinitialization hazards never
+    // arise.
+    extern __shared__ int __shm[];
+    shared_allocator al((int *)&__shm[0]);
+    constexpr int PIPE_DEPTH = 2;
+    auto &a_smem = al.allocate<a_st, PIPE_DEPTH>();
+    auto &b_smem = al.allocate<b_st, PIPE_DEPTH>();
+    d_st &d_smem = al.allocate<d_st>();
+    __shared__ semaphore inputs_arrived[PIPE_DEPTH];
+    __shared__ semaphore inputs_finished[PIPE_DEPTH];
+    __shared__ semaphore inputs_ready[PIPE_DEPTH];
+    if (threadIdx.x < PIPE_DEPTH) {
+        init_semaphore(inputs_arrived[threadIdx.x], 0, 1);
+        init_semaphore(inputs_finished[threadIdx.x], 0, 1);
+        init_semaphore(inputs_ready[threadIdx.x], 0, 2);
+    }
+    uint32_t phasebits = 0xFFFF0000;
+    uint32_t ready_phase = 0;
+    everyone::tma::cluster::sync();
+
+    // Worker loop: rank-0 thread 0 draws a ticket and publishes it to this
+    // cluster's global slot; the cluster barrier (release/acquire at cluster
+    // scope) makes it visible to the peer CTA; both CTAs execute the same
+    // task and meet at the boundary barrier before the next draw.
+    while (true) {
+        if (cta_rank == 0 && threadIdx.x == 0)
+            g.worker_ticket[cluster_id] = atomicAdd(g.ticket_counter, 1u);
+        everyone::tma::cluster::sync();
+        const unsigned int ticket = g.worker_ticket[cluster_id];
+        if (ticket >= static_cast<unsigned int>(g.total_tickets))
+            break;
+        if (ticket < static_cast<unsigned int>(g.copy_clusters))
+            copy_task(g, ticket, cta_rank);
+        else
+            gemm_task(g, static_cast<int>(ticket) - g.copy_clusters,
+                      cta_rank, ticket, phasebits, ready_phase,
+                      a_smem, b_smem, d_smem,
+                      inputs_arrived, inputs_finished, inputs_ready);
+        everyone::tma::cluster::sync();
+    }
 }
 
 
@@ -339,7 +450,9 @@ inline void entry_out(
     const at::Tensor &barrier_target,
     const at::Tensor &input_expected_scratch, const at::Tensor &tile_ready,
     const at::Tensor &B, const at::Tensor &B_scale, const at::Tensor &D,
-    int64_t copy_clusters) {
+    int64_t copy_clusters, int64_t ep_rank,
+    const at::Tensor &ticket_counter, const at::Tensor &worker_ticket,
+    int64_t trap_record_ptr, int64_t forced_worker_clusters) {
     // Dispatch-side contracts are identical to the split path; reuse them.
     fp8_block_routed::check_pointer_list(x_ptrs, "x_ptrs");
     fp8_block_routed::check_pointer_list(x_scale_ptrs, "x_scale_ptrs");
@@ -378,10 +491,11 @@ inline void entry_out(
                     && routed_x_scale.is_contiguous(),
                 "routed_x_scale must be contiguous float32 [capacity,H/128]");
     for (const at::Tensor *t :
-         {&barrier_buffer, &barrier_target, &input_expected_scratch}) {
+         {&barrier_buffer, &barrier_target, &input_expected_scratch,
+          &ticket_counter}) {
         TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kInt
                         && t->is_contiguous() && t->numel() == 1,
-                    "barrier state tensors must be int32 [1]");
+                    "barrier/queue state tensors must be int32 [1]");
     }
     TORCH_CHECK(barrier_buffer_multicast_ptr > 0,
                 "barrier multicast pointer must be positive");
@@ -410,6 +524,10 @@ inline void entry_out(
                 "D must be contiguous BF16 [capacity,N]");
     TORCH_CHECK(copy_clusters > 0 && copy_clusters <= 32,
                 "copy_clusters must be in [1,32]");
+    TORCH_CHECK(ep_rank >= 0 && ep_rank < (int64_t)x_ptrs.size(),
+                "ep_rank must index the peer list");
+    TORCH_CHECK(trap_record_ptr > 0,
+                "trap_record_ptr must be a mapped pinned address");
     TORCH_CHECK(tokens_per_expert.numel() <= MAX_LOCAL_EXPERTS,
                 "local expert count exceeds the smem segment cache");
     kittens::py::device_check(routed_x, routed_x_scale, m_indices, B, B_scale);
@@ -461,16 +579,59 @@ inline void entry_out(
     g.n_tiles = n / 64;
 
     const int m_tiles = static_cast<int>(schedule_capacity / 64);
-    const int total_ctas =
-        static_cast<int>(copy_clusters) * 2 + m_tiles * g.n_tiles;
+    const int n_pairs = g.n_tiles / 2;
+    const int total_tickets =
+        static_cast<int>(copy_clusters) + m_tiles * n_pairs;
+    g.ticket_counter =
+        reinterpret_cast<unsigned int *>(ticket_counter.data_ptr<int>());
+    g.worker_ticket =
+        reinterpret_cast<unsigned int *>(worker_ticket.data_ptr<int>());
+    g.trap_record =
+        reinterpret_cast<unsigned long long *>(trap_record_ptr);
+    g.total_tickets = total_tickets;
+    g.ep_rank = static_cast<int>(ep_rank);
+
     constexpr int PIPE_DEPTH = 2;
     constexpr int SMEM =
         PIPE_DEPTH * (sizeof(a_st) + sizeof(b_st)) + sizeof(d_st) + 1024;
-    cudaStream_t stream =
-        at::cuda::getCurrentCUDAStream(routed_x.get_device());
     CUDACHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-    kernel<<<total_ctas, THREADS, SMEM, stream>>>(g);
+
+    // Cluster-level occupancy, queried once and cached: it sizes the fixed
+    // worker grid (performance only -- the progress proof holds for any
+    // resident count >= 1) and must run before any graph capture.
+    static int cached_max_clusters = -1;
+    if (cached_max_clusters < 0) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(2, 1, 1);
+        cfg.blockDim = dim3(THREADS, 1, 1);
+        cfg.dynamicSmemBytes = SMEM;
+        cudaLaunchAttribute attr = {};
+        attr.id = cudaLaunchAttributeClusterDimension;
+        attr.val.clusterDim.x = 2;
+        attr.val.clusterDim.y = 1;
+        attr.val.clusterDim.z = 1;
+        cfg.attrs = &attr;
+        cfg.numAttrs = 1;
+        int max_clusters = 0;
+        CUDACHECK(cudaOccupancyMaxActiveClusters(&max_clusters, kernel, &cfg));
+        TORCH_CHECK(max_clusters >= 1,
+                    "K1 worker kernel has zero cluster occupancy");
+        cached_max_clusters = max_clusters;
+    }
+    int workers = forced_worker_clusters > 0
+                      ? static_cast<int>(forced_worker_clusters)
+                      : std::min(cached_max_clusters, total_tickets);
+    if (workers < 1) workers = 1;
+    TORCH_CHECK(worker_ticket.is_cuda()
+                    && worker_ticket.scalar_type() == at::kInt
+                    && worker_ticket.is_contiguous()
+                    && worker_ticket.numel() >= workers,
+                "worker_ticket must be int32 with one slot per worker");
+
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream(routed_x.get_device());
+    kernel<<<workers * 2, THREADS, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());
 }
 

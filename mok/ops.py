@@ -702,6 +702,8 @@ def fp8_block_routed_combine_reduce_fused_out(
         "input_expected_scratch",
         "tile_ready",
         "gate_up",
+        "ticket_counter",
+        "worker_ticket",
     ),
 )
 def fp8_block_dispatch_gemm_fused_out(
@@ -725,9 +727,15 @@ def fp8_block_dispatch_gemm_fused_out(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     gate_up: torch.Tensor,
+    ep_rank: int,
+    ticket_counter: torch.Tensor,
+    worker_ticket: torch.Tensor,
+    trap_record_ptr: int,
     copy_clusters: int = 8,
+    forced_worker_clusters: int = 0,
 ) -> None:
-    """Input barrier, pull dispatch, and gate/up GEMM in one persistent kernel."""
+    """Input barrier, pull dispatch, and gate/up GEMM on a ticket-queue
+    resident-worker grid (scheduling-order independent)."""
     if not hasattr(_C, "fp8_block_dispatch_gemm_fused_out"):
         raise RuntimeError(
             "the loaded MoK extension lacks the fused dispatch+GEMM kernel"
@@ -754,6 +762,11 @@ def fp8_block_dispatch_gemm_fused_out(
         weight_scale,
         gate_up,
         copy_clusters,
+        ep_rank,
+        ticket_counter,
+        worker_ticket,
+        trap_record_ptr,
+        forced_worker_clusters,
     )
 
 
