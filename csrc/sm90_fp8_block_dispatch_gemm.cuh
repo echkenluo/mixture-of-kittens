@@ -24,6 +24,8 @@
 // mbarrier semaphores are initialized exactly once.
 #if defined(KITTENS_SM90)
 
+#include <array>
+
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 
@@ -420,10 +422,21 @@ __global__ void kernel(const __grid_constant__ globals g) {
     // scope) makes it visible to the peer CTA; both CTAs execute the same
     // task and meet at the boundary barrier before the next draw.
     while (true) {
-        if (cta_rank == 0 && threadIdx.x == 0)
-            g.worker_ticket[cluster_id] = atomicAdd(g.ticket_counter, 1u);
+        if (cta_rank == 0 && threadIdx.x == 0) {
+            const unsigned int drawn = atomicAdd(g.ticket_counter, 1u);
+            // Explicit release store with a memory clobber: the cluster
+            // barrier's hardware semantics would suffice, but the inline-PTX
+            // barrier wrapper carries no clobber, so the compiler must be
+            // told not to sink this store past it.
+            asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
+                         "l"(g.worker_ticket + cluster_id), "r"(drawn)
+                         : "memory");
+        }
         everyone::tma::cluster::sync();
-        const unsigned int ticket = g.worker_ticket[cluster_id];
+        unsigned int ticket;
+        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                     : "=r"(ticket)
+                     : "l"(g.worker_ticket + cluster_id) : "memory");
         if (ticket >= static_cast<unsigned int>(g.total_tickets))
             break;
         if (ticket < static_cast<unsigned int>(g.copy_clusters))
@@ -437,6 +450,52 @@ __global__ void kernel(const __grid_constant__ globals g) {
     }
 }
 
+
+// Per-device cluster-occupancy cache.  prewarm() is called at workspace
+// creation (never inside a capture); entry_out fails closed if the cache is
+// cold under an active capture.
+inline int &occupancy_slot(int device_index) {
+    static std::array<int, 64> cache = [] {
+        std::array<int, 64> c{};
+        c.fill(-1);
+        return c;
+    }();
+    return cache.at(static_cast<size_t>(device_index));
+}
+
+inline int occupancy_cache(int device_index) {
+    return occupancy_slot(device_index);
+}
+
+inline int prewarm(int device_index) {
+    constexpr int PIPE_DEPTH = 2;
+    constexpr int SMEM =
+        PIPE_DEPTH * (sizeof(a_st) + sizeof(b_st)) + sizeof(d_st) + 1024;
+    c10::cuda::CUDAGuard guard(device_index);
+    CUDACHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(2, 1, 1);
+    cfg.blockDim = dim3(THREADS, 1, 1);
+    cfg.dynamicSmemBytes = SMEM;
+    cudaLaunchAttribute attr = {};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = 2;
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    int max_clusters = 0;
+    CUDACHECK(cudaOccupancyMaxActiveClusters(&max_clusters, kernel, &cfg));
+    TORCH_CHECK(max_clusters >= 1,
+                "K1 worker kernel has zero cluster occupancy");
+    occupancy_slot(device_index) = max_clusters;
+    return max_clusters;
+}
+
+inline void entry_prewarm() {
+    prewarm(static_cast<int>(c10::cuda::current_device()));
+}
 
 inline void entry_out(
     const at::Tensor &x_buffer, const std::vector<int64_t> &x_ptrs,
@@ -586,42 +645,41 @@ inline void entry_out(
         reinterpret_cast<unsigned int *>(ticket_counter.data_ptr<int>());
     g.worker_ticket =
         reinterpret_cast<unsigned int *>(worker_ticket.data_ptr<int>());
-    g.trap_record =
-        reinterpret_cast<unsigned long long *>(trap_record_ptr);
+    {
+        // Host-mapped pinned record: resolve the actual device-usable
+        // address (UVA usually aliases the host pointer, but a
+        // host-register pinned backend need not).
+        void *dev = nullptr;
+        CUDACHECK(cudaHostGetDevicePointer(
+            &dev, reinterpret_cast<void *>(trap_record_ptr), 0));
+        TORCH_CHECK(dev != nullptr, "trap record host memory is not mapped");
+        g.trap_record = reinterpret_cast<unsigned long long *>(dev);
+    }
     g.total_tickets = total_tickets;
     g.ep_rank = static_cast<int>(ep_rank);
 
     constexpr int PIPE_DEPTH = 2;
     constexpr int SMEM =
         PIPE_DEPTH * (sizeof(a_st) + sizeof(b_st)) + sizeof(d_st) + 1024;
-    CUDACHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
 
-    // Cluster-level occupancy, queried once and cached: it sizes the fixed
-    // worker grid (performance only -- the progress proof holds for any
-    // resident count >= 1) and must run before any graph capture.
-    static int cached_max_clusters = -1;
-    if (cached_max_clusters < 0) {
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = dim3(2, 1, 1);
-        cfg.blockDim = dim3(THREADS, 1, 1);
-        cfg.dynamicSmemBytes = SMEM;
-        cudaLaunchAttribute attr = {};
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim.x = 2;
-        attr.val.clusterDim.y = 1;
-        attr.val.clusterDim.z = 1;
-        cfg.attrs = &attr;
-        cfg.numAttrs = 1;
-        int max_clusters = 0;
-        CUDACHECK(cudaOccupancyMaxActiveClusters(&max_clusters, kernel, &cfg));
-        TORCH_CHECK(max_clusters >= 1,
-                    "K1 worker kernel has zero cluster occupancy");
-        cached_max_clusters = max_clusters;
+    // Per-device cluster occupancy cache, warmed by prewarm() at workspace
+    // creation (before any CUDA graph capture).  Inside a capture the query
+    // itself is illegal, so an un-warmed cache fails closed.
+    const int device_index = routed_x.get_device();
+    int max_clusters = occupancy_cache(device_index);
+    if (max_clusters < 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDACHECK(cudaStreamIsCapturing(
+            at::cuda::getCurrentCUDAStream(device_index), &cap));
+        TORCH_CHECK(cap == cudaStreamCaptureStatusNone,
+                    "K1 occupancy cache not warmed before graph capture; "
+                    "call fp8_block_dispatch_gemm_prewarm at workspace "
+                    "creation");
+        max_clusters = prewarm(device_index);
     }
     int workers = forced_worker_clusters > 0
                       ? static_cast<int>(forced_worker_clusters)
-                      : std::min(cached_max_clusters, total_tickets);
+                      : std::min(max_clusters, total_tickets);
     if (workers < 1) workers = 1;
     TORCH_CHECK(worker_ticket.is_cuda()
                     && worker_ticket.scalar_type() == at::kInt

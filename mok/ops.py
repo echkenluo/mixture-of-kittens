@@ -827,7 +827,8 @@ def fp8_block_gemm_combine_fused_out(
 
 
 @torch.library.custom_op(
-    "mok::routed_epilogue_fused_out", mutates_args=("output",)
+    "mok::routed_epilogue_fused_out",
+    mutates_args=("output", "in_use", "epilogue_done"),
 )
 def routed_epilogue_fused_out(
     combine_buffer: torch.Tensor,
@@ -835,8 +836,13 @@ def routed_epilogue_fused_out(
     output: torch.Tensor,
     barrier_buffer: torch.Tensor,
     barrier_expected_scratch: torch.Tensor,
+    in_use: torch.Tensor,
+    epilogue_done: torch.Tensor,
+    trap_record_ptr: int,
+    ep_rank: int,
 ) -> None:
-    """Routed epilogue whose head spins on the fused-barrier publication."""
+    """Routed epilogue: fused-barrier spin head (timeout-trapped) plus the
+    workspace lease release chain (last CTA releases in_use)."""
     if not hasattr(_C, "routed_epilogue_fused_out"):
         raise RuntimeError(
             "the loaded MoK extension lacks the fused-wait epilogue"
@@ -847,7 +853,42 @@ def routed_epilogue_fused_out(
         output,
         barrier_buffer,
         barrier_expected_scratch,
+        in_use,
+        epilogue_done,
+        trap_record_ptr,
+        ep_rank,
     )
+
+
+def fp8_block_dispatch_gemm_prewarm() -> None:
+    """Warm the K1 per-device occupancy cache (host-only; call at workspace
+    creation, never inside a CUDA graph capture)."""
+    if hasattr(_C, "fp8_block_dispatch_gemm_prewarm"):
+        _C.fp8_block_dispatch_gemm_prewarm()
+
+
+@torch.library.custom_op(
+    "mok::workspace_lease_acquire", mutates_args=("in_use",)
+)
+def workspace_lease_acquire(
+    in_use: torch.Tensor, trap_record_ptr: int, ep_rank: int
+) -> None:
+    """First device operation of an orchestration entry: atom.exch.acquire
+    on in_use; a concurrent holder fail-closes via the REENTRANT trap."""
+    if not hasattr(_C, "mok_workspace_lease_acquire"):
+        raise RuntimeError("the loaded MoK extension lacks the lease kernels")
+    _C.mok_workspace_lease_acquire(in_use, trap_record_ptr, ep_rank)
+
+
+@torch.library.custom_op(
+    "mok::workspace_lease_release", mutates_args=("in_use",)
+)
+def workspace_lease_release(in_use: torch.Tensor) -> None:
+    """Trailing lease release for entries that do not hand the lease to the
+    epilogue release chain."""
+    if not hasattr(_C, "mok_workspace_lease_release"):
+        raise RuntimeError("the loaded MoK extension lacks the lease kernels")
+    _C.mok_workspace_lease_release(in_use)
 
 
 def _validate_fp8_block_grouped_contiguous(

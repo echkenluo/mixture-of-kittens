@@ -62,6 +62,53 @@ struct globals_fwd_epilogue {
     }
 };
 
+// Workspace trap/lease protocol, shared numbering with the K1 kernel
+// (sm90_fp8_block_dispatch_gemm.cuh): eight u64 slots in host-mapped pinned
+// memory, slot[0] is owner-cum-error-code (CAS from 0), only the CAS winner
+// writes slots [1..7], fences to the host and traps; losers park so the
+// winner's record cannot be cut short.
+constexpr unsigned long long MOK_ERR_TIMEOUT = 1;
+constexpr unsigned long long MOK_ERR_REENTRANT = 3;
+constexpr unsigned long long MOK_SITE_EPI_SCRATCH = 4;
+constexpr unsigned long long MOK_SITE_EPI_BARRIER = 5;
+constexpr unsigned long long MOK_SITE_LEASE = 7;
+constexpr unsigned long long MOK_SPIN_TRAP_ITERS = 1ull << 28;
+
+static __device__ __forceinline__ void mok_park_forever() {
+    while (true) __nanosleep(1u << 20);
+}
+
+static __device__ __noinline__ void mok_trap_commit(
+    unsigned long long *record, unsigned long long code,
+    unsigned long long site, unsigned long long slot,
+    unsigned long long expected, unsigned long long observed,
+    unsigned long long ep_rank, unsigned long long ticket,
+    unsigned long long iters) {
+    const unsigned long long prev = atomicCAS(record, 0ull, code);
+    if (prev != 0ull) mok_park_forever();
+    record[1] = site;
+    record[2] = slot;
+    record[3] = expected;
+    record[4] = observed;
+    record[5] = ep_rank;
+    record[6] = ticket;
+    record[7] = iters;
+    __threadfence_system();
+    __trap();
+}
+
+// Resolve a host-mapped pinned allocation's device-usable address.  UVA
+// usually makes it identical to the host pointer, but PyTorch's pinned
+// allocator may use a host-register backend where it is not -- always ask.
+static inline unsigned long long *mok_resolve_trap_record(int64_t host_ptr) {
+    TORCH_CHECK(host_ptr != 0, "trap record pointer must be non-null");
+    void *dev = nullptr;
+    CUDACHECK(cudaHostGetDevicePointer(
+        &dev, reinterpret_cast<void *>(host_ptr), 0));
+    TORCH_CHECK(dev != nullptr, "trap record host memory is not mapped");
+    return reinterpret_cast<unsigned long long *>(dev);
+}
+
 struct globals_routed_epilogue {
     static constexpr int Nb = 1024;
     static constexpr int TOKENS_PER_CTA = 2;
@@ -78,6 +125,14 @@ struct globals_routed_epilogue {
     // until every rank's arrive lands on the local barrier flag.
     const unsigned int *barrier_flag;
     const unsigned int *barrier_expected_scratch;
+    // Workspace lease release chain (null when this call does not own the
+    // lease): every CTA joins an acq_rel completion count after its own
+    // store drain; the last one releases in_use.  Trap state for the two
+    // spins above (timeouts engage only when trap_record is non-null).
+    unsigned int *in_use;
+    unsigned int *epilogue_done;
+    unsigned long long *trap_record;
+    int ep_rank;
 
     __host__ inline dim3 grid() const {
         const int col_blocks = (output.cols() + Nb - 1) / Nb;
@@ -99,16 +154,30 @@ static __device__ __forceinline__ void routed_epilogue_barrier_wait(
         return;
     if (threadIdx.x == 0) {
         unsigned int expected;
+        unsigned long long iters = 0;
         do {
             asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
                          : "=r"(expected)
                          : "l"(g.barrier_expected_scratch) : "memory");
-        } while (expected == 0u);
+            if (expected != 0u) break;
+            __nanosleep(128);
+            if (g.trap_record != nullptr && ++iters >= MOK_SPIN_TRAP_ITERS)
+                mok_trap_commit(g.trap_record, MOK_ERR_TIMEOUT,
+                                MOK_SITE_EPI_SCRATCH, blockIdx.x, 1, 0,
+                                g.ep_rank, 0, iters);
+        } while (true);
         unsigned int value;
+        iters = 0;
         do {
             asm volatile("{ld.relaxed.sys.global.u32 %0, [%1];}"
                          : "=r"(value) : "l"(g.barrier_flag) : "memory");
-        } while (value < expected);
+            if (value >= expected) break;
+            __nanosleep(128);
+            if (g.trap_record != nullptr && ++iters >= MOK_SPIN_TRAP_ITERS)
+                mok_trap_commit(g.trap_record, MOK_ERR_TIMEOUT,
+                                MOK_SITE_EPI_BARRIER, blockIdx.x, expected,
+                                value, g.ep_rank, 0, iters);
+        } while (true);
         asm volatile("{fence.acquire.sys;}" ::: "memory");
     }
     __syncthreads();
@@ -261,6 +330,72 @@ static __device__ __forceinline__ void routed_epilogue_kernel(
                 {first_token_idx + stage, col_block_idx}
             );
     }
+
+    // Workspace lease release: each CTA drains its own async stores, then
+    // joins an acq_rel RMW chain on epilogue_done -- every add acquires the
+    // previous CTA's release, so old == gridDim.x-1 uniquely identifies the
+    // last finisher AND carries a happens-before over all CTAs' drains; its
+    // release-store of in_use=0 hands the workspace to the next acquirer
+    // (which reads it with atom.exch.acquire).
+    if (g.epilogue_done != nullptr) {
+        tma::store_async_wait();
+        __syncthreads();
+        if (tid == 0) {
+            unsigned int old;
+            asm volatile("{atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;}"
+                         : "=r"(old) : "l"(g.epilogue_done) : "memory");
+            if (old == gridDim.x - 1)
+                asm volatile("{st.release.gpu.global.u32 [%0], 0;}" ::
+                             "l"(g.in_use) : "memory");
+        }
+    }
+}
+
+// Workspace lease endpoints.  Acquire is the FIRST device operation of any
+// orchestration entry (before any workspace clear/copy): atom.exch.acquire
+// on in_use; a non-zero prior value means a concurrent call is inside the
+// workspace -- fail closed via the trap protocol (REENTRANT).  Release is
+// the trailing endpoint for entries that do not hand the lease to the
+// epilogue chain above.
+__global__ void workspace_lease_acquire_kernel(
+    unsigned int *in_use, unsigned long long *trap_record, int ep_rank) {
+    unsigned int prev;
+    asm volatile("{atom.acquire.gpu.global.exch.b32 %0, [%1], 1;}"
+                 : "=r"(prev) : "l"(in_use) : "memory");
+    if (prev != 0u)
+        mok_trap_commit(trap_record, MOK_ERR_REENTRANT, MOK_SITE_LEASE,
+                        0, 0, prev,
+                        static_cast<unsigned long long>(ep_rank), 0, 0);
+}
+
+__global__ void workspace_lease_release_kernel(unsigned int *in_use) {
+    asm volatile("{st.release.gpu.global.u32 [%0], 0;}" ::
+                 "l"(in_use) : "memory");
+}
+
+static __host__ void workspace_lease_acquire(
+    const at::Tensor &in_use, int64_t trap_record_ptr, int64_t ep_rank) {
+    TORCH_CHECK(in_use.is_cuda() && in_use.scalar_type() == at::kInt
+                    && in_use.numel() == 1,
+                "in_use must be int32 [1] on CUDA");
+    unsigned long long *record = mok_resolve_trap_record(trap_record_ptr);
+    c10::cuda::CUDAGuard guard(in_use.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(in_use.get_device());
+    workspace_lease_acquire_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<unsigned int *>(in_use.data_ptr<int>()), record,
+        static_cast<int>(ep_rank));
+    CUDACHECK(cudaGetLastError());
+}
+
+static __host__ void workspace_lease_release(const at::Tensor &in_use) {
+    TORCH_CHECK(in_use.is_cuda() && in_use.scalar_type() == at::kInt
+                    && in_use.numel() == 1,
+                "in_use must be int32 [1] on CUDA");
+    c10::cuda::CUDAGuard guard(in_use.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(in_use.get_device());
+    workspace_lease_release_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<unsigned int *>(in_use.data_ptr<int>()));
+    CUDACHECK(cudaGetLastError());
 }
 
 static __host__ void routed_epilogue_out(
@@ -268,8 +403,14 @@ static __host__ void routed_epilogue_out(
     const at::Tensor &topk_weights,
     const at::Tensor &output,
     const unsigned int *barrier_flag = nullptr,
-    const unsigned int *barrier_expected_scratch = nullptr
+    const unsigned int *barrier_expected_scratch = nullptr,
+    unsigned int *in_use = nullptr,
+    unsigned int *epilogue_done = nullptr,
+    unsigned long long *trap_record = nullptr,
+    int ep_rank = 0
 ) {
+    TORCH_CHECK((in_use == nullptr) == (epilogue_done == nullptr),
+                "lease release needs both in_use and epilogue_done");
     globals_routed_epilogue g {
         .combine_buffer = kittens::py::tensor_to_gl<
             globals_routed_epilogue::activation_gl
@@ -282,6 +423,10 @@ static __host__ void routed_epilogue_out(
         >(output),
         .barrier_flag = barrier_flag,
         .barrier_expected_scratch = barrier_expected_scratch,
+        .in_use = in_use,
+        .epilogue_done = epilogue_done,
+        .trap_record = trap_record,
+        .ep_rank = ep_rank,
     };
     kittens::py::launch_kernel<
         config_fwd_epilogue,

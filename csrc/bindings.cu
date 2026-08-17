@@ -209,17 +209,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("routed_epilogue_fused_out",
           [](const at::Tensor &combine_buffer, const at::Tensor &topk_weights,
              const at::Tensor &output, const at::Tensor &barrier_buffer,
-             const at::Tensor &barrier_expected_scratch) {
+             const at::Tensor &barrier_expected_scratch,
+             const at::Tensor &in_use, const at::Tensor &epilogue_done,
+             int64_t trap_record_ptr, int64_t ep_rank) {
               utils::routed_epilogue_out(
                   combine_buffer, topk_weights, output,
                   reinterpret_cast<const unsigned int *>(
                       barrier_buffer.data_ptr<int>()),
                   reinterpret_cast<const unsigned int *>(
-                      barrier_expected_scratch.data_ptr<int>()));
+                      barrier_expected_scratch.data_ptr<int>()),
+                  reinterpret_cast<unsigned int *>(in_use.data_ptr<int>()),
+                  reinterpret_cast<unsigned int *>(
+                      epilogue_done.data_ptr<int>()),
+                  utils::mok_resolve_trap_record(trap_record_ptr),
+                  static_cast<int>(ep_rank));
           },
           "", pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
           pybind11::arg("output"), pybind11::arg("barrier_buffer"),
-          pybind11::arg("barrier_expected_scratch"));
+          pybind11::arg("barrier_expected_scratch"),
+          pybind11::arg("in_use"), pybind11::arg("epilogue_done"),
+          pybind11::arg("trap_record_ptr"), pybind11::arg("ep_rank"));
+    m.def("mok_workspace_lease_acquire", &utils::workspace_lease_acquire, "",
+          pybind11::arg("in_use"), pybind11::arg("trap_record_ptr"),
+          pybind11::arg("ep_rank"));
+    m.def("mok_workspace_lease_release", &utils::workspace_lease_release, "",
+          pybind11::arg("in_use"));
+    m.def("fp8_block_dispatch_gemm_prewarm",
+          &mok_sm90::fp8_block_dispatch_gemm::entry_prewarm, "");
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

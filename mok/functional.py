@@ -25,9 +25,12 @@ from .ops import (
     fp8_block_routed_dispatch_copy_out,
     fp8_block_routed_dispatch_out,
     fwd_epilogue,
+    fp8_block_dispatch_gemm_prewarm,
     routed_epilogue_fused_out,
     routed_epilogue_out,
     schedule,
+    workspace_lease_acquire,
+    workspace_lease_release,
 )
 
 
@@ -146,7 +149,9 @@ class MoKFP8RouteWorkspace:
     ticket_counter: torch.Tensor  # (1,) int32, K1 worker-queue head
     worker_ticket: torch.Tensor   # (1024,) int32, per-cluster publish slots
     trap_record: torch.Tensor     # (8,) int64 host-mapped pinned; alloc-zeroed
-    trap_record_ptr: int          # device-usable address of trap_record
+    trap_record_ptr: int          # host address; device ptr resolved in C++
+    in_use: torch.Tensor          # (1,) int32 production lease guard
+    epilogue_done: torch.Tensor   # (1,) int32 release completion counter
 
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
@@ -532,6 +537,11 @@ def create_fp8_route_workspace(
     # first-writer record survives for post-mortem.
     trap_record = torch.zeros(8, dtype=torch.int64).pin_memory()
     trap_record_ptr = trap_record.data_ptr()
+    in_use = torch.zeros(1, dtype=torch.int32, device=device)
+    epilogue_done = torch.zeros(1, dtype=torch.int32, device=device)
+    # Warm the K1 per-device occupancy cache while we are guaranteed to be
+    # outside any CUDA graph capture.
+    fp8_block_dispatch_gemm_prewarm()
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -586,6 +596,8 @@ def create_fp8_route_workspace(
         worker_ticket=worker_ticket,
         trap_record=trap_record,
         trap_record_ptr=trap_record_ptr,
+        in_use=in_use,
+        epilogue_done=epilogue_done,
     )
 
 
@@ -697,6 +709,32 @@ def get_workspace(
     )
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace
+
+
+def acquire_workspace_lease(workspace: MoKFP8RouteWorkspace) -> None:
+    """Explicit lease acquire for orchestrators that span multiple entries."""
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
+
+
+def release_workspace_lease(workspace: MoKFP8RouteWorkspace) -> None:
+    """Explicit trailing lease release (counterpart of acquire above)."""
+    workspace_lease_release(workspace.in_use)
+
+
+def format_trap_record(workspace: MoKFP8RouteWorkspace) -> str | None:
+    """Post-mortem reader: call AFTER a CUDA API returned an error, and do
+    not issue further CUDA calls first -- the record lives in host-mapped
+    pinned memory precisely so this read needs no working context.  Returns
+    None when no trap fired."""
+    rec = workspace.trap_record.tolist()
+    if rec[0] == 0:
+        return None
+    return (
+        "MOK_TRAP|code=%d|site=%d|slot=%d|expected=%d|observed=%d"
+        "|rank=%d|ticket=%d|iters=%d" % tuple(rec)
+    )
 
 
 def clear_workspace_cache() -> None:
@@ -907,6 +945,11 @@ def dispatch_fp8_block(
     routed_x = workspace.routed_x[:active_rows]
     routed_x_scale = workspace.routed_x_scale[:active_rows]
     m_indices = workspace.m_indices[:active_rows]
+    # Workspace lease: first device operation of this entry (split path
+    # self-closes with the trailing release below).
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
     if prepare_combine:
         # The fused dispatch barrier runs after this clear and after publishing
         # the symmetric input buffers.  It therefore also proves that every
@@ -936,6 +979,7 @@ def dispatch_fp8_block(
         schedule.tokens_per_expert,
         workspace.topk,
     )
+    workspace_lease_release(workspace.in_use)
     return routed_x, routed_x_scale, m_indices
 
 
@@ -949,8 +993,13 @@ def dispatch_gemm_fused_fp8_block(
     gate_up: torch.Tensor,
     copy_clusters: int = 8,
     forced_worker_clusters: int = 0,
+    hold_lease: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
+
+    Lease ownership: hold_lease=False (standalone/unit-test use) self-closes
+    with a trailing release kernel; hold_lease=True (full pipeline) keeps the
+    lease held for the epilogue release chain in gemm_combine_fused.
 
     Strict-contract producer/consumer fusion: communication CTAs pull routed
     rows and publish per-M64-tile ready counters, GEMM CTAs start each tile as
@@ -990,6 +1039,12 @@ def dispatch_gemm_fused_fp8_block(
             f"{expected_scale_shape}"
         )
 
+    # Workspace lease: the acquire kernel is the FIRST device operation of
+    # this call -- a concurrent holder traps (REENTRANT) before any clear or
+    # copy below can touch shared state.
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
     # Same iteration-preparation contract as dispatch_fp8_block with
     # prepare_combine=True: the fused kernel's in-kernel input barrier also
     # proves every rank finished these clears before peer stores begin.
@@ -1035,6 +1090,8 @@ def dispatch_gemm_fused_fp8_block(
         copy_clusters=copy_clusters,
         forced_worker_clusters=forced_worker_clusters,
     )
+    if not hold_lease:
+        workspace_lease_release(workspace.in_use)
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
 
 
@@ -1063,6 +1120,7 @@ def gemm_combine_fused_fp8_block(
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
     workspace.down_ready.zero_()
+    workspace.epilogue_done.zero_()
     fp8_block_gemm_combine_fused_out(
         down_input,
         down_input_scale,
@@ -1088,6 +1146,10 @@ def gemm_combine_fused_fp8_block(
         workspace.output,
         workspace.barrier_buffer,
         workspace.barrier_expected_scratch,
+        workspace.in_use,
+        workspace.epilogue_done,
+        workspace.trap_record_ptr,
+        workspace.ep_rank,
     )
     return workspace.output
 
