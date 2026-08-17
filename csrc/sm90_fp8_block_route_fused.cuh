@@ -164,7 +164,8 @@ inline void combine_reduce_out(
     const at::Tensor &barrier_buffer,
     const std::vector<int64_t> &barrier_buffer_ptrs,
     int64_t barrier_buffer_multicast_ptr,
-    const at::Tensor &barrier_target, int64_t topk) {
+    const at::Tensor &barrier_target, int64_t topk,
+    bool combine_precleared) {
     TORCH_CHECK(topk > 0 && topk <= 255, "topk must be in [1,255]");
     TORCH_CHECK(
         output.dim() == 2 && output.is_cuda()
@@ -201,14 +202,16 @@ inline void combine_reduce_out(
 
     c10::cuda::CUDAGuard device_guard(output.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(output.get_device());
-    CUDACHECK(cudaMemsetAsync(
-        combine_buffer.data_ptr(), 0,
-        static_cast<size_t>(combine_buffer.numel()
-                            * combine_buffer.element_size()),
-        stream));
-    utils::barrier_all::entrypoint(
-        barrier_buffer, barrier_buffer_ptrs,
-        barrier_buffer_multicast_ptr, barrier_target);
+    if (!combine_precleared) {
+        CUDACHECK(cudaMemsetAsync(
+            combine_buffer.data_ptr(), 0,
+            static_cast<size_t>(combine_buffer.numel()
+                                * combine_buffer.element_size()),
+            stream));
+        utils::barrier_all::entrypoint(
+            barrier_buffer, barrier_buffer_ptrs,
+            barrier_buffer_multicast_ptr, barrier_target);
+    }
     if (routed_y.size(0) != 0) {
         mok_sm90::fp8_block_routed::combine_out(
             routed_y, combine_buffer, combine_buffer_ptrs,

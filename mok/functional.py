@@ -807,6 +807,7 @@ def dispatch_fp8_block(
     x_scale: torch.Tensor,
     *,
     trim_to_active_rows: bool = False,
+    prepare_combine: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Copy and dispatch production FP8/K128 activations on the current stream.
 
@@ -847,6 +848,8 @@ def dispatch_fp8_block(
         )
     if type(trim_to_active_rows) is not bool:
         raise TypeError("trim_to_active_rows must be a bool")
+    if type(prepare_combine) is not bool:
+        raise TypeError("prepare_combine must be a bool")
     active_rows = (
         int(schedule.num_tokens.item())
         if trim_to_active_rows
@@ -865,6 +868,11 @@ def dispatch_fp8_block(
     routed_x = workspace.routed_x[:active_rows]
     routed_x_scale = workspace.routed_x_scale[:active_rows]
     m_indices = workspace.m_indices[:active_rows]
+    if prepare_combine:
+        # The fused dispatch barrier runs after this clear and after publishing
+        # the symmetric input buffers.  It therefore also proves that every
+        # destination is clear before any later peer combine stores begin.
+        workspace.combine_buffer.zero_()
     fp8_block_routed_dispatch_copy_out(
         x,
         workspace.x_buffer,
@@ -1020,12 +1028,22 @@ def combine_reduce_fp8_block_routes(
     schedule: MoKSchedule,
     routed_y: torch.Tensor,
     topk_weights: torch.Tensor,
+    *,
+    combine_precleared: bool = False,
 ) -> torch.Tensor:
-    """Combine remote BF16 rows and reduce route slots in one host call."""
+    """Combine remote BF16 rows and reduce route slots in one host call.
+
+    ``combine_precleared`` is valid only after the matching dispatch used
+    ``prepare_combine=True`` on every rank.  That lets dispatch's existing
+    peer barrier cover the early clear and removes the later pre-combine
+    barrier from the critical path.
+    """
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
+    if type(combine_precleared) is not bool:
+        raise TypeError("combine_precleared must be a bool")
     expected_weights_shape = (workspace.num_local_tokens, workspace.topk)
     if (
         not routed_y.is_cuda
@@ -1070,6 +1088,7 @@ def combine_reduce_fp8_block_routes(
         workspace.barrier_buffer_multicast_ptr,
         workspace.barrier_target,
         workspace.topk,
+        combine_precleared,
     )
     return workspace.output
 

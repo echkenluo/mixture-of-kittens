@@ -280,6 +280,40 @@ def test_sm90_fp8_block_routed_dispatch_combine(
     )
     assert not fused_mismatches.any().item()
 
+    # Clear the destination before dispatch so that dispatch's existing peer
+    # barrier also establishes combine-buffer readiness.  The prepared
+    # combine path must produce the same result without its old first barrier.
+    workspace.combine_buffer.fill_(float("nan"))
+    functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=active_only,
+        prepare_combine=True,
+    )
+    prepared_output = functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        routed_y,
+        torch.ones(
+            (num_local_tokens, topk), dtype=torch.float32, device=device
+        ),
+        combine_precleared=True,
+    )
+    prepared_mismatches = torch.tensor(
+        [int((prepared_output != expected_combine).sum())],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(prepared_mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"ROUTED_PREPARED_MISMATCH|rank={rank}|values="
+        f"{prepared_mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not prepared_mismatches.any().item()
+
 
 @pytest.mark.parametrize("num_local_tokens", [256, 512])
 def test_sm90_fp8_block_empty_routes(
@@ -354,6 +388,15 @@ def test_sm90_fp8_block_empty_routes(
     assert not combine_buffer.any().item()
     assert not output.any().item()
 
+    workspace.combine_buffer.fill_(float("nan"))
+    functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=True,
+        prepare_combine=True,
+    )
     fused_output = functional.combine_reduce_fp8_block_routes(
         workspace,
         schedule,
@@ -361,6 +404,7 @@ def test_sm90_fp8_block_empty_routes(
         torch.zeros(
             (num_local_tokens, topk), dtype=torch.float32, device=device
         ),
+        combine_precleared=True,
     )
     torch.cuda.synchronize(device)
     assert not fused_output.any().item()

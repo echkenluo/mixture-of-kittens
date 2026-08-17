@@ -160,7 +160,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("output"), pybind11::arg("barrier_buffer"),
           pybind11::arg("barrier_buffer_ptrs"),
           pybind11::arg("barrier_buffer_multicast_ptr"),
-          pybind11::arg("barrier_target"), pybind11::arg("topk"));
+          pybind11::arg("barrier_target"), pybind11::arg("topk"),
+          pybind11::arg("combine_precleared") = false);
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

@@ -609,8 +609,11 @@ def fp8_block_routed_combine_reduce_out(
     barrier_buffer_multicast_ptr: int,
     barrier_target: torch.Tensor,
     topk: int,
+    combine_precleared: bool = False,
 ) -> None:
-    """Clear, combine, synchronize, and reduce routed rows in one call."""
+    """Combine, synchronize, and reduce, optionally reusing an earlier clear."""
+    if type(combine_precleared) is not bool:
+        raise TypeError("combine_precleared must be a bool")
     if not hasattr(_C, "fp8_block_routed_combine_reduce_out"):
         raise RuntimeError("the loaded MoK extension lacks fused FP8 combine")
     _C.fp8_block_routed_combine_reduce_out(
@@ -627,6 +630,7 @@ def fp8_block_routed_combine_reduce_out(
         barrier_buffer_multicast_ptr,
         barrier_target,
         topk,
+        combine_precleared,
     )
 
 
