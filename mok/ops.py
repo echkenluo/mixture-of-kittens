@@ -704,6 +704,7 @@ def fp8_block_routed_combine_reduce_fused_out(
         "gate_up",
         "ticket_counter",
         "worker_ticket",
+        "ticket_visit",
     ),
 )
 def fp8_block_dispatch_gemm_fused_out(
@@ -731,10 +732,12 @@ def fp8_block_dispatch_gemm_fused_out(
     ticket_counter: torch.Tensor,
     worker_ticket: torch.Tensor,
     trap_record_ptr: int,
+    ticket_visit: torch.Tensor,
     copy_clusters: int = 8,
     forced_worker_clusters: int = 0,
     delay_ticket0_cycles: int = 0,
     spin_trap_iters: int = 0,
+    record_visits: int = 0,
 ) -> None:
     """Input barrier, pull dispatch, and gate/up GEMM on a ticket-queue
     resident-worker grid (scheduling-order independent)."""
@@ -771,6 +774,8 @@ def fp8_block_dispatch_gemm_fused_out(
         forced_worker_clusters,
         delay_ticket0_cycles,
         spin_trap_iters,
+        ticket_visit,
+        record_visits,
     )
 
 
@@ -866,11 +871,13 @@ def routed_epilogue_fused_out(
     )
 
 
-def fp8_block_dispatch_gemm_prewarm(device_index: int) -> None:
+def fp8_block_dispatch_gemm_prewarm(device_index: int) -> int:
     """Warm the K1 occupancy cache for the given device (host-only; call at
-    workspace creation, never inside a CUDA graph capture)."""
+    workspace creation, never inside a CUDA graph capture).  Returns the
+    cudaOccupancyMaxActiveClusters value for the acceptance record."""
     if hasattr(_C, "fp8_block_dispatch_gemm_prewarm"):
-        _C.fp8_block_dispatch_gemm_prewarm(device_index)
+        return int(_C.fp8_block_dispatch_gemm_prewarm(device_index))
+    return -1
 
 
 @torch.library.custom_op(

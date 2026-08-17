@@ -100,6 +100,8 @@ struct globals {
     // Stage-C debug knobs (0 = off / default in production):
     unsigned long long delay_ticket0_cycles;  // busy-wait after ticket-0 draw
     unsigned long long spin_trap_iters;       // spin timeout override
+    unsigned int *ticket_visit;    // [>= total_tickets] when record_visits
+    int record_visits;             // exactly-once debug counting
 };
 
 __device__ __forceinline__ void park_forever() {
@@ -449,6 +451,8 @@ __global__ void kernel(const __grid_constant__ globals g) {
                      : "l"(g.worker_ticket + cluster_id) : "memory");
         if (ticket >= static_cast<unsigned int>(g.total_tickets))
             break;
+        if (g.record_visits && cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(g.ticket_visit + ticket, 1u);
         // Stage-C injection: hold the resident ticket-0 producer for a
         // bounded busy-wait AFTER claiming its ticket and BEFORE the
         // arrive/copy, exercising the resident-but-slow-producer path.
@@ -514,8 +518,8 @@ inline int prewarm(int device_index) {
     return max_clusters;
 }
 
-inline void entry_prewarm(int64_t device_index) {
-    prewarm(static_cast<int>(device_index));
+inline int64_t entry_prewarm(int64_t device_index) {
+    return static_cast<int64_t>(prewarm(static_cast<int>(device_index)));
 }
 
 inline void entry_out(
@@ -533,7 +537,8 @@ inline void entry_out(
     int64_t copy_clusters, int64_t ep_rank,
     const at::Tensor &ticket_counter, const at::Tensor &worker_ticket,
     int64_t trap_record_ptr, int64_t forced_worker_clusters,
-    int64_t delay_ticket0_cycles, int64_t spin_trap_iters) {
+    int64_t delay_ticket0_cycles, int64_t spin_trap_iters,
+    const at::Tensor &ticket_visit, int64_t record_visits) {
     // Dispatch-side contracts are identical to the split path; reuse them.
     fp8_block_routed::check_pointer_list(x_ptrs, "x_ptrs");
     fp8_block_routed::check_pointer_list(x_scale_ptrs, "x_scale_ptrs");
@@ -684,6 +689,14 @@ inline void entry_out(
     g.spin_trap_iters = spin_trap_iters > 0
                             ? static_cast<unsigned long long>(spin_trap_iters)
                             : SPIN_TRAP_ITERS;
+    TORCH_CHECK(record_visits == 0
+                    || (ticket_visit.is_cuda()
+                        && ticket_visit.scalar_type() == at::kInt
+                        && ticket_visit.numel() >= total_tickets),
+                "ticket_visit must be int32 with one slot per ticket");
+    g.ticket_visit =
+        reinterpret_cast<unsigned int *>(ticket_visit.data_ptr<int>());
+    g.record_visits = static_cast<int>(record_visits);
 
     constexpr int PIPE_DEPTH = 2;
     constexpr int SMEM =

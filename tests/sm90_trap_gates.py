@@ -35,17 +35,38 @@ _CHILD_ENV = dict(
 # input-publish scratch (site 1) or barrier flag (site 2) that ticket 0
 # publishes, while GEMM workers wait on tile_ready (site 3) -- any K1
 # timeout site is a valid outcome of this injection.
+def _fields_reentrant(m):
+    # observed = prior lease value (1), rank as passed to the case.
+    return int(m[4]) == 1 and int(m[5]) == 3
+
+
+def _fields_contract(m):
+    # expected = capacity (2048), observed = injected num_tokens (65).
+    return (
+        int(m[3]) == 2048 and int(m[4]) == 65
+        and 0 <= int(m[5]) < 4 and int(m[6]) == 0 and int(m[7]) == 0
+    )
+
+
+def _fields_timeout(m):
+    # iters = the injected spin limit, rank within the 4-rank world.
+    return int(m[7]) == 200_000 and 0 <= int(m[5]) < 4
+
+
+# (name, cmd, code, accepted sites, rc, repeats, per-field validator).  The
+# contract case repeats 3x as the multi-CTA CAS-race stress: every worker's
+# thread 0 races the two-phase claim on each run.
 CASES = (
     ("reentrant", [sys.executable, "tests/_trap_case.py", "reentrant"],
-     3, (7,), 70),
+     3, (7,), 70, 1, _fields_reentrant),
     ("contract",
      [sys.executable, "-m", "torch.distributed.run", "--standalone",
       "--nproc-per-node=4", "tests/_trap_case.py", "contract"],
-     2, (6,), None),
+     2, (6,), None, 3, _fields_contract),
     ("timeout",
      [sys.executable, "-m", "torch.distributed.run", "--standalone",
       "--nproc-per-node=4", "tests/_trap_case.py", "timeout"],
-     1, (1, 2, 3), None),
+     1, (1, 2, 3), None, 1, _fields_timeout),
 )
 
 PATTERN = re.compile(
@@ -56,7 +77,8 @@ PATTERN = re.compile(
 
 def main() -> int:
     failures = []
-    for name, cmd, want_code, want_sites, want_rc in CASES:
+    for name, cmd, want_code, want_sites, want_rc, repeats, checker in CASES:
+      for attempt in range(repeats):
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=600,
@@ -70,6 +92,7 @@ def main() -> int:
         matches = PATTERN.findall(out)
         ok_record = any(
             int(m[0]) == want_code and int(m[1]) in want_sites
+            and checker(m)
             for m in matches
         )
         ok_rc = (

@@ -540,8 +540,16 @@ def create_fp8_route_workspace(
     in_use = torch.zeros(1, dtype=torch.int32, device=device)
     epilogue_done = torch.zeros(1, dtype=torch.int32, device=device)
     # Warm the K1 occupancy cache for THIS workspace's device while we are
-    # guaranteed to be outside any CUDA graph capture.
-    fp8_block_dispatch_gemm_prewarm(epilogue_done.device.index)
+    # guaranteed to be outside any CUDA graph capture; keep the measured
+    # cluster occupancy for acceptance records.
+    k1_max_clusters = fp8_block_dispatch_gemm_prewarm(
+        epilogue_done.device.index
+    )
+    print(
+        f"MOK_K1_OCCUPANCY|device={epilogue_done.device.index}"
+        f"|max_clusters={k1_max_clusters}",
+        flush=True,
+    )
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -993,6 +1001,8 @@ def dispatch_gemm_fused_fp8_block(
     forced_worker_clusters: int = 0,
     delay_ticket0_cycles: int = 0,
     spin_trap_iters: int = 0,
+    ticket_visit: torch.Tensor | None = None,
+    record_visits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
 
@@ -1081,10 +1091,15 @@ def dispatch_gemm_fused_fp8_block(
         ticket_counter=workspace.ticket_counter,
         worker_ticket=workspace.worker_ticket,
         trap_record_ptr=workspace.trap_record_ptr,
+        ticket_visit=(
+            ticket_visit if ticket_visit is not None
+            else workspace.worker_ticket
+        ),
         copy_clusters=copy_clusters,
         forced_worker_clusters=forced_worker_clusters,
         delay_ticket0_cycles=delay_ticket0_cycles,
         spin_trap_iters=spin_trap_iters,
+        record_visits=record_visits,
     )
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
 

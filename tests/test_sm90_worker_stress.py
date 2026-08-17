@@ -65,6 +65,18 @@ def _build_case(context, route, num_local_tokens=512):
             torch.zeros_like(token_indices),
             (token_indices * 7 + 3) % num_local_experts,
         )
+    elif route == "one_empty":
+        # Nobody routes to the LAST rank: its fused K1 sees num_tokens == 0
+        # (copy tickets do zero rows, every GEMM ticket early-exits, the
+        # input arrive must still fire).
+        destination_ranks = token_indices % (world_size - 1)
+        local_experts = (token_indices % 2).to(torch.int64)
+    elif route == "multi_empty":
+        # Everything piles on rank 0: all other ranks are empty (the
+        # strongest multi-rank-empty case reachable while every token must
+        # route somewhere; an all-rank-empty layer cannot arise upstream).
+        destination_ranks = torch.zeros_like(token_indices)
+        local_experts = (token_indices % 2).to(torch.int64)
     else:  # single_tile: at most one M64 tile of work per destination rank
         keep = token_indices < (64 // world_size) * world_size
         destination_ranks = torch.where(
@@ -179,7 +191,9 @@ def _poison(workspace):
     workspace.m_indices.fill_(-777)
 
 
-@pytest.mark.parametrize("route", ["balanced", "skewed"])
+@pytest.mark.parametrize(
+    "route", ["balanced", "skewed", "one_empty", "multi_empty"]
+)
 @pytest.mark.parametrize("forced", [1, 7, 8, 9, 0], ids=lambda f: f"w{f}")
 def test_k1_worker_sweep(
     context: tuple[int, int, torch.device], route: str, forced: int
@@ -239,6 +253,34 @@ def test_k1_iteration_stress(
     assert not any(values)
 
 
+def test_k1_single_worker_thousand(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """1000 iterations with a single worker cluster: the R < C progression
+    and consecutive multi-task drain path at scenario-frozen volume."""
+    rank, _, device = context
+    ws, schedule, x, x_scale, w, w_scale, refs, dims = _build_case(
+        context, "balanced"
+    )
+    capacity, n, _ = dims
+    gate_up = torch.full(
+        (capacity, n), 101.0, dtype=torch.bfloat16, device=device
+    )
+    worst = torch.zeros(5, dtype=torch.int64, device=device)
+    for _ in range(1000):
+        _poison(ws)
+        gate_up.fill_(101.0)
+        functional.dispatch_gemm_fused_fp8_block(
+            ws, schedule, x, x_scale, w, w_scale, gate_up,
+            copy_clusters=8, forced_worker_clusters=1,
+        )
+        worst = torch.maximum(worst, _fused_mismatch(ws, gate_up, refs, dims))
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    values = worst.cpu().tolist()
+    print(f"K1_W1_1000|rank={rank}|values={values}", flush=True)
+    assert not any(values)
+
+
 def test_k1_delay_ticket0(
     context: tuple[int, int, torch.device],
 ) -> None:
@@ -250,19 +292,98 @@ def test_k1_delay_ticket0(
         context, "balanced"
     )
     capacity, n, _ = dims
-    _poison(ws)
     gate_up = torch.full(
         (capacity, n), 101.0, dtype=torch.bfloat16, device=device
     )
-    functional.dispatch_gemm_fused_fp8_block(
-        ws, schedule, x, x_scale, w, w_scale, gate_up,
-        copy_clusters=8, delay_ticket0_cycles=200_000_000,
-    )
-    mism = _fused_mismatch(ws, gate_up, refs, dims)
-    dist.all_reduce(mism, op=dist.ReduceOp.MAX)
-    values = mism.cpu().tolist()
-    print(f"K1_DELAY|rank={rank}|values={values}", flush=True)
+    worst = torch.zeros(5, dtype=torch.int64, device=device)
+    # One long delay (~0.1s) plus 999 short ones (~2.5ms each): scenario
+    # volume at the frozen 1000 while keeping suite runtime bounded.
+    delays = [200_000_000] + [5_000_000] * 999
+    for delay in delays:
+        _poison(ws)
+        gate_up.fill_(101.0)
+        functional.dispatch_gemm_fused_fp8_block(
+            ws, schedule, x, x_scale, w, w_scale, gate_up,
+            copy_clusters=8, delay_ticket0_cycles=delay,
+        )
+        worst = torch.maximum(worst, _fused_mismatch(ws, gate_up, refs, dims))
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    values = worst.cpu().tolist()
+    print(f"K1_DELAY_1000|rank={rank}|values={values}", flush=True)
     assert not any(values)
+
+
+def test_k1_arrival_skew(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """Cross-rank arrival skew: rank 0 sleeps ~0.1s BEFORE entering K1, so
+    every other rank spins in the input-publish barrier until the straggler
+    arrives; repeated 200x with short skews for volume."""
+    rank, _, device = context
+    ws, schedule, x, x_scale, w, w_scale, refs, dims = _build_case(
+        context, "balanced"
+    )
+    capacity, n, _ = dims
+    gate_up = torch.full(
+        (capacity, n), 101.0, dtype=torch.bfloat16, device=device
+    )
+    worst = torch.zeros(5, dtype=torch.int64, device=device)
+    skews = [200_000_000] + [5_000_000] * 199
+    for skew in skews:
+        _poison(ws)
+        gate_up.fill_(101.0)
+        if rank == 0:
+            torch.cuda._sleep(skew)
+        functional.dispatch_gemm_fused_fp8_block(
+            ws, schedule, x, x_scale, w, w_scale, gate_up, copy_clusters=8
+        )
+        worst = torch.maximum(worst, _fused_mismatch(ws, gate_up, refs, dims))
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    values = worst.cpu().tolist()
+    print(f"K1_ARRIVAL_SKEW|rank={rank}|values={values}", flush=True)
+    assert not any(values)
+
+
+def test_k1_exactly_once_tickets(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """Exactly-once debug gate: every ticket below total_tickets is visited
+    exactly once, none above, across worker counts."""
+    rank, _, device = context
+    ws, schedule, x, x_scale, w, w_scale, refs, dims = _build_case(
+        context, "balanced"
+    )
+    capacity, n, _ = dims
+    m_tiles = capacity // 64
+    n_pairs = (n // 64) // 2
+    total = 8 + m_tiles * n_pairs
+    gate_up = torch.full(
+        (capacity, n), 101.0, dtype=torch.bfloat16, device=device
+    )
+    for forced in (1, 8, 0):
+        visits = torch.zeros(total + 64, dtype=torch.int32, device=device)
+        _poison(ws)
+        gate_up.fill_(101.0)
+        functional.dispatch_gemm_fused_fp8_block(
+            ws, schedule, x, x_scale, w, w_scale, gate_up,
+            copy_clusters=8, forced_worker_clusters=forced,
+            ticket_visit=visits, record_visits=1,
+        )
+        bad = torch.tensor(
+            [
+                int((visits[:total] != 1).sum()),
+                int((visits[total:] != 0).sum()),
+            ],
+            device=device,
+        )
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        values = bad.cpu().tolist()
+        print(
+            f"K1_EXACTLY_ONCE|rank={rank}|forced={forced}|total={total}"
+            f"|values={values}",
+            flush=True,
+        )
+        assert not any(values)
 
 
 def test_k1_graph_replay_stress(
@@ -287,18 +408,26 @@ def test_k1_graph_replay_stress(
     )
     torch.cuda.synchronize(device)
     dist.barrier()
+    # The graph itself poisons, runs the pipeline, computes the mismatch
+    # vector and folds it into a running max -- EVERY replay is checked,
+    # not just the final state (a mid-run corruption later overwritten
+    # cannot hide).
+    worst = torch.zeros(5, dtype=torch.int64, device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        _poison(ws)
+        gate_up.fill_(101.0)
         functional.dispatch_gemm_fused_fp8_block(
             ws, schedule, x, x_scale, w, w_scale, gate_up, copy_clusters=8
         )
+        step = _fused_mismatch(ws, gate_up, refs, dims)
+        torch.maximum(worst, step, out=worst)
     replays = 1000
     for _ in range(replays):
         graph.replay()
     torch.cuda.synchronize(device)
-    mism = _fused_mismatch(ws, gate_up, refs, dims)
-    dist.all_reduce(mism, op=dist.ReduceOp.MAX)
-    values = mism.cpu().tolist()
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    values = worst.cpu().tolist()
     print(
         f"K1_GRAPH_REPLAY|rank={rank}|replays={replays}|values={values}",
         flush=True,
@@ -329,4 +458,56 @@ def test_k1_single_active_tile_tail(
     dist.all_reduce(mism, op=dist.ReduceOp.MAX)
     values = mism.cpu().tolist()
     print(f"K1_SINGLE_TILE|rank={rank}|values={values}", flush=True)
+    assert not any(values)
+
+
+def test_k1_concurrent_workspaces(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """Two independent workspaces on two streams, fused pipelines running
+    concurrently for 1000 iterations: the legal concurrency path (each
+    workspace has its own lease/queue state) stays exact on both."""
+    rank, _, device = context
+    ws_a, sch_a, x_a, xs_a, w_a, wsc_a, refs_a, dims_a = _build_case(
+        context, "balanced"
+    )
+    ws_b, sch_b, x_b, xs_b, w_b, wsc_b, refs_b, dims_b = _build_case(
+        context, "skewed", num_local_tokens=256
+    )
+    assert ws_a is not ws_b
+    cap_a, n_a, _ = dims_a
+    cap_b, n_b, _ = dims_b
+    gate_a = torch.full(
+        (cap_a, n_a), 101.0, dtype=torch.bfloat16, device=device
+    )
+    gate_b = torch.full(
+        (cap_b, n_b), 101.0, dtype=torch.bfloat16, device=device
+    )
+    s1 = torch.cuda.Stream(device=device)
+    s2 = torch.cuda.Stream(device=device)
+    worst = torch.zeros(10, dtype=torch.int64, device=device)
+    for _ in range(1000):
+        _poison(ws_a)
+        _poison(ws_b)
+        gate_a.fill_(101.0)
+        gate_b.fill_(101.0)
+        torch.cuda.synchronize(device)
+        with torch.cuda.stream(s1):
+            functional.dispatch_gemm_fused_fp8_block(
+                ws_a, sch_a, x_a, xs_a, w_a, wsc_a, gate_a, copy_clusters=8
+            )
+        with torch.cuda.stream(s2):
+            functional.dispatch_gemm_fused_fp8_block(
+                ws_b, sch_b, x_b, xs_b, w_b, wsc_b, gate_b, copy_clusters=8
+            )
+        torch.cuda.synchronize(device)
+        worst[:5] = torch.maximum(
+            worst[:5], _fused_mismatch(ws_a, gate_a, refs_a, dims_a)
+        )
+        worst[5:] = torch.maximum(
+            worst[5:], _fused_mismatch(ws_b, gate_b, refs_b, dims_b)
+        )
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    values = worst.cpu().tolist()
+    print(f"K1_CONCURRENT_WS|rank={rank}|values={values}", flush=True)
     assert not any(values)

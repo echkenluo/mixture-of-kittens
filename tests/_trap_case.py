@@ -33,9 +33,15 @@ def case_reentrant() -> None:
     torch.cuda.set_device(device)
     in_use = torch.zeros(1, dtype=torch.int32, device=device)
     record = torch.zeros(8, dtype=torch.int64).pin_memory()
-    ops.workspace_lease_acquire(in_use, record.data_ptr(), 3)
-    # Second acquire on the held lease: REENTRANT trap, fail closed.
-    ops.workspace_lease_acquire(in_use, record.data_ptr(), 3)
+    # Concurrent contention: the first acquire holds the lease on stream A;
+    # a SECOND stream races its own acquire with no release in between --
+    # the cross-stream loser must fail closed with the REENTRANT trap.
+    stream_a = torch.cuda.Stream(device=device)
+    stream_b = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream_a):
+        ops.workspace_lease_acquire(in_use, record.data_ptr(), 3)
+    with torch.cuda.stream(stream_b):
+        ops.workspace_lease_acquire(in_use, record.data_ptr(), 3)
     try:
         torch.cuda.synchronize()
     except RuntimeError:
