@@ -103,15 +103,20 @@ __device__ __forceinline__ void park_forever() {
     while (true) __nanosleep(1u << 20);
 }
 
-// Winner commits the full record and aborts the kernel; losers park so the
-// winner's [1..7] stores and system fence cannot be cut short.
+// Two-phase publication so a CPU watchdog can never observe a half-written
+// record: the winner claims slot[0] with a sentinel, writes the payload,
+// fences to the system scope, and only then release-stores the final error
+// code.  Host readers treat the sentinel as "not committed yet".  Losers
+// (sentinel or final code) park so the winner cannot be cut short.
+constexpr unsigned long long TRAP_CLAIMED = ~0ull;
+
 __device__ __noinline__ void trap_commit(
     const globals &g, unsigned long long code, unsigned long long site,
     unsigned long long slot, unsigned long long expected,
     unsigned long long observed, unsigned long long ticket,
     unsigned long long iters) {
     const unsigned long long prev =
-        atomicCAS(g.trap_record, 0ull, code);
+        atomicCAS(g.trap_record, 0ull, TRAP_CLAIMED);
     if (prev != 0ull) park_forever();
     g.trap_record[1] = site;
     g.trap_record[2] = slot;
@@ -121,6 +126,8 @@ __device__ __noinline__ void trap_commit(
     g.trap_record[6] = ticket;
     g.trap_record[7] = iters;
     __threadfence_system();
+    asm volatile("{st.release.sys.global.u64 [%0], %1;}" ::
+                 "l"(g.trap_record), "l"(code) : "memory");
     __trap();
 }
 

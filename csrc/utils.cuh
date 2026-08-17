@@ -78,13 +78,19 @@ static __device__ __forceinline__ void mok_park_forever() {
     while (true) __nanosleep(1u << 20);
 }
 
+// Two-phase publication (see the K1 header's trap_commit): claim with a
+// sentinel, write payload, system fence, then release-store the final code
+// so a CPU watchdog never reads a half-written record.
+constexpr unsigned long long MOK_TRAP_CLAIMED = ~0ull;
+
 static __device__ __noinline__ void mok_trap_commit(
     unsigned long long *record, unsigned long long code,
     unsigned long long site, unsigned long long slot,
     unsigned long long expected, unsigned long long observed,
     unsigned long long ep_rank, unsigned long long ticket,
     unsigned long long iters) {
-    const unsigned long long prev = atomicCAS(record, 0ull, code);
+    const unsigned long long prev =
+        atomicCAS(record, 0ull, MOK_TRAP_CLAIMED);
     if (prev != 0ull) mok_park_forever();
     record[1] = site;
     record[2] = slot;
@@ -94,6 +100,8 @@ static __device__ __noinline__ void mok_trap_commit(
     record[6] = ticket;
     record[7] = iters;
     __threadfence_system();
+    asm volatile("{st.release.sys.global.u64 [%0], %1;}" ::
+                 "l"(record), "l"(code) : "memory");
     __trap();
 }
 

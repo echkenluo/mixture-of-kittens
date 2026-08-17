@@ -727,10 +727,14 @@ def format_trap_record(workspace: MoKFP8RouteWorkspace) -> str | None:
     """Post-mortem reader: call AFTER a CUDA API returned an error, and do
     not issue further CUDA calls first -- the record lives in host-mapped
     pinned memory precisely so this read needs no working context.  Returns
-    None when no trap fired."""
-    rec = workspace.trap_record.tolist()
-    if rec[0] == 0:
+    None when no trap fired OR while a trap is claimed but its payload is
+    not yet committed (slot[0] holds the ~0 sentinel, which reads as -1 in
+    the int64 view; two-phase publication guarantees the payload is complete
+    once the final code lands)."""
+    head = int(workspace.trap_record[0].item())
+    if head == 0 or head == -1:
         return None
+    rec = workspace.trap_record.tolist()
     return (
         "MOK_TRAP|code=%d|site=%d|slot=%d|expected=%d|observed=%d"
         "|rank=%d|ticket=%d|iters=%d" % tuple(rec)
@@ -1117,20 +1121,33 @@ def gemm_combine_fused_fp8_block(
     out = output if output is not None else workspace.output
     if release_lease:
         ref = workspace.output
+        workspace_storages = {
+            t.untyped_storage().data_ptr()
+            for t in (
+                workspace.output,
+                workspace.combine_buffer,
+                workspace.routed_x,
+                workspace.routed_x_scale,
+                workspace.m_indices,
+                workspace.x_buffer,
+                workspace.x_scale_buffer,
+                workspace.schedule_peer_rank,
+                workspace.schedule_peer_token_idx,
+            )
+        }
         if (
             output is None
             or output.shape != ref.shape
             or output.dtype != ref.dtype
             or output.device != ref.device
             or not output.is_contiguous()
-            or output.untyped_storage().data_ptr()
-            == ref.untyped_storage().data_ptr()
+            or output.untyped_storage().data_ptr() in workspace_storages
         ):
             raise ValueError(
                 "release_lease=True requires a caller-owned output tensor "
-                "(matching shape/dtype/device, contiguous, NOT aliasing "
-                "workspace storage): the workspace may be overwritten by a "
-                "new acquirer after release"
+                "(matching shape/dtype/device, contiguous, NOT aliasing any "
+                "workspace-owned storage): the workspace may be overwritten "
+                "by a new acquirer after release"
             )
     workspace.down_ready.zero_()
     workspace.epilogue_done.zero_()
