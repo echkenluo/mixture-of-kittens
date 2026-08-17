@@ -65,12 +65,17 @@ def _fields_timeout(m):
     slot, expected, observed, ticket = (
         int(m[2]), int(m[3]), int(m[4]), int(m[6])
     )
+    # Fixed test geometry: copy_clusters=8, m_tiles=8, n_pairs=2.
+    # Copy sites: slot = copy_cta_idx = 2*ticket + cta_rank.
+    # GEMM site: slot = m_tile = (ticket - 8) // n_pairs.
     if site == 1:
-        return 0 <= slot < 16 and expected == 1 and observed == 0
+        return (0 <= ticket < 8 and slot in (2 * ticket, 2 * ticket + 1)
+                and expected == 1 and observed == 0)
     if site == 2:
-        return 0 <= slot < 16 and expected > 0 and observed < expected
+        return (0 <= ticket < 8 and slot in (2 * ticket, 2 * ticket + 1)
+                and expected > 0 and observed < expected)
     if site == 3:
-        return 0 <= slot < 8 and expected == 64 and observed < 64             and ticket >= 8
+        return (8 <= ticket < 24 and slot == (ticket - 8) // 2 and expected == 64 and 0 <= observed < 64)
     return False
 
 
