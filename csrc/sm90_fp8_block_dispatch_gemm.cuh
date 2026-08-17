@@ -29,6 +29,7 @@ using fp8_block_test::d_st;
 using fp8_block_test::acc_rt;
 
 constexpr int THREADS = 128;
+constexpr int MAX_LOCAL_EXPERTS = 256;  // smem expert-segment cache bound
 
 struct globals {
     // --- GEMM (consumer) side, contiguous contract.  The gl layouts have no
@@ -105,6 +106,20 @@ __device__ __forceinline__ void copy_role(const globals &g) {
     }
     __syncthreads();
 
+    // Cache the per-expert segment ends once per CTA: the per-row expert
+    // lookup below then scans shared memory instead of issuing up to
+    // num_local_experts uncached global loads for every row, which was the
+    // dominant serial cost of the first version.
+    __shared__ int expert_row_end[MAX_LOCAL_EXPERTS];
+    if (threadIdx.x == 0) {
+        int offset = 0;
+        for (int e = 0; e < g.num_local_experts; ++e) {
+            offset += g.tokens_per_expert[e];
+            expert_row_end[e] = offset;
+        }
+    }
+    __syncthreads();
+
     const int device_rows = g.num_tokens[0];
     const int valid_rows = device_rows < g.schedule_capacity
                                ? device_rows
@@ -112,7 +127,15 @@ __device__ __forceinline__ void copy_role(const globals &g) {
     const int fp8_vectors = g.hidden_size / static_cast<int>(sizeof(uint4));
     const uint4 zero{0, 0, 0, 0};
 
-    for (int row = copy_cta_idx; row < valid_rows; row += copy_cta_count) {
+    // One row per warp: rows fly concurrently with no block-wide barrier in
+    // the loop.  __syncwarp orders the lanes' row stores before lane 0's
+    // release-increment (gpu scope suffices -- the consumer GEMM CTAs are on
+    // this device), so each tile_ready add still carries its full row.
+    constexpr int WARPS = THREADS / 32;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    for (int row = copy_cta_idx * WARPS + warp; row < valid_rows;
+         row += copy_cta_count * WARPS) {
         const int peer_rank = g.schedule_peer_rank[row];
         const int peer_token_idx = g.schedule_peer_token_idx[row];
         const bool valid = peer_rank >= 0 && peer_rank < g.ep_size
@@ -130,32 +153,27 @@ __device__ __forceinline__ void copy_role(const globals &g) {
             const float *src_scale =
                 g.x_scale_peer[peer_rank]
                 + static_cast<size_t>(source_row) * g.scale_columns;
-            for (int i = threadIdx.x; i < fp8_vectors; i += blockDim.x)
+            #pragma unroll 4
+            for (int i = lane; i < fp8_vectors; i += 32)
                 dst_vectors[i] = src_vectors[i];
-            for (int i = threadIdx.x; i < g.scale_columns; i += blockDim.x)
+            for (int i = lane; i < g.scale_columns; i += 32)
                 dst_scale[i] = src_scale[i];
         } else {
-            for (int i = threadIdx.x; i < fp8_vectors; i += blockDim.x)
+            #pragma unroll 4
+            for (int i = lane; i < fp8_vectors; i += 32)
                 dst_vectors[i] = zero;
-            for (int i = threadIdx.x; i < g.scale_columns; i += blockDim.x)
+            for (int i = lane; i < g.scale_columns; i += 32)
                 dst_scale[i] = 0.0f;
         }
-        if (threadIdx.x == 0) {
+        if (lane == 0) {
             int expert = 0;
-            int offset = 0;
-            for (int candidate = 0; candidate < g.num_local_experts;
-                 ++candidate) {
-                const int next = offset + g.tokens_per_expert[candidate];
-                if (row < next) {
-                    expert = candidate;
-                    break;
-                }
-                offset = next;
-            }
+            while (expert < g.num_local_experts - 1
+                   && row >= expert_row_end[expert])
+                ++expert;
             g.m_indices[row] = expert;
         }
-        __syncthreads();
-        if (threadIdx.x == 0) {
+        __syncwarp();
+        if (lane == 0) {
             asm volatile("{red.release.gpu.global.add.u32 [%0], 1;}" ::
                          "l"(g.tile_ready + (row >> 6)) : "memory");
         }
@@ -378,6 +396,8 @@ inline void entry_out(
                 "D must be contiguous BF16 [capacity,N]");
     TORCH_CHECK(copy_clusters > 0 && copy_clusters <= 32,
                 "copy_clusters must be in [1,32]");
+    TORCH_CHECK(tokens_per_expert.numel() <= MAX_LOCAL_EXPERTS,
+                "local expert count exceeds the smem segment cache");
     kittens::py::device_check(routed_x, routed_x_scale, m_indices, B, B_scale);
     kittens::py::device_check(routed_x, D);
 
