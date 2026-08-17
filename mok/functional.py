@@ -991,6 +991,8 @@ def dispatch_gemm_fused_fp8_block(
     gate_up: torch.Tensor,
     copy_clusters: int = 8,
     forced_worker_clusters: int = 0,
+    delay_ticket0_cycles: int = 0,
+    spin_trap_iters: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
 
@@ -1081,6 +1083,8 @@ def dispatch_gemm_fused_fp8_block(
         trap_record_ptr=workspace.trap_record_ptr,
         copy_clusters=copy_clusters,
         forced_worker_clusters=forced_worker_clusters,
+        delay_ticket0_cycles=delay_ticket0_cycles,
+        spin_trap_iters=spin_trap_iters,
     )
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
 

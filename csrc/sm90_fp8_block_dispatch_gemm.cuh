@@ -97,6 +97,9 @@ struct globals {
     unsigned long long *trap_record;  // host-mapped pinned, never zeroed here
     int total_tickets;              // copy_clusters + m_tiles * (n_tiles/2)
     int ep_rank;                    // for trap records only
+    // Stage-C debug knobs (0 = off / default in production):
+    unsigned long long delay_ticket0_cycles;  // busy-wait after ticket-0 draw
+    unsigned long long spin_trap_iters;       // spin timeout override
 };
 
 __device__ __forceinline__ void park_forever() {
@@ -160,7 +163,7 @@ __device__ __forceinline__ void copy_task(const globals &g, unsigned int ticket,
                          : "l"(g.input_expected_scratch) : "memory");
             if (expected != 0u) break;
             __nanosleep(128);
-            if (++iters >= SPIN_TRAP_ITERS)
+            if (++iters >= g.spin_trap_iters)
                 trap_commit(g, ERR_TIMEOUT, SITE_K1_INPUT_SCRATCH,
                             copy_cta_idx, 1, 0, ticket, iters);
         } while (true);
@@ -171,7 +174,7 @@ __device__ __forceinline__ void copy_task(const globals &g, unsigned int ticket,
                          : "=r"(value) : "l"(g.barrier_flag) : "memory");
             if (value >= expected) break;
             __nanosleep(128);
-            if (++iters >= SPIN_TRAP_ITERS)
+            if (++iters >= g.spin_trap_iters)
                 trap_commit(g, ERR_TIMEOUT, SITE_K1_BARRIER_FLAG,
                             copy_cta_idx, expected, value, ticket, iters);
         } while (true);
@@ -295,7 +298,7 @@ __device__ __forceinline__ void gemm_task(
                          : "l"(g.tile_ready + m_tile) : "memory");
             if (done >= 64u) break;
             __nanosleep(256);
-            if (++iters >= SPIN_TRAP_ITERS)
+            if (++iters >= g.spin_trap_iters)
                 trap_commit(g, ERR_TIMEOUT, SITE_K1_TILE_READY,
                             m_tile, 64, done, ticket, iters);
         } while (true);
@@ -446,6 +449,17 @@ __global__ void kernel(const __grid_constant__ globals g) {
                      : "l"(g.worker_ticket + cluster_id) : "memory");
         if (ticket >= static_cast<unsigned int>(g.total_tickets))
             break;
+        // Stage-C injection: hold the resident ticket-0 producer for a
+        // bounded busy-wait AFTER claiming its ticket and BEFORE the
+        // arrive/copy, exercising the resident-but-slow-producer path.
+        if (ticket == 0u && g.delay_ticket0_cycles != 0ull) {
+            if (threadIdx.x == 0) {
+                const unsigned long long start = clock64();
+                while (static_cast<unsigned long long>(clock64()) - start
+                       < g.delay_ticket0_cycles) { }
+            }
+            __syncthreads();
+        }
         if (ticket < static_cast<unsigned int>(g.copy_clusters))
             copy_task(g, ticket, cta_rank);
         else
@@ -518,7 +532,8 @@ inline void entry_out(
     const at::Tensor &B, const at::Tensor &B_scale, const at::Tensor &D,
     int64_t copy_clusters, int64_t ep_rank,
     const at::Tensor &ticket_counter, const at::Tensor &worker_ticket,
-    int64_t trap_record_ptr, int64_t forced_worker_clusters) {
+    int64_t trap_record_ptr, int64_t forced_worker_clusters,
+    int64_t delay_ticket0_cycles, int64_t spin_trap_iters) {
     // Dispatch-side contracts are identical to the split path; reuse them.
     fp8_block_routed::check_pointer_list(x_ptrs, "x_ptrs");
     fp8_block_routed::check_pointer_list(x_scale_ptrs, "x_scale_ptrs");
@@ -664,6 +679,11 @@ inline void entry_out(
     }
     g.total_tickets = total_tickets;
     g.ep_rank = static_cast<int>(ep_rank);
+    g.delay_ticket0_cycles =
+        static_cast<unsigned long long>(delay_ticket0_cycles);
+    g.spin_trap_iters = spin_trap_iters > 0
+                            ? static_cast<unsigned long long>(spin_trap_iters)
+                            : SPIN_TRAP_ITERS;
 
     constexpr int PIPE_DEPTH = 2;
     constexpr int SMEM =

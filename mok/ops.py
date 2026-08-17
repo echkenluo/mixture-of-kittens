@@ -733,6 +733,8 @@ def fp8_block_dispatch_gemm_fused_out(
     trap_record_ptr: int,
     copy_clusters: int = 8,
     forced_worker_clusters: int = 0,
+    delay_ticket0_cycles: int = 0,
+    spin_trap_iters: int = 0,
 ) -> None:
     """Input barrier, pull dispatch, and gate/up GEMM on a ticket-queue
     resident-worker grid (scheduling-order independent)."""
@@ -767,6 +769,8 @@ def fp8_block_dispatch_gemm_fused_out(
         worker_ticket,
         trap_record_ptr,
         forced_worker_clusters,
+        delay_ticket0_cycles,
+        spin_trap_iters,
     )
 
 

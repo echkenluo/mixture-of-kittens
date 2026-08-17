@@ -192,7 +192,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("copy_clusters"), pybind11::arg("ep_rank"),
           pybind11::arg("ticket_counter"), pybind11::arg("worker_ticket"),
           pybind11::arg("trap_record_ptr"),
-          pybind11::arg("forced_worker_clusters") = 0);
+          pybind11::arg("forced_worker_clusters") = 0,
+          pybind11::arg("delay_ticket0_cycles") = 0,
+          pybind11::arg("spin_trap_iters") = 0);
     m.def("fp8_block_gemm_combine_fused_out",
           &mok_sm90::fp8_block_gemm_combine::entry_out, "",
           pybind11::arg("down_input"), pybind11::arg("down_input_scale"),
