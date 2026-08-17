@@ -1069,14 +1069,18 @@ def test_sm90_fp8_block_grouped_contiguous_dynamic_output(
     )
 
 
+@pytest.mark.parametrize("route", ["balanced", "skewed"], ids=["bal", "skew"])
 @pytest.mark.parametrize("copy_clusters", [8, 2], ids=["cc8", "cc2"])
 def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
     copy_clusters: int,
+    route: str,
     context: tuple[int, int, torch.device],
 ) -> None:
     """The fused dispatch+GEMM persistent kernel must be bitwise-identical to
     the split dispatch -> dynamic grouped GEMM sequence: same pull layout,
-    same m_indices, same FP8 tile schedule, and an untouched capacity tail."""
+    same m_indices, same FP8 tile schedule, and an untouched capacity tail.
+    The skewed route hammers rank 0's expert 0 with ~70% of all tokens, so
+    per-expert segments (and the tile_ready handoff) are highly non-uniform."""
     rank, world_size, device = context
     require_sm90(device)
     assert world_size in (4, 8, 16, 32, 64)
@@ -1106,8 +1110,19 @@ def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
         num_local_experts=num_local_experts,
     )
     token_indices = torch.arange(num_local_tokens, device=device)
-    destination_ranks = token_indices % world_size
-    local_experts = ((token_indices // world_size) % 4 == 0).to(torch.int64)
+    if route == "balanced":
+        destination_ranks = token_indices % world_size
+        local_experts = ((token_indices // world_size) % 4 == 0).to(torch.int64)
+    else:
+        hot = (token_indices % 10) < 7
+        destination_ranks = torch.where(
+            hot, torch.zeros_like(token_indices), token_indices % world_size
+        )
+        local_experts = torch.where(
+            hot,
+            torch.zeros_like(token_indices),
+            (token_indices * 7 + 3) % num_local_experts,
+        )
     top_experts = (
         destination_ranks * num_local_experts + local_experts
     ).view(-1, 1)
@@ -1226,7 +1241,7 @@ def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
     dist.all_reduce(mismatches, op=dist.ReduceOp.MAX)
     print(
         f"FUSED_DISPATCH_GEMM_MISMATCH|rank={rank}|cc={copy_clusters}|"
-        f"values={mismatches.cpu().tolist()}",
+        f"route={route}|values={mismatches.cpu().tolist()}",
         flush=True,
     )
     assert not mismatches.any().item()
