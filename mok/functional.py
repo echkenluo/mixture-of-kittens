@@ -539,9 +539,9 @@ def create_fp8_route_workspace(
     trap_record_ptr = trap_record.data_ptr()
     in_use = torch.zeros(1, dtype=torch.int32, device=device)
     epilogue_done = torch.zeros(1, dtype=torch.int32, device=device)
-    # Warm the K1 per-device occupancy cache while we are guaranteed to be
-    # outside any CUDA graph capture.
-    fp8_block_dispatch_gemm_prewarm()
+    # Warm the K1 occupancy cache for THIS workspace's device while we are
+    # guaranteed to be outside any CUDA graph capture.
+    fp8_block_dispatch_gemm_prewarm(epilogue_done.device.index)
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -945,11 +945,6 @@ def dispatch_fp8_block(
     routed_x = workspace.routed_x[:active_rows]
     routed_x_scale = workspace.routed_x_scale[:active_rows]
     m_indices = workspace.m_indices[:active_rows]
-    # Workspace lease: first device operation of this entry (split path
-    # self-closes with the trailing release below).
-    workspace_lease_acquire(
-        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
-    )
     if prepare_combine:
         # The fused dispatch barrier runs after this clear and after publishing
         # the symmetric input buffers.  It therefore also proves that every
@@ -979,7 +974,6 @@ def dispatch_fp8_block(
         schedule.tokens_per_expert,
         workspace.topk,
     )
-    workspace_lease_release(workspace.in_use)
     return routed_x, routed_x_scale, m_indices
 
 
@@ -993,13 +987,13 @@ def dispatch_gemm_fused_fp8_block(
     gate_up: torch.Tensor,
     copy_clusters: int = 8,
     forced_worker_clusters: int = 0,
-    hold_lease: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
 
-    Lease ownership: hold_lease=False (standalone/unit-test use) self-closes
-    with a trailing release kernel; hold_lease=True (full pipeline) keeps the
-    lease held for the epilogue release chain in gemm_combine_fused.
+    Leased-mode sub-entry: the caller (orchestrator) owns the workspace
+    lease across the whole pipeline (acquire_workspace_lease before the
+    first workspace write, e.g. build_schedule) -- this function never
+    acquires or releases it.
 
     Strict-contract producer/consumer fusion: communication CTAs pull routed
     rows and publish per-M64-tile ready counters, GEMM CTAs start each tile as
@@ -1039,12 +1033,6 @@ def dispatch_gemm_fused_fp8_block(
             f"{expected_scale_shape}"
         )
 
-    # Workspace lease: the acquire kernel is the FIRST device operation of
-    # this call -- a concurrent holder traps (REENTRANT) before any clear or
-    # copy below can touch shared state.
-    workspace_lease_acquire(
-        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
-    )
     # Same iteration-preparation contract as dispatch_fp8_block with
     # prepare_combine=True: the fused kernel's in-kernel input barrier also
     # proves every rank finished these clears before peer stores begin.
@@ -1090,8 +1078,6 @@ def dispatch_gemm_fused_fp8_block(
         copy_clusters=copy_clusters,
         forced_worker_clusters=forced_worker_clusters,
     )
-    if not hold_lease:
-        workspace_lease_release(workspace.in_use)
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
 
 
@@ -1104,8 +1090,13 @@ def gemm_combine_fused_fp8_block(
     weight_scale: torch.Tensor,
     routed_y: torch.Tensor,
     topk_weights: torch.Tensor,
+    release_lease: bool = False,
 ) -> torch.Tensor:
     """Down GEMM, last-arriver combine push, fused arrive, waiting epilogue.
+
+    Leased-mode sub-entry.  release_lease=True is set only by the
+    orchestrator that owns the lease and ends its pipeline here: the
+    epilogue's last-finishing CTA then performs the owner-qualified release.
 
     Replaces the dynamic down GEMM + precleared combine_reduce pair.  The
     GEMM CTA that completes each M64 block last pushes the block's rows to
@@ -1150,6 +1141,7 @@ def gemm_combine_fused_fp8_block(
         workspace.epilogue_done,
         workspace.trap_record_ptr,
         workspace.ep_rank,
+        do_release=1 if release_lease else 0,
     )
     return workspace.output
 

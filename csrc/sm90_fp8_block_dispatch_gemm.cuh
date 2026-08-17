@@ -493,8 +493,8 @@ inline int prewarm(int device_index) {
     return max_clusters;
 }
 
-inline void entry_prewarm() {
-    prewarm(static_cast<int>(c10::cuda::current_device()));
+inline void entry_prewarm(int64_t device_index) {
+    prewarm(static_cast<int>(device_index));
 }
 
 inline void entry_out(

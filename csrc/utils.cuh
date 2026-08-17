@@ -378,8 +378,10 @@ static __host__ void workspace_lease_acquire(
     TORCH_CHECK(in_use.is_cuda() && in_use.scalar_type() == at::kInt
                     && in_use.numel() == 1,
                 "in_use must be int32 [1] on CUDA");
-    unsigned long long *record = mok_resolve_trap_record(trap_record_ptr);
+    // Guard BEFORE resolving the host-mapped record: the device pointer is
+    // resolved against the current device.
     c10::cuda::CUDAGuard guard(in_use.device());
+    unsigned long long *record = mok_resolve_trap_record(trap_record_ptr);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(in_use.get_device());
     workspace_lease_acquire_kernel<<<1, 1, 0, stream>>>(
         reinterpret_cast<unsigned int *>(in_use.data_ptr<int>()), record,

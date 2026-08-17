@@ -840,9 +840,10 @@ def routed_epilogue_fused_out(
     epilogue_done: torch.Tensor,
     trap_record_ptr: int,
     ep_rank: int,
+    do_release: int = 0,
 ) -> None:
-    """Routed epilogue: fused-barrier spin head (timeout-trapped) plus the
-    workspace lease release chain (last CTA releases in_use)."""
+    """Routed epilogue: fused-barrier spin head (timeout-trapped); when
+    do_release is set the last CTA performs the lease release chain."""
     if not hasattr(_C, "routed_epilogue_fused_out"):
         raise RuntimeError(
             "the loaded MoK extension lacks the fused-wait epilogue"
@@ -857,14 +858,15 @@ def routed_epilogue_fused_out(
         epilogue_done,
         trap_record_ptr,
         ep_rank,
+        do_release,
     )
 
 
-def fp8_block_dispatch_gemm_prewarm() -> None:
-    """Warm the K1 per-device occupancy cache (host-only; call at workspace
-    creation, never inside a CUDA graph capture)."""
+def fp8_block_dispatch_gemm_prewarm(device_index: int) -> None:
+    """Warm the K1 occupancy cache for the given device (host-only; call at
+    workspace creation, never inside a CUDA graph capture)."""
     if hasattr(_C, "fp8_block_dispatch_gemm_prewarm"):
-        _C.fp8_block_dispatch_gemm_prewarm()
+        _C.fp8_block_dispatch_gemm_prewarm(device_index)
 
 
 @torch.library.custom_op(
