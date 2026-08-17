@@ -159,13 +159,21 @@ void combine_kernel(const __grid_constant__ combine_globals g) {
         return;
     // Fused arrive: every block (early-exit ones included) joins the
     // completion count so the last one can arrive on behalf of this rank.
-    if (wrote_peer)
-        asm volatile("{fence.release.sys;}" ::: "memory");
+    // The block's peer writes are gathered to thread 0 by the syncthreads,
+    // and thread 0's system-scope release fence orders them before its join
+    // on the completion counter; a per-thread fence before the sync would
+    // cover only that thread's own stores.
     __syncthreads();
     if (threadIdx.x == 0) {
+        if (wrote_peer)
+            asm volatile("{fence.release.sys;}" ::: "memory");
         const unsigned int finished =
             atomicAdd(g.completion_counter, 1u) + 1u;
         if (finished == gridDim.x) {
+            // Pair with every joining block's release fence through the
+            // counter's atomic chain: without this acquire, the multicast
+            // arrive below would not carry the other blocks' peer writes.
+            asm volatile("{fence.acquire.sys;}" ::: "memory");
             *g.completion_counter = 0u;  // reset for the next graph replay
             const unsigned int expected =
                 atomicAdd(g.barrier_target,
