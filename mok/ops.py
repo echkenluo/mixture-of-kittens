@@ -593,7 +593,14 @@ def fp8_block_routed_dispatch_copy_out(
 
 @torch.library.custom_op(
     "mok::fp8_block_routed_combine_reduce_out",
-    mutates_args=("combine_buffer", "output", "barrier_buffer", "barrier_target"),
+    mutates_args=(
+        "combine_buffer",
+        "output",
+        "barrier_buffer",
+        "barrier_target",
+        "combine_completion",
+        "barrier_expected_scratch",
+    ),
 )
 def fp8_block_routed_combine_reduce_out(
     routed_y: torch.Tensor,
@@ -610,10 +617,17 @@ def fp8_block_routed_combine_reduce_out(
     barrier_target: torch.Tensor,
     topk: int,
     combine_precleared: bool = False,
+    combine_completion: torch.Tensor | None = None,
+    barrier_expected_scratch: torch.Tensor | None = None,
 ) -> None:
     """Combine, synchronize, and reduce, optionally reusing an earlier clear."""
     if type(combine_precleared) is not bool:
         raise TypeError("combine_precleared must be a bool")
+    if (combine_completion is None) != (barrier_expected_scratch is None):
+        raise ValueError(
+            "combine_completion and barrier_expected_scratch must be "
+            "passed together"
+        )
     if not hasattr(_C, "fp8_block_routed_combine_reduce_out"):
         raise RuntimeError("the loaded MoK extension lacks fused FP8 combine")
     _C.fp8_block_routed_combine_reduce_out(
@@ -631,6 +645,8 @@ def fp8_block_routed_combine_reduce_out(
         barrier_target,
         topk,
         combine_precleared,
+        combine_completion,
+        barrier_expected_scratch,
     )
 
 
