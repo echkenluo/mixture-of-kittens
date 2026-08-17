@@ -29,17 +29,23 @@ _CHILD_ENV = dict(
     + os.environ.get("PYTHONPATH", ""),
 )
 
+# (name, cmd, expected code, accepted sites, expected rc).  The timeout
+# injection delays the ticket-0 producer, and WHICH spin exceeds the limit
+# first is scheduling-dependent: the other copy workers wait on the
+# input-publish scratch (site 1) or barrier flag (site 2) that ticket 0
+# publishes, while GEMM workers wait on tile_ready (site 3) -- any K1
+# timeout site is a valid outcome of this injection.
 CASES = (
     ("reentrant", [sys.executable, "tests/_trap_case.py", "reentrant"],
-     3, 7, 70),
+     3, (7,), 70),
     ("contract",
      [sys.executable, "-m", "torch.distributed.run", "--standalone",
       "--nproc-per-node=4", "tests/_trap_case.py", "contract"],
-     2, 6, None),
+     2, (6,), None),
     ("timeout",
      [sys.executable, "-m", "torch.distributed.run", "--standalone",
       "--nproc-per-node=4", "tests/_trap_case.py", "timeout"],
-     1, 3, None),
+     1, (1, 2, 3), None),
 )
 
 PATTERN = re.compile(
@@ -50,7 +56,7 @@ PATTERN = re.compile(
 
 def main() -> int:
     failures = []
-    for name, cmd, want_code, want_site, want_rc in CASES:
+    for name, cmd, want_code, want_sites, want_rc in CASES:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=600,
@@ -63,7 +69,7 @@ def main() -> int:
         out = proc.stdout + proc.stderr
         matches = PATTERN.findall(out)
         ok_record = any(
-            int(m[0]) == want_code and int(m[1]) == want_site
+            int(m[0]) == want_code and int(m[1]) in want_sites
             for m in matches
         )
         ok_rc = (
@@ -79,7 +85,8 @@ def main() -> int:
         verdict = "PASS" if ok_record and ok_rc and not bad_markers else "FAIL"
         print(
             f"TRAP_GATE|case={name}|verdict={verdict}|rc={proc.returncode}"
-            f"|records={len(matches)}|expected=code{want_code}/site{want_site}"
+            f"|records={len(matches)}"
+            f"|expected=code{want_code}/sites{list(want_sites)}"
             f"|bad_markers={bad_markers}",
             flush=True,
         )
