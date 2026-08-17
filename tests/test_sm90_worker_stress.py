@@ -472,7 +472,7 @@ def test_k1_concurrent_workspaces(
         context, "balanced"
     )
     ws_b, sch_b, x_b, xs_b, w_b, wsc_b, refs_b, dims_b = _build_case(
-        context, "skewed", num_local_tokens=256
+        context, "skewed", num_local_tokens=1024
     )
     assert ws_a is not ws_b
     cap_a, n_a, _ = dims_a
