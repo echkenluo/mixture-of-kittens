@@ -31,6 +31,13 @@ using fp8_block_test::acc_rt;
 constexpr int THREADS = 128;
 
 struct globals {
+    // --- GEMM (consumer) side, contiguous contract.  The gl layouts have no
+    // default constructor, so they lead the struct and are the only members
+    // provided at aggregate initialization; everything after them is
+    // value-initialized there and assigned afterwards. ---
+    fp8_block_test::contiguous::a_gl A;    // aliases routed_x
+    fp8_block_test::contiguous::b_gl B;
+    fp8_block_test::contiguous::d_gl D;
     // --- dispatch (producer) side ---
     const uint8_t *x_peer[MAX_EP_SIZE];
     const float *x_scale_peer[MAX_EP_SIZE];
@@ -56,10 +63,6 @@ struct globals {
     unsigned int *input_expected_scratch;  // zeroed each iteration
     // producer->consumer handoff: per-M64-tile completed-row counters
     unsigned int *tile_ready;              // [capacity/64], zeroed each iter
-    // --- GEMM (consumer) side, contiguous contract ---
-    fp8_block_test::contiguous::a_gl A;    // aliases routed_x
-    fp8_block_test::contiguous::b_gl B;
-    fp8_block_test::contiguous::d_gl D;
     const float *A_scale;                  // aliases routed_x_scale
     const float *B_scale;
     int n;
@@ -379,7 +382,14 @@ inline void entry_out(
     kittens::py::device_check(routed_x, D);
 
     c10::cuda::CUDAGuard device_guard(routed_x.device());
-    globals g{};
+    globals g{
+        kittens::py::tensor_to_gl<fp8_block_test::contiguous::a_gl>(
+            const_cast<at::Tensor &>(routed_x)),
+        kittens::py::tensor_to_gl<fp8_block_test::contiguous::b_gl>(
+            const_cast<at::Tensor &>(B)),
+        kittens::py::tensor_to_gl<fp8_block_test::contiguous::d_gl>(
+            const_cast<at::Tensor &>(D)),
+    };
     for (size_t rank = 0; rank < x_ptrs.size(); ++rank) {
         g.x_peer[rank] = reinterpret_cast<const uint8_t *>(x_ptrs[rank]);
         g.x_scale_peer[rank] =
@@ -410,12 +420,6 @@ inline void entry_out(
         input_expected_scratch.data_ptr<int>());
     g.tile_ready =
         reinterpret_cast<unsigned int *>(tile_ready.data_ptr<int>());
-    g.A = kittens::py::tensor_to_gl<fp8_block_test::contiguous::a_gl>(
-        const_cast<at::Tensor &>(routed_x));
-    g.B = kittens::py::tensor_to_gl<fp8_block_test::contiguous::b_gl>(
-        const_cast<at::Tensor &>(B));
-    g.D = kittens::py::tensor_to_gl<fp8_block_test::contiguous::d_gl>(
-        const_cast<at::Tensor &>(D));
     g.A_scale = routed_x_scale.data_ptr<float>();
     g.B_scale = B_scale.data_ptr<float>();
     g.n = n;
