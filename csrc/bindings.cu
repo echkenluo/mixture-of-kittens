@@ -5,6 +5,7 @@
 #include "sm90_fp8_block_worker_test.cuh"
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
+#include "sm90_fp8_block_dispatch_gemm.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::entrypoint, "",
@@ -173,6 +174,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("combine_precleared") = false,
           pybind11::arg("combine_completion") = pybind11::none(),
           pybind11::arg("barrier_expected_scratch") = pybind11::none());
+    m.def("fp8_block_dispatch_gemm_fused_out",
+          &mok_sm90::fp8_block_dispatch_gemm::entry_out, "",
+          pybind11::arg("x_buffer"), pybind11::arg("x_ptrs"),
+          pybind11::arg("x_scale_buffer"), pybind11::arg("x_scale_ptrs"),
+          pybind11::arg("routed_x"), pybind11::arg("routed_x_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
+          pybind11::arg("topk"), pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("input_expected_scratch"),
+          pybind11::arg("tile_ready"), pybind11::arg("B"),
+          pybind11::arg("B_scale"), pybind11::arg("D"),
+          pybind11::arg("copy_clusters") = 8);
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

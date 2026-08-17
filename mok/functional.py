@@ -15,8 +15,10 @@ from .ops import (
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fp8_block_build_schedule_out,
+    fp8_block_dispatch_gemm_fused_out,
     fp8_block_grouped_contiguous_out,
     fp8_block_grouped_contiguous_dynamic_out,
+    fp8_block_routed_combine_reduce_fused_out,
     fp8_block_routed_combine_reduce_out,
     fp8_block_routed_combine_out,
     fp8_block_routed_dispatch_copy_out,
@@ -136,6 +138,8 @@ class MoKFP8RouteWorkspace:
     barrier_target: torch.Tensor
     combine_completion: torch.Tensor       # (1,) int32, fused-arrive counter
     barrier_expected_scratch: torch.Tensor  # (1,) int32, fused-wait expected
+    input_expected_scratch: torch.Tensor    # (1,) int32, fused dispatch wait
+    tile_ready: torch.Tensor  # (capacity/64,) int32 producer->consumer count
 
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
@@ -506,6 +510,10 @@ def create_fp8_route_workspace(
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
     combine_completion = torch.zeros(1, dtype=torch.int32, device=device)
     barrier_expected_scratch = torch.zeros(1, dtype=torch.int32, device=device)
+    input_expected_scratch = torch.zeros(1, dtype=torch.int32, device=device)
+    tile_ready = torch.zeros(
+        schedule_capacity // 64, dtype=torch.int32, device=device
+    )
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -553,6 +561,8 @@ def create_fp8_route_workspace(
         barrier_target=barrier_target,
         combine_completion=combine_completion,
         barrier_expected_scratch=barrier_expected_scratch,
+        input_expected_scratch=input_expected_scratch,
+        tile_ready=tile_ready,
     )
 
 
@@ -906,6 +916,96 @@ def dispatch_fp8_block(
     return routed_x, routed_x_scale, m_indices
 
 
+def dispatch_gemm_fused_fp8_block(
+    workspace: MoKFP8RouteWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    gate_up: torch.Tensor,
+    copy_clusters: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Input barrier, pull dispatch, and gate/up GEMM as one persistent kernel.
+
+    Strict-contract producer/consumer fusion: communication CTAs pull routed
+    rows and publish per-M64-tile ready counters, GEMM CTAs start each tile as
+    soon as its own rows have landed.  Replaces the dispatch_fp8_block(...,
+    prepare_combine=True) + gate/up grouped-GEMM pair; downstream stages are
+    unchanged.  Always operates on the full capacity view (no host reads).
+    """
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    expected_x_shape = (workspace.num_local_tokens, workspace.hidden_size)
+    if (
+        not x.is_cuda
+        or x.device != workspace.device
+        or x.dtype != torch.float8_e4m3fn
+        or not x.is_contiguous()
+        or tuple(x.shape) != expected_x_shape
+    ):
+        raise ValueError(
+            "x must be contiguous CUDA float8_e4m3fn with shape "
+            f"{expected_x_shape}"
+        )
+    expected_scale_shape = (
+        workspace.num_local_tokens,
+        workspace.hidden_size // 128,
+    )
+    if (
+        not x_scale.is_cuda
+        or x_scale.device != workspace.device
+        or x_scale.dtype != torch.float32
+        or not x_scale.is_contiguous()
+        or tuple(x_scale.shape) != expected_scale_shape
+    ):
+        raise ValueError(
+            "x_scale must be contiguous CUDA float32 with shape "
+            f"{expected_scale_shape}"
+        )
+
+    # Same iteration-preparation contract as dispatch_fp8_block with
+    # prepare_combine=True: the fused kernel's in-kernel input barrier also
+    # proves every rank finished these clears before peer stores begin.
+    workspace.combine_buffer.zero_()
+    workspace.barrier_expected_scratch.zero_()
+    # Producer/consumer handoff state consumed by this very kernel.  Stream
+    # order separates these clears from the previous iteration's readers,
+    # which is what keeps CUDA graph replay valid with no host counters.
+    workspace.input_expected_scratch.zero_()
+    workspace.tile_ready.zero_()
+    # Publish the symmetric input copies; they precede the fused kernel on
+    # the stream, so its first-CTA arrive covers them.
+    workspace.x_buffer.copy_(x)
+    workspace.x_scale_buffer.copy_(x_scale)
+    fp8_block_dispatch_gemm_fused_out(
+        workspace.x_buffer,
+        workspace.x_buffer_ptrs,
+        workspace.x_scale_buffer,
+        workspace.x_scale_buffer_ptrs,
+        workspace.routed_x,
+        workspace.routed_x_scale,
+        workspace.m_indices,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        workspace.topk,
+        workspace.barrier_buffer,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.barrier_target,
+        workspace.input_expected_scratch,
+        workspace.tile_ready,
+        weight,
+        weight_scale,
+        gate_up,
+        copy_clusters,
+    )
+    return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
+
+
 def combine_fp8_block(
     workspace: MoKFP8RouteWorkspace,
     schedule: MoKSchedule,
@@ -1086,15 +1186,26 @@ def combine_reduce_fp8_block_routes(
     active_rows = routed_y.shape[0]
     # The fused in-kernel barrier requires the scratch slot zeroed earlier in
     # this iteration, which dispatch's prepare_combine path guarantees; the
-    # two flags are therefore enabled together.
-    fused_kwargs = (
-        {
-            "combine_completion": workspace.combine_completion,
-            "barrier_expected_scratch": workspace.barrier_expected_scratch,
-        }
-        if combine_precleared
-        else {}
-    )
+    # fused op is therefore tied to the precleared path.
+    if combine_precleared:
+        fp8_block_routed_combine_reduce_fused_out(
+            routed_y,
+            workspace.combine_buffer,
+            workspace.combine_buffer_ptrs,
+            schedule.peer_rank[:active_rows],
+            schedule.peer_token_idx[:active_rows],
+            schedule.num_tokens,
+            topk_weights,
+            workspace.output,
+            workspace.barrier_buffer,
+            workspace.barrier_buffer_ptrs,
+            workspace.barrier_buffer_multicast_ptr,
+            workspace.barrier_target,
+            workspace.topk,
+            workspace.combine_completion,
+            workspace.barrier_expected_scratch,
+        )
+        return workspace.output
     fp8_block_routed_combine_reduce_out(
         routed_y,
         workspace.combine_buffer,

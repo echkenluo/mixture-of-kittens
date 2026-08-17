@@ -593,14 +593,7 @@ def fp8_block_routed_dispatch_copy_out(
 
 @torch.library.custom_op(
     "mok::fp8_block_routed_combine_reduce_out",
-    mutates_args=(
-        "combine_buffer",
-        "output",
-        "barrier_buffer",
-        "barrier_target",
-        "combine_completion",
-        "barrier_expected_scratch",
-    ),
+    mutates_args=("combine_buffer", "output", "barrier_buffer", "barrier_target"),
 )
 def fp8_block_routed_combine_reduce_out(
     routed_y: torch.Tensor,
@@ -617,17 +610,10 @@ def fp8_block_routed_combine_reduce_out(
     barrier_target: torch.Tensor,
     topk: int,
     combine_precleared: bool = False,
-    combine_completion: torch.Tensor | None = None,
-    barrier_expected_scratch: torch.Tensor | None = None,
 ) -> None:
     """Combine, synchronize, and reduce, optionally reusing an earlier clear."""
     if type(combine_precleared) is not bool:
         raise TypeError("combine_precleared must be a bool")
-    if (combine_completion is None) != (barrier_expected_scratch is None):
-        raise ValueError(
-            "combine_completion and barrier_expected_scratch must be "
-            "passed together"
-        )
     if not hasattr(_C, "fp8_block_routed_combine_reduce_out"):
         raise RuntimeError("the loaded MoK extension lacks fused FP8 combine")
     _C.fp8_block_routed_combine_reduce_out(
@@ -645,8 +631,129 @@ def fp8_block_routed_combine_reduce_out(
         barrier_target,
         topk,
         combine_precleared,
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_routed_combine_reduce_fused_out",
+    mutates_args=(
+        "combine_buffer",
+        "output",
+        "barrier_buffer",
+        "barrier_target",
+        "combine_completion",
+        "barrier_expected_scratch",
+    ),
+)
+def fp8_block_routed_combine_reduce_fused_out(
+    routed_y: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_buffer_ptrs: list[int],
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    topk: int,
+    combine_completion: torch.Tensor,
+    barrier_expected_scratch: torch.Tensor,
+) -> None:
+    """Precleared combine with the post-combine barrier fused in kernel.
+
+    A separate op from the legacy 14-argument form because torch.library
+    handles optional mutated tensors poorly (positional-index bookkeeping in
+    ADInplaceOrView breaks when they arrive as keywords); the fused path
+    always has both state tensors, so they are simply required here.
+    """
+    if not hasattr(_C, "fp8_block_routed_combine_reduce_out"):
+        raise RuntimeError("the loaded MoK extension lacks fused FP8 combine")
+    _C.fp8_block_routed_combine_reduce_out(
+        routed_y,
+        combine_buffer,
+        combine_buffer_ptrs,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        topk_weights,
+        output,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        topk,
+        True,
         combine_completion,
         barrier_expected_scratch,
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_dispatch_gemm_fused_out",
+    mutates_args=(
+        "routed_x",
+        "routed_x_scale",
+        "m_indices",
+        "barrier_buffer",
+        "barrier_target",
+        "input_expected_scratch",
+        "tile_ready",
+        "gate_up",
+    ),
+)
+def fp8_block_dispatch_gemm_fused_out(
+    x_buffer: torch.Tensor,
+    x_ptrs: list[int],
+    x_scale_buffer: torch.Tensor,
+    x_scale_ptrs: list[int],
+    routed_x: torch.Tensor,
+    routed_x_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    topk: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    input_expected_scratch: torch.Tensor,
+    tile_ready: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    gate_up: torch.Tensor,
+    copy_clusters: int = 8,
+) -> None:
+    """Input barrier, pull dispatch, and gate/up GEMM in one persistent kernel."""
+    if not hasattr(_C, "fp8_block_dispatch_gemm_fused_out"):
+        raise RuntimeError(
+            "the loaded MoK extension lacks the fused dispatch+GEMM kernel"
+        )
+    _C.fp8_block_dispatch_gemm_fused_out(
+        x_buffer,
+        x_ptrs,
+        x_scale_buffer,
+        x_scale_ptrs,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+        topk,
+        barrier_buffer,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        input_expected_scratch,
+        tile_ready,
+        weight,
+        weight_scale,
+        gate_up,
+        copy_clusters,
     )
 
 

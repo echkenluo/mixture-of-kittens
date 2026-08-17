@@ -1069,6 +1069,169 @@ def test_sm90_fp8_block_grouped_contiguous_dynamic_output(
     )
 
 
+@pytest.mark.parametrize("copy_clusters", [8, 2], ids=["cc8", "cc2"])
+def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
+    copy_clusters: int,
+    context: tuple[int, int, torch.device],
+) -> None:
+    """The fused dispatch+GEMM persistent kernel must be bitwise-identical to
+    the split dispatch -> dynamic grouped GEMM sequence: same pull layout,
+    same m_indices, same FP8 tile schedule, and an untouched capacity tail."""
+    rank, world_size, device = context
+    require_sm90(device)
+    assert world_size in (4, 8, 16, 32, 64)
+    if not hasattr(_C, "fp8_block_dispatch_gemm_fused_out"):
+        pytest.skip("extension lacks the fused dispatch+GEMM kernel")
+
+    num_local_tokens = 512
+    hidden_size = 256
+    topk = 1
+    num_local_experts = 2
+    n = 256
+    sentinel = 101.0
+    config = functional.MoKConfig(
+        fwd_num_comm_sms=2,
+        bwd_num_comm_sms=2,
+        minibatch_size=256,
+        macrobatch_size=4096,
+        schedule_capacity_multiplier=1.0,
+    )
+    workspace = functional.get_fp8_route_workspace(
+        config,
+        dist.group.WORLD,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        num_local_experts=num_local_experts,
+    )
+    token_indices = torch.arange(num_local_tokens, device=device)
+    destination_ranks = token_indices % world_size
+    local_experts = ((token_indices // world_size) % 4 == 0).to(torch.int64)
+    top_experts = (
+        destination_ranks * num_local_experts + local_experts
+    ).view(-1, 1)
+    schedule = functional.build_schedule(
+        workspace,
+        config,
+        top_experts,
+        num_local_experts=num_local_experts,
+        expert_padding=64,
+    )
+
+    x = torch.empty(
+        num_local_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=device
+    )
+    columns = torch.arange(hidden_size, device=device)
+    x.copy_(
+        ((token_indices[:, None] * hidden_size + columns[None, :]) % 31 - 15)
+        .add(rank * 0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    scale_columns = torch.arange(hidden_size // 128, device=device)
+    x_scale = (
+        rank * 10000 + token_indices[:, None] * 100 + scale_columns[None, :]
+    ).to(torch.float32).contiguous()
+    generator = torch.Generator(device=device).manual_seed(20260817 + rank)
+    weight = torch.randn(
+        (num_local_experts, n, hidden_size), generator=generator, device=device
+    ).clamp(-3, 3).to(torch.float8_e4m3fn)
+    weight_scale = (
+        torch.rand(
+            (num_local_experts, n // 128, hidden_size // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
+    capacity = workspace.schedule_capacity
+    valid_rows = int(schedule.num_tokens.item())
+    assert 0 < valid_rows <= capacity and valid_rows % 64 == 0
+
+    # --- split reference: dispatch kernel + dynamic grouped GEMM ---
+    workspace.routed_x.fill_(7)
+    workspace.routed_x_scale.fill_(-999)
+    workspace.m_indices.fill_(-777)
+    routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=False,
+        prepare_combine=True,
+    )
+    gate_up_ref = torch.full(
+        (capacity, n), sentinel, dtype=torch.bfloat16, device=device
+    )
+    functional.grouped_gemm_fp8_block_dynamic_out(
+        routed_x,
+        weight,
+        routed_x_scale,
+        weight_scale,
+        m_indices,
+        schedule.num_tokens,
+        gate_up_ref,
+    )
+    routed_x_ref = workspace.routed_x.clone()
+    routed_x_scale_ref = workspace.routed_x_scale.clone()
+    m_indices_ref = workspace.m_indices.clone()
+
+    # --- fused path on a poisoned workspace ---
+    workspace.routed_x.fill_(7)
+    workspace.routed_x_scale.fill_(-999)
+    workspace.m_indices.fill_(-777)
+    gate_up_fused = torch.full(
+        (capacity, n), sentinel, dtype=torch.bfloat16, device=device
+    )
+    functional.dispatch_gemm_fused_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        weight,
+        weight_scale,
+        gate_up_fused,
+        copy_clusters=copy_clusters,
+    )
+
+    mismatches = torch.tensor(
+        [
+            int(
+                (
+                    workspace.routed_x[:valid_rows].view(torch.uint8)
+                    != routed_x_ref[:valid_rows].view(torch.uint8)
+                ).sum()
+            ),
+            int(
+                (
+                    workspace.routed_x_scale[:valid_rows]
+                    != routed_x_scale_ref[:valid_rows]
+                ).sum()
+            ),
+            int((workspace.m_indices != m_indices_ref).sum()),
+            int((workspace.routed_x[valid_rows:] != 7).sum()),
+            int((workspace.routed_x_scale[valid_rows:] != -999).sum()),
+            int(
+                (
+                    gate_up_fused[:valid_rows].view(torch.uint16)
+                    != gate_up_ref[:valid_rows].view(torch.uint16)
+                ).sum()
+            ),
+            int((gate_up_fused[valid_rows:] != sentinel).sum()),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"FUSED_DISPATCH_GEMM_MISMATCH|rank={rank}|cc={copy_clusters}|"
+        f"values={mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not mismatches.any().item()
+
+
 def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
     context: tuple[int, int, torch.device]
 ) -> None:
