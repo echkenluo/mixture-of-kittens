@@ -124,28 +124,64 @@ struct combine_globals {
     int hidden_size;
     int topk;
     int schedule_capacity;
+    // Fused-barrier arrive state (may be null for the legacy separate-barrier
+    // path): the last completing block publishes the expected barrier value
+    // and issues the multicast arrive that barrier_all used to perform.
+    unsigned int *completion_counter;
+    unsigned int *barrier_target;
+    unsigned int *barrier_expected_scratch;
+    unsigned int *barrier_multicast_ptr;
 };
 
 __global__ __launch_bounds__(THREADS, 1)
 void combine_kernel(const __grid_constant__ combine_globals g) {
     const int row = blockIdx.x;
-    if (row >= g.schedule_capacity || row >= g.num_tokens[0])
+    const bool in_range = row < g.schedule_capacity && row < g.num_tokens[0];
+    bool wrote_peer = false;
+    if (in_range) {
+        const int peer_rank = g.schedule_peer_rank[row];
+        const int peer_token_idx = g.schedule_peer_token_idx[row];
+        if (peer_rank >= 0 && peer_rank < g.ep_size && peer_token_idx >= 0
+            && peer_token_idx < g.num_local_tokens * g.topk) {
+            // BF16 rows are uint4 aligned because hidden_size is K128 aligned.
+            const int row_bytes = g.hidden_size * 2;
+            const int vectors = row_bytes / static_cast<int>(sizeof(uint4));
+            const auto *src = reinterpret_cast<const uint4 *>(g.routed_y)
+                              + static_cast<size_t>(row) * vectors;
+            auto *dst = reinterpret_cast<uint4 *>(g.combine_peer[peer_rank])
+                        + static_cast<size_t>(peer_token_idx) * vectors;
+            for (int index = threadIdx.x; index < vectors; index += blockDim.x)
+                dst[index] = src[index];
+            wrote_peer = true;
+        }
+    }
+    if (g.completion_counter == nullptr)
         return;
-    const int peer_rank = g.schedule_peer_rank[row];
-    const int peer_token_idx = g.schedule_peer_token_idx[row];
-    if (peer_rank < 0 || peer_rank >= g.ep_size || peer_token_idx < 0
-        || peer_token_idx >= g.num_local_tokens * g.topk)
-        return;
-
-    // BF16 rows are also uint4 aligned because hidden_size is K128 aligned.
-    const int row_bytes = g.hidden_size * 2;
-    const int vectors = row_bytes / static_cast<int>(sizeof(uint4));
-    const auto *src = reinterpret_cast<const uint4 *>(g.routed_y)
-                      + static_cast<size_t>(row) * vectors;
-    auto *dst = reinterpret_cast<uint4 *>(g.combine_peer[peer_rank])
-                + static_cast<size_t>(peer_token_idx) * vectors;
-    for (int index = threadIdx.x; index < vectors; index += blockDim.x)
-        dst[index] = src[index];
+    // Fused arrive: every block (early-exit ones included) joins the
+    // completion count so the last one can arrive on behalf of this rank.
+    if (wrote_peer)
+        asm volatile("{fence.release.sys;}" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int finished =
+            atomicAdd(g.completion_counter, 1u) + 1u;
+        if (finished == gridDim.x) {
+            *g.completion_counter = 0u;  // reset for the next graph replay
+            const unsigned int expected =
+                atomicAdd(g.barrier_target,
+                          static_cast<unsigned int>(g.ep_size))
+                + static_cast<unsigned int>(g.ep_size);
+            // Publish before the arrive: the consumer first spins on the
+            // scratch becoming nonzero, then on the barrier flag itself.
+            asm volatile("{st.release.gpu.global.u32 [%0], %1;}" ::
+                         "l"(g.barrier_expected_scratch), "r"(expected)
+                         : "memory");
+            asm volatile(
+                "{multimem.red.release.sys.global.add.u32 [%0], 1;}" ::
+                "l"(g.barrier_multicast_ptr) : "memory");
+            asm volatile("{fence.proxy.alias;}" ::: "memory");
+        }
+    }
 }
 
 inline void check_pointer_list(const std::vector<int64_t> &pointers,
@@ -306,7 +342,11 @@ inline void combine_out(
     const std::vector<int64_t> &combine_buffer_ptrs,
     const at::Tensor &schedule_peer_rank,
     const at::Tensor &schedule_peer_token_idx, const at::Tensor &num_tokens,
-    int64_t topk) {
+    int64_t topk,
+    unsigned int *completion_counter = nullptr,
+    unsigned int *barrier_target = nullptr,
+    unsigned int *barrier_expected_scratch = nullptr,
+    unsigned int *barrier_multicast_ptr = nullptr) {
     TORCH_CHECK(routed_y.dim() == 2 && routed_y.is_cuda()
                     && routed_y.scalar_type() == at::kBFloat16
                     && routed_y.is_contiguous(),
@@ -347,6 +387,17 @@ inline void combine_out(
     globals.hidden_size = static_cast<int>(hidden_size);
     globals.topk = static_cast<int>(topk);
     globals.schedule_capacity = static_cast<int>(schedule_capacity);
+    globals.completion_counter = completion_counter;
+    globals.barrier_target = barrier_target;
+    globals.barrier_expected_scratch = barrier_expected_scratch;
+    globals.barrier_multicast_ptr = barrier_multicast_ptr;
+    TORCH_CHECK(
+        (completion_counter == nullptr) == (barrier_target == nullptr)
+            && (completion_counter == nullptr)
+                   == (barrier_expected_scratch == nullptr)
+            && (completion_counter == nullptr)
+                   == (barrier_multicast_ptr == nullptr),
+        "fused-barrier pointers must be all set or all null");
 
     c10::cuda::CUDAGuard device_guard(routed_y.device());
     cudaStream_t stream =

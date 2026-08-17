@@ -73,6 +73,11 @@ struct globals_routed_epilogue {
     activation_gl combine_buffer;  // (num_local_tokens * topk, H)
     weight_gl topk_weights;        // (num_local_tokens, topk)
     activation_gl output;          // (num_local_tokens, H)
+    // Fused-barrier wait state (null for the legacy separate-barrier path):
+    // spin until the producing combine publishes the expected value, then
+    // until every rank's arrive lands on the local barrier flag.
+    const unsigned int *barrier_flag;
+    const unsigned int *barrier_expected_scratch;
 
     __host__ inline dim3 grid() const {
         const int col_blocks = (output.cols() + Nb - 1) / Nb;
@@ -86,6 +91,28 @@ struct globals_routed_epilogue {
         ) + 1024;
     }
 };
+
+static __device__ __forceinline__ void routed_epilogue_barrier_wait(
+    const globals_routed_epilogue &g
+) {
+    if (g.barrier_flag == nullptr)
+        return;
+    if (threadIdx.x == 0) {
+        unsigned int expected;
+        do {
+            asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
+                         : "=r"(expected)
+                         : "l"(g.barrier_expected_scratch) : "memory");
+        } while (expected == 0u);
+        unsigned int value;
+        do {
+            asm volatile("{ld.relaxed.sys.global.u32 %0, [%1];}"
+                         : "=r"(value) : "l"(g.barrier_flag) : "memory");
+        } while (value < expected);
+        asm volatile("{fence.acquire.sys;}" ::: "memory");
+    }
+    __syncthreads();
+}
 
 static __device__ __forceinline__ void fwd_epilogue_kernel(const globals_fwd_epilogue &g) {
     constexpr int TOKENS_PER_CTA = globals_fwd_epilogue::TOKENS_PER_CTA;
@@ -163,6 +190,8 @@ static __device__ __forceinline__ void routed_epilogue_kernel(
     constexpr int TOKENS_PER_CTA = globals_routed_epilogue::TOKENS_PER_CTA;
     using compute_group = group<config_fwd_epilogue::NUM_WARPS>;
 
+    routed_epilogue_barrier_wait(g);
+
     const int tid = threadIdx.x;
     const int topk = g.topk_weights.cols();
     const int col_blocks =
@@ -237,7 +266,9 @@ static __device__ __forceinline__ void routed_epilogue_kernel(
 static __host__ void routed_epilogue_out(
     const at::Tensor &combine_buffer,
     const at::Tensor &topk_weights,
-    const at::Tensor &output
+    const at::Tensor &output,
+    const unsigned int *barrier_flag = nullptr,
+    const unsigned int *barrier_expected_scratch = nullptr
 ) {
     globals_routed_epilogue g {
         .combine_buffer = kittens::py::tensor_to_gl<
@@ -249,6 +280,8 @@ static __host__ void routed_epilogue_out(
         .output = kittens::py::tensor_to_gl<
             globals_routed_epilogue::activation_gl
         >(output),
+        .barrier_flag = barrier_flag,
+        .barrier_expected_scratch = barrier_expected_scratch,
     };
     kittens::py::launch_kernel<
         config_fwd_epilogue,

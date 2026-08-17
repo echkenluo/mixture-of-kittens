@@ -129,8 +129,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"),
           pybind11::arg("tokens_per_expert"), pybind11::arg("topk"));
     m.def("fp8_block_routed_combine_out",
-          &mok_sm90::fp8_block_routed::combine_out, "",
-          pybind11::arg("routed_y"), pybind11::arg("combine_buffer"),
+          [](const at::Tensor &routed_y, const at::Tensor &combine_buffer,
+             const std::vector<int64_t> &combine_buffer_ptrs,
+             const at::Tensor &schedule_peer_rank,
+             const at::Tensor &schedule_peer_token_idx,
+             const at::Tensor &num_tokens, int64_t topk) {
+              mok_sm90::fp8_block_routed::combine_out(
+                  routed_y, combine_buffer, combine_buffer_ptrs,
+                  schedule_peer_rank, schedule_peer_token_idx, num_tokens,
+                  topk);
+          },
+          "", pybind11::arg("routed_y"), pybind11::arg("combine_buffer"),
           pybind11::arg("combine_buffer_ptrs"),
           pybind11::arg("schedule_peer_rank"),
           pybind11::arg("schedule_peer_token_idx"),
@@ -161,12 +170,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("barrier_buffer_ptrs"),
           pybind11::arg("barrier_buffer_multicast_ptr"),
           pybind11::arg("barrier_target"), pybind11::arg("topk"),
-          pybind11::arg("combine_precleared") = false);
+          pybind11::arg("combine_precleared") = false,
+          pybind11::arg("combine_completion") = pybind11::none(),
+          pybind11::arg("barrier_expected_scratch") = pybind11::none());
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
-    m.def("routed_epilogue_out", &utils::routed_epilogue_out, "",
-          pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
+    m.def("routed_epilogue_out",
+          [](const at::Tensor &combine_buffer, const at::Tensor &topk_weights,
+             const at::Tensor &output) {
+              utils::routed_epilogue_out(combine_buffer, topk_weights, output);
+          },
+          "", pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
           pybind11::arg("output"));
     m.def("bwd_epilogue", &utils::bwd_epilogue, "",
           pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));

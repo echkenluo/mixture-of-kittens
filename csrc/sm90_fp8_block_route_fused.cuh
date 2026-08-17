@@ -165,7 +165,10 @@ inline void combine_reduce_out(
     const std::vector<int64_t> &barrier_buffer_ptrs,
     int64_t barrier_buffer_multicast_ptr,
     const at::Tensor &barrier_target, int64_t topk,
-    bool combine_precleared) {
+    bool combine_precleared,
+    const c10::optional<at::Tensor> &combine_completion = c10::nullopt,
+    const c10::optional<at::Tensor> &barrier_expected_scratch
+    = c10::nullopt) {
     TORCH_CHECK(topk > 0 && topk <= 255, "topk must be in [1,255]");
     TORCH_CHECK(
         output.dim() == 2 && output.is_cuda()
@@ -200,6 +203,23 @@ inline void combine_reduce_out(
         barrier_buffer, barrier_buffer_ptrs,
         barrier_buffer_multicast_ptr, barrier_target, output.device());
 
+    const bool fused_barrier =
+        combine_completion.has_value() && barrier_expected_scratch.has_value()
+        && routed_y.size(0) != 0;
+    if (fused_barrier) {
+        const at::Tensor &completion = combine_completion.value();
+        const at::Tensor &scratch = barrier_expected_scratch.value();
+        TORCH_CHECK(
+            completion.is_cuda() && scratch.is_cuda()
+                && completion.device() == output.device()
+                && scratch.device() == output.device()
+                && completion.scalar_type() == at::kInt
+                && scratch.scalar_type() == at::kInt
+                && completion.numel() == 1 && scratch.numel() == 1
+                && completion.is_contiguous() && scratch.is_contiguous(),
+            "fused-barrier state tensors must be int32 [1] on the output device");
+    }
+
     c10::cuda::CUDAGuard device_guard(output.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(output.get_device());
     if (!combine_precleared) {
@@ -211,6 +231,29 @@ inline void combine_reduce_out(
         utils::barrier_all::entrypoint(
             barrier_buffer, barrier_buffer_ptrs,
             barrier_buffer_multicast_ptr, barrier_target);
+    }
+    if (fused_barrier) {
+        // The combine kernel's last block performs the arrive that the
+        // separate barrier kernel used to issue, and the epilogue spins on
+        // the published expected value before reading remote rows.  The
+        // scratch slot must have been zeroed earlier in this iteration
+        // (dispatch does it), which is what makes graph replay safe.
+        mok_sm90::fp8_block_routed::combine_out(
+            routed_y, combine_buffer, combine_buffer_ptrs,
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, topk,
+            reinterpret_cast<unsigned int *>(
+                combine_completion.value().data_ptr<int>()),
+            reinterpret_cast<unsigned int *>(barrier_target.data_ptr<int>()),
+            reinterpret_cast<unsigned int *>(
+                barrier_expected_scratch.value().data_ptr<int>()),
+            reinterpret_cast<unsigned int *>(barrier_buffer_multicast_ptr));
+        utils::routed_epilogue_out(
+            combine_buffer, topk_weights, output,
+            reinterpret_cast<const unsigned int *>(
+                barrier_buffer.data_ptr<int>()),
+            reinterpret_cast<const unsigned int *>(
+                barrier_expected_scratch.value().data_ptr<int>()));
+        return;
     }
     if (routed_y.size(0) != 0) {
         mok_sm90::fp8_block_routed::combine_out(

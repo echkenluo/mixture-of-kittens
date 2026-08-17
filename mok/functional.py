@@ -134,6 +134,8 @@ class MoKFP8RouteWorkspace:
     barrier_buffer_ptrs: list[int]
     barrier_buffer_multicast_ptr: int
     barrier_target: torch.Tensor
+    combine_completion: torch.Tensor       # (1,) int32, fused-arrive counter
+    barrier_expected_scratch: torch.Tensor  # (1,) int32, fused-wait expected
 
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
@@ -502,6 +504,8 @@ def create_fp8_route_workspace(
     ]
     barrier_buffer_multicast_ptr = int(barrier_buffer_handle.multicast_ptr)
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
+    combine_completion = torch.zeros(1, dtype=torch.int32, device=device)
+    barrier_expected_scratch = torch.zeros(1, dtype=torch.int32, device=device)
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -547,6 +551,8 @@ def create_fp8_route_workspace(
         barrier_buffer_ptrs=barrier_buffer_ptrs,
         barrier_buffer_multicast_ptr=barrier_buffer_multicast_ptr,
         barrier_target=barrier_target,
+        combine_completion=combine_completion,
+        barrier_expected_scratch=barrier_expected_scratch,
     )
 
 
@@ -873,6 +879,10 @@ def dispatch_fp8_block(
         # the symmetric input buffers.  It therefore also proves that every
         # destination is clear before any later peer combine stores begin.
         workspace.combine_buffer.zero_()
+        # Reset the fused-barrier expected slot for this iteration; the
+        # epilogue spins on it becoming nonzero, so zeroing must happen
+        # strictly before combine publishes it (stream order does that).
+        workspace.barrier_expected_scratch.zero_()
     fp8_block_routed_dispatch_copy_out(
         x,
         workspace.x_buffer,
@@ -1074,6 +1084,17 @@ def combine_reduce_fp8_block_routes(
             f"{expected_weights_shape}"
         )
     active_rows = routed_y.shape[0]
+    # The fused in-kernel barrier requires the scratch slot zeroed earlier in
+    # this iteration, which dispatch's prepare_combine path guarantees; the
+    # two flags are therefore enabled together.
+    fused_kwargs = (
+        {
+            "combine_completion": workspace.combine_completion,
+            "barrier_expected_scratch": workspace.barrier_expected_scratch,
+        }
+        if combine_precleared
+        else {}
+    )
     fp8_block_routed_combine_reduce_out(
         routed_y,
         workspace.combine_buffer,
@@ -1089,6 +1110,7 @@ def combine_reduce_fp8_block_routes(
         workspace.barrier_target,
         workspace.topk,
         combine_precleared,
+        **fused_kwargs,
     )
     return workspace.output
 
