@@ -16,6 +16,7 @@ from .ops import (
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fp8_block_build_schedule_out,
     fp8_block_dispatch_gemm_fused_out,
+    fp8_block_gemm_combine_fused_out,
     fp8_block_grouped_contiguous_out,
     fp8_block_grouped_contiguous_dynamic_out,
     fp8_block_routed_combine_reduce_fused_out,
@@ -24,6 +25,7 @@ from .ops import (
     fp8_block_routed_dispatch_copy_out,
     fp8_block_routed_dispatch_out,
     fwd_epilogue,
+    routed_epilogue_fused_out,
     routed_epilogue_out,
     schedule,
 )
@@ -140,6 +142,7 @@ class MoKFP8RouteWorkspace:
     barrier_expected_scratch: torch.Tensor  # (1,) int32, fused-wait expected
     input_expected_scratch: torch.Tensor    # (1,) int32, fused dispatch wait
     tile_ready: torch.Tensor  # (capacity/64,) int32 producer->consumer count
+    down_ready: torch.Tensor  # (capacity/64,) int32 down-GEMM tile count
 
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
@@ -514,6 +517,9 @@ def create_fp8_route_workspace(
     tile_ready = torch.zeros(
         schedule_capacity // 64, dtype=torch.int32, device=device
     )
+    down_ready = torch.zeros(
+        schedule_capacity // 64, dtype=torch.int32, device=device
+    )
 
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
@@ -563,6 +569,7 @@ def create_fp8_route_workspace(
         barrier_expected_scratch=barrier_expected_scratch,
         input_expected_scratch=input_expected_scratch,
         tile_ready=tile_ready,
+        down_ready=down_ready,
     )
 
 
@@ -1004,6 +1011,60 @@ def dispatch_gemm_fused_fp8_block(
         copy_clusters,
     )
     return workspace.routed_x, workspace.routed_x_scale, workspace.m_indices
+
+
+def gemm_combine_fused_fp8_block(
+    workspace: MoKFP8RouteWorkspace,
+    schedule: MoKSchedule,
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    routed_y: torch.Tensor,
+    topk_weights: torch.Tensor,
+    push_clusters: int = 8,
+) -> torch.Tensor:
+    """Down GEMM, combine push, fused arrive, and the waiting epilogue.
+
+    Symmetric second cut: replaces the dynamic down GEMM + precleared
+    combine_reduce pair.  Requires the same-iteration dispatch to have run
+    with prepare_combine semantics (combine buffers cleared and proven by the
+    input barrier, barrier_expected_scratch zeroed).  down_ready is cleared
+    here, stream-ordered after the previous iteration's readers.
+    """
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    workspace.down_ready.zero_()
+    fp8_block_gemm_combine_fused_out(
+        down_input,
+        down_input_scale,
+        weight,
+        weight_scale,
+        workspace.m_indices,
+        schedule.num_tokens,
+        routed_y,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        workspace.topk,
+        workspace.down_ready,
+        workspace.combine_completion,
+        workspace.barrier_target,
+        workspace.barrier_expected_scratch,
+        workspace.barrier_buffer_multicast_ptr,
+        push_clusters,
+    )
+    routed_epilogue_fused_out(
+        workspace.combine_buffer,
+        topk_weights,
+        workspace.output,
+        workspace.barrier_buffer,
+        workspace.barrier_expected_scratch,
+    )
+    return workspace.output
 
 
 def combine_fp8_block(

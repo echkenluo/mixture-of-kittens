@@ -1247,6 +1247,173 @@ def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
     assert not mismatches.any().item()
 
 
+@pytest.mark.parametrize("push_clusters", [8, 2], ids=["pc8", "pc2"])
+def test_sm90_fp8_block_gemm_combine_fused_matches_split(
+    push_clusters: int,
+    context: tuple[int, int, torch.device],
+) -> None:
+    """The fused down-GEMM+combine persistent kernel plus fused-wait epilogue
+    must reproduce the split dynamic-GEMM -> precleared combine_reduce pair
+    bitwise, on both the GEMM output and the reduced output."""
+    rank, world_size, device = context
+    require_sm90(device)
+    assert world_size in (4, 8, 16, 32, 64)
+    if not hasattr(_C, "fp8_block_gemm_combine_fused_out"):
+        pytest.skip("extension lacks the fused GEMM+combine kernel")
+
+    num_local_tokens = 512
+    hidden_size = 256
+    topk = 1
+    num_local_experts = 2
+    sentinel = 101.0
+    config = functional.MoKConfig(
+        fwd_num_comm_sms=2,
+        bwd_num_comm_sms=2,
+        minibatch_size=256,
+        macrobatch_size=4096,
+        schedule_capacity_multiplier=1.0,
+    )
+    workspace = functional.get_fp8_route_workspace(
+        config,
+        dist.group.WORLD,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        hidden_size=hidden_size,
+        topk=topk,
+        num_local_experts=num_local_experts,
+    )
+    token_indices = torch.arange(num_local_tokens, device=device)
+    destination_ranks = token_indices % world_size
+    local_experts = ((token_indices // world_size) % 4 == 0).to(torch.int64)
+    top_experts = (
+        destination_ranks * num_local_experts + local_experts
+    ).view(-1, 1)
+    schedule = functional.build_schedule(
+        workspace,
+        config,
+        top_experts,
+        num_local_experts=num_local_experts,
+        expert_padding=64,
+    )
+    x = torch.empty(
+        num_local_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=device
+    )
+    columns = torch.arange(hidden_size, device=device)
+    x.copy_(
+        ((token_indices[:, None] * hidden_size + columns[None, :]) % 31 - 15)
+        .add(rank * 0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    scale_columns = torch.arange(hidden_size // 128, device=device)
+    x_scale = (
+        rank * 10000 + token_indices[:, None] * 100 + scale_columns[None, :]
+    ).to(torch.float32).contiguous()
+    generator = torch.Generator(device=device).manual_seed(20260818 + rank)
+    w2 = torch.randn(
+        (num_local_experts, hidden_size, hidden_size),
+        generator=generator,
+        device=device,
+    ).clamp(-3, 3).to(torch.float8_e4m3fn)
+    w2_scale = (
+        torch.rand(
+            (num_local_experts, hidden_size // 128, hidden_size // 128),
+            generator=generator,
+            device=device,
+        )
+        * 0.09
+        + 0.01
+    )
+    topk_weights = torch.full(
+        (num_local_tokens, topk), 0.75, dtype=torch.float32, device=device
+    )
+    capacity = workspace.schedule_capacity
+    valid_rows = int(schedule.num_tokens.item())
+    assert 0 < valid_rows <= capacity and valid_rows % 64 == 0
+
+    # --- split reference: dispatch (preclears combine), dynamic down GEMM,
+    # precleared fused combine_reduce ---
+    routed_x, routed_x_scale, m_indices = functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=False,
+        prepare_combine=True,
+    )
+    routed_y_ref = torch.full(
+        (capacity, hidden_size), sentinel, dtype=torch.bfloat16, device=device
+    )
+    functional.grouped_gemm_fp8_block_dynamic_out(
+        routed_x,
+        w2,
+        routed_x_scale,
+        w2_scale,
+        m_indices,
+        schedule.num_tokens,
+        routed_y_ref,
+    )
+    output_ref = functional.combine_reduce_fp8_block_routes(
+        workspace,
+        schedule,
+        routed_y_ref[:valid_rows],
+        topk_weights,
+        combine_precleared=True,
+    ).clone()
+
+    # --- fused path: re-run dispatch to restore the precleared contract,
+    # then one persistent kernel + fused-wait epilogue ---
+    functional.dispatch_fp8_block(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        trim_to_active_rows=False,
+        prepare_combine=True,
+    )
+    workspace.output.fill_(0)
+    routed_y_fused = torch.full(
+        (capacity, hidden_size), sentinel, dtype=torch.bfloat16, device=device
+    )
+    output_fused = functional.gemm_combine_fused_fp8_block(
+        workspace,
+        schedule,
+        routed_x,
+        routed_x_scale,
+        w2,
+        w2_scale,
+        routed_y_fused,
+        topk_weights,
+        push_clusters=push_clusters,
+    )
+
+    mismatches = torch.tensor(
+        [
+            int(
+                (
+                    routed_y_fused[:valid_rows].view(torch.uint16)
+                    != routed_y_ref[:valid_rows].view(torch.uint16)
+                ).sum()
+            ),
+            int((routed_y_fused[valid_rows:] != sentinel).sum()),
+            int(
+                (
+                    output_fused.view(torch.uint16)
+                    != output_ref.view(torch.uint16)
+                ).sum()
+            ),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(mismatches, op=dist.ReduceOp.MAX)
+    print(
+        f"FUSED_GEMM_COMBINE_MISMATCH|rank={rank}|pc={push_clusters}|"
+        f"values={mismatches.cpu().tolist()}",
+        flush=True,
+    )
+    assert not mismatches.any().item()
+
+
 def test_sm90_fp8_block_grouped_contiguous_rejects_invalid_inputs(
     context: tuple[int, int, torch.device]
 ) -> None:

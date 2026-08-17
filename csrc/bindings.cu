@@ -6,6 +6,7 @@
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
+#include "sm90_fp8_block_gemm_combine.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::entrypoint, "",
@@ -189,6 +190,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("tile_ready"), pybind11::arg("B"),
           pybind11::arg("B_scale"), pybind11::arg("D"),
           pybind11::arg("copy_clusters") = 8);
+    m.def("fp8_block_gemm_combine_fused_out",
+          &mok_sm90::fp8_block_gemm_combine::entry_out, "",
+          pybind11::arg("down_input"), pybind11::arg("down_input_scale"),
+          pybind11::arg("weight"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("routed_y"), pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("combine_buffer"),
+          pybind11::arg("combine_buffer_ptrs"), pybind11::arg("topk"),
+          pybind11::arg("down_ready"), pybind11::arg("combine_completion"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("barrier_expected_scratch"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("push_clusters") = 8);
+    m.def("routed_epilogue_fused_out",
+          [](const at::Tensor &combine_buffer, const at::Tensor &topk_weights,
+             const at::Tensor &output, const at::Tensor &barrier_buffer,
+             const at::Tensor &barrier_expected_scratch) {
+              utils::routed_epilogue_out(
+                  combine_buffer, topk_weights, output,
+                  reinterpret_cast<const unsigned int *>(
+                      barrier_buffer.data_ptr<int>()),
+                  reinterpret_cast<const unsigned int *>(
+                      barrier_expected_scratch.data_ptr<int>()));
+          },
+          "", pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
+          pybind11::arg("output"), pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_expected_scratch"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));

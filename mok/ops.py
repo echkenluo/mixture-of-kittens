@@ -757,6 +757,88 @@ def fp8_block_dispatch_gemm_fused_out(
     )
 
 
+@torch.library.custom_op(
+    "mok::fp8_block_gemm_combine_fused_out",
+    mutates_args=(
+        "routed_y",
+        "combine_buffer",
+        "down_ready",
+        "combine_completion",
+        "barrier_target",
+        "barrier_expected_scratch",
+    ),
+)
+def fp8_block_gemm_combine_fused_out(
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens: torch.Tensor,
+    routed_y: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_buffer_ptrs: list[int],
+    topk: int,
+    down_ready: torch.Tensor,
+    combine_completion: torch.Tensor,
+    barrier_target: torch.Tensor,
+    barrier_expected_scratch: torch.Tensor,
+    barrier_buffer_multicast_ptr: int,
+    push_clusters: int = 8,
+) -> None:
+    """Down GEMM and combine push in one persistent kernel, arrive fused."""
+    if not hasattr(_C, "fp8_block_gemm_combine_fused_out"):
+        raise RuntimeError(
+            "the loaded MoK extension lacks the fused GEMM+combine kernel"
+        )
+    _C.fp8_block_gemm_combine_fused_out(
+        down_input,
+        down_input_scale,
+        weight,
+        weight_scale,
+        m_indices,
+        num_tokens,
+        routed_y,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        combine_buffer,
+        combine_buffer_ptrs,
+        topk,
+        down_ready,
+        combine_completion,
+        barrier_target,
+        barrier_expected_scratch,
+        barrier_buffer_multicast_ptr,
+        push_clusters,
+    )
+
+
+@torch.library.custom_op(
+    "mok::routed_epilogue_fused_out", mutates_args=("output",)
+)
+def routed_epilogue_fused_out(
+    combine_buffer: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_buffer: torch.Tensor,
+    barrier_expected_scratch: torch.Tensor,
+) -> None:
+    """Routed epilogue whose head spins on the fused-barrier publication."""
+    if not hasattr(_C, "routed_epilogue_fused_out"):
+        raise RuntimeError(
+            "the loaded MoK extension lacks the fused-wait epilogue"
+        )
+    _C.routed_epilogue_fused_out(
+        combine_buffer,
+        topk_weights,
+        output,
+        barrier_buffer,
+        barrier_expected_scratch,
+    )
+
+
 def _validate_fp8_block_grouped_contiguous(
     input: torch.Tensor,
     weight: torch.Tensor,
