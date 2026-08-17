@@ -64,6 +64,19 @@ struct globals {
     int n_tiles;
 };
 
+// The monotonic barrier arrive that the peers' fused-wait epilogue consumes:
+// publish the expected value, then the multicast increment.
+__device__ __forceinline__ void fused_arrive(const globals &g) {
+    const unsigned int expected =
+        atomicAdd(g.barrier_target, static_cast<unsigned int>(g.ep_size))
+        + static_cast<unsigned int>(g.ep_size);
+    asm volatile("{st.release.gpu.global.u32 [%0], %1;}" ::
+                 "l"(g.barrier_expected_scratch), "r"(expected) : "memory");
+    asm volatile("{multimem.red.release.sys.global.add.u32 [%0], 1;}" ::
+                 "l"(g.barrier_multicast_ptr) : "memory");
+    asm volatile("{fence.proxy.alias;}" ::: "memory");
+}
+
 // Executed by the GEMM CTA that completes its M64 block last (the
 // last-arriver): push all 64 rows to their peers' combine buffers, join the
 // block-completion count, and let the very last pusher issue the fused
@@ -110,17 +123,7 @@ __device__ __forceinline__ void push_block(const globals &g, int m_tile) {
         if (finished == active_blocks) {
             asm volatile("{fence.acquire.sys;}" ::: "memory");
             *g.completion_counter = 0u;  // reset for the next graph replay
-            const unsigned int expected =
-                atomicAdd(g.barrier_target,
-                          static_cast<unsigned int>(g.ep_size))
-                + static_cast<unsigned int>(g.ep_size);
-            asm volatile("{st.release.gpu.global.u32 [%0], %1;}" ::
-                         "l"(g.barrier_expected_scratch), "r"(expected)
-                         : "memory");
-            asm volatile(
-                "{multimem.red.release.sys.global.add.u32 [%0], 1;}" ::
-                "l"(g.barrier_multicast_ptr) : "memory");
-            asm volatile("{fence.proxy.alias;}" ::: "memory");
+            fused_arrive(g);
         }
     }
 }
@@ -133,8 +136,15 @@ __device__ __forceinline__ void gemm_role(const globals &g,
     const int n_tile = n_tile_base + cta_rank;
     const int m_tile = gemm_cluster_idx / n_pairs;
     const int global_row_base = m_tile * 64;
-    if (global_row_base >= g.num_tokens[0])
+    if (global_row_base >= g.num_tokens[0]) {
+        // An empty rank pushes nothing, so no CTA ever reaches the
+        // completion count -- yet every rank must arrive or the peers'
+        // fused-wait epilogue spins forever.  The first CTA arrives on the
+        // rank's behalf; there is nothing to order, the arrive is enough.
+        if (blockIdx.x == 0 && threadIdx.x == 0 && g.num_tokens[0] == 0)
+            fused_arrive(g);
         return;
+    }
 
     const int expert = g.m_indices[global_row_base];
 
