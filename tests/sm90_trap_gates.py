@@ -36,21 +36,42 @@ _CHILD_ENV = dict(
 # publishes, while GEMM workers wait on tile_ready (site 3) -- any K1
 # timeout site is a valid outcome of this injection.
 def _fields_reentrant(m):
-    # observed = prior lease value (1), rank as passed to the case.
-    return int(m[4]) == 1 and int(m[5]) == 3
+    # slot/expected/ticket/iters are structurally 0 for a lease conflict;
+    # observed = prior lease value (1); rank = the ep_rank the case passes.
+    return (
+        int(m[2]) == 0 and int(m[3]) == 0 and int(m[4]) == 1
+        and int(m[5]) == 3 and int(m[6]) == 0 and int(m[7]) == 0
+    )
 
 
 def _fields_contract(m):
-    # expected = capacity (2048), observed = injected num_tokens (65).
+    # slot 0 (contract site), expected = capacity (2048), observed = the
+    # injected num_tokens (65); pre-loop check so ticket and iters are 0.
     return (
-        int(m[3]) == 2048 and int(m[4]) == 65
+        int(m[2]) == 0 and int(m[3]) == 2048 and int(m[4]) == 65
         and 0 <= int(m[5]) < 4 and int(m[6]) == 0 and int(m[7]) == 0
     )
 
 
 def _fields_timeout(m):
-    # iters = the injected spin limit, rank within the 4-rank world.
-    return int(m[7]) == 200_000 and 0 <= int(m[5]) < 4
+    # Per-site constraints for the delayed-ticket-0 injection (capacity 512
+    # -> 8 m-tiles, 8 copy tickets, copy_cta_idx < 16):
+    #   site 1 (input scratch): waiting for the publish, expected 1 seen 0;
+    #   site 2 (barrier flag): published but arrives short of expected;
+    #   site 3 (tile_ready): a GEMM ticket (>= 8) short of 64 rows.
+    if int(m[7]) != 200_000 or not (0 <= int(m[5]) < 4):
+        return False
+    site = int(m[1])
+    slot, expected, observed, ticket = (
+        int(m[2]), int(m[3]), int(m[4]), int(m[6])
+    )
+    if site == 1:
+        return 0 <= slot < 16 and expected == 1 and observed == 0
+    if site == 2:
+        return 0 <= slot < 16 and expected > 0 and observed < expected
+    if site == 3:
+        return 0 <= slot < 8 and expected == 64 and observed < 64             and ticket >= 8
+    return False
 
 
 # (name, cmd, code, accepted sites, rc, repeats, per-field validator).  The

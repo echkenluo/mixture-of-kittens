@@ -318,7 +318,7 @@ def test_k1_arrival_skew(
 ) -> None:
     """Cross-rank arrival skew: rank 0 sleeps ~0.1s BEFORE entering K1, so
     every other rank spins in the input-publish barrier until the straggler
-    arrives; repeated 200x with short skews for volume."""
+    arrives; 1000 iterations: one long skew plus 999 short ones."""
     rank, _, device = context
     ws, schedule, x, x_scale, w, w_scale, refs, dims = _build_case(
         context, "balanced"
@@ -328,7 +328,7 @@ def test_k1_arrival_skew(
         (capacity, n), 101.0, dtype=torch.bfloat16, device=device
     )
     worst = torch.zeros(5, dtype=torch.int64, device=device)
-    skews = [200_000_000] + [5_000_000] * 199
+    skews = [200_000_000] + [5_000_000] * 999
     for skew in skews:
         _poison(ws)
         gate_up.fill_(101.0)
