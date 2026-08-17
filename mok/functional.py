@@ -1221,7 +1221,6 @@ def combine_reduce_fp8_block_routes(
         workspace.barrier_target,
         workspace.topk,
         combine_precleared,
-        **fused_kwargs,
     )
     return workspace.output
 
