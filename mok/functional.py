@@ -1022,15 +1022,16 @@ def gemm_combine_fused_fp8_block(
     weight_scale: torch.Tensor,
     routed_y: torch.Tensor,
     topk_weights: torch.Tensor,
-    push_clusters: int = 8,
 ) -> torch.Tensor:
-    """Down GEMM, combine push, fused arrive, and the waiting epilogue.
+    """Down GEMM, last-arriver combine push, fused arrive, waiting epilogue.
 
-    Symmetric second cut: replaces the dynamic down GEMM + precleared
-    combine_reduce pair.  Requires the same-iteration dispatch to have run
-    with prepare_combine semantics (combine buffers cleared and proven by the
-    input barrier, barrier_expected_scratch zeroed).  down_ready is cleared
-    here, stream-ordered after the previous iteration's readers.
+    Replaces the dynamic down GEMM + precleared combine_reduce pair.  The
+    GEMM CTA that completes each M64 block last pushes the block's rows to
+    the peers, so no resident communication CTAs are needed.  Requires the
+    same-iteration dispatch to have run with prepare_combine semantics
+    (combine buffers cleared and proven by the input barrier,
+    barrier_expected_scratch zeroed).  down_ready is cleared here,
+    stream-ordered after the previous iteration's readers.
     """
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
@@ -1055,7 +1056,6 @@ def gemm_combine_fused_fp8_block(
         workspace.barrier_target,
         workspace.barrier_expected_scratch,
         workspace.barrier_buffer_multicast_ptr,
-        push_clusters,
     )
     routed_epilogue_fused_out(
         workspace.combine_buffer,

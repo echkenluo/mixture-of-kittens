@@ -1247,14 +1247,13 @@ def test_sm90_fp8_block_dispatch_gemm_fused_matches_split(
     assert not mismatches.any().item()
 
 
-@pytest.mark.parametrize("push_clusters", [8, 2], ids=["pc8", "pc2"])
 def test_sm90_fp8_block_gemm_combine_fused_matches_split(
-    push_clusters: int,
     context: tuple[int, int, torch.device],
 ) -> None:
-    """The fused down-GEMM+combine persistent kernel plus fused-wait epilogue
-    must reproduce the split dynamic-GEMM -> precleared combine_reduce pair
-    bitwise, on both the GEMM output and the reduced output."""
+    """The fused down-GEMM + last-arriver-push persistent kernel plus the
+    fused-wait epilogue must reproduce the split dynamic-GEMM -> precleared
+    combine_reduce pair bitwise, on both the GEMM output and the reduced
+    output."""
     rank, world_size, device = context
     require_sm90(device)
     assert world_size in (4, 8, 16, 32, 64)
@@ -1383,7 +1382,6 @@ def test_sm90_fp8_block_gemm_combine_fused_matches_split(
         w2_scale,
         routed_y_fused,
         topk_weights,
-        push_clusters=push_clusters,
     )
 
     mismatches = torch.tensor(
@@ -1407,7 +1405,7 @@ def test_sm90_fp8_block_gemm_combine_fused_matches_split(
     )
     dist.all_reduce(mismatches, op=dist.ReduceOp.MAX)
     print(
-        f"FUSED_GEMM_COMBINE_MISMATCH|rank={rank}|pc={push_clusters}|"
+        f"FUSED_GEMM_COMBINE_MISMATCH|rank={rank}|"
         f"values={mismatches.cpu().tolist()}",
         flush=True,
     )

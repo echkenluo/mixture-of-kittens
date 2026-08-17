@@ -202,8 +202,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("down_ready"), pybind11::arg("combine_completion"),
           pybind11::arg("barrier_target"),
           pybind11::arg("barrier_expected_scratch"),
-          pybind11::arg("barrier_buffer_multicast_ptr"),
-          pybind11::arg("push_clusters") = 8);
+          pybind11::arg("barrier_buffer_multicast_ptr"));
     m.def("routed_epilogue_fused_out",
           [](const at::Tensor &combine_buffer, const at::Tensor &topk_weights,
              const at::Tensor &output, const at::Tensor &barrier_buffer,

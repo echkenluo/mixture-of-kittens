@@ -786,9 +786,8 @@ def fp8_block_gemm_combine_fused_out(
     barrier_target: torch.Tensor,
     barrier_expected_scratch: torch.Tensor,
     barrier_buffer_multicast_ptr: int,
-    push_clusters: int = 8,
 ) -> None:
-    """Down GEMM and combine push in one persistent kernel, arrive fused."""
+    """Down GEMM with last-arriver combine push in one persistent kernel."""
     if not hasattr(_C, "fp8_block_gemm_combine_fused_out"):
         raise RuntimeError(
             "the loaded MoK extension lacks the fused GEMM+combine kernel"
@@ -811,7 +810,6 @@ def fp8_block_gemm_combine_fused_out(
         barrier_target,
         barrier_expected_scratch,
         barrier_buffer_multicast_ptr,
-        push_clusters,
     )
 
 

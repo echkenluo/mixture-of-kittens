@@ -50,7 +50,6 @@ struct globals {
     int hidden_size;
     int topk;
     int schedule_capacity;
-    int push_clusters;                     // communication clusters up front
     // producer->consumer handoff: per-M64-tile completed-column counters
     unsigned int *down_ready;              // [capacity/64], zeroed each iter
     // fused post-combine barrier state (19c3cee protocol)
@@ -65,69 +64,50 @@ struct globals {
     int n_tiles;
 };
 
-__device__ __forceinline__ void push_role(const globals &g) {
-    const int push_cta_count = g.push_clusters * 2;
-    const int push_cta_idx = blockIdx.x;
-
+// Executed by the GEMM CTA that completes its M64 block last (the
+// last-arriver): push all 64 rows to their peers' combine buffers, join the
+// block-completion count, and let the very last pusher issue the fused
+// arrive.  Push is store-direction and fire-and-forget, so riding it on the
+// finishing CTA costs no resident communication CTAs at all -- the first
+// version's dedicated push clusters occupied SM slots for the whole kernel
+// and taxed the GEMM ~11%.
+__device__ __forceinline__ void push_block(const globals &g, int m_tile) {
     const int device_rows = g.num_tokens[0];
     const int valid_rows = device_rows < g.schedule_capacity
                                ? device_rows
                                : g.schedule_capacity;
+    const int block_base = m_tile * 64;
+    const int block_rows =
+        valid_rows - block_base < 64 ? valid_rows - block_base : 64;
     const int row_vectors =
         g.hidden_size * 2 / static_cast<int>(sizeof(uint4));  // BF16 rows
 
-    // One M64 block per CTA stride; within a block, one row per warp.  The
-    // acquire spin pairs with the GEMM CTAs' release-adds, so every store
-    // below reads a fully written routed_y row.
     constexpr int WARPS = THREADS / 32;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const unsigned int tiles_expected = static_cast<unsigned int>(g.n_tiles);
-    for (int block_base = push_cta_idx * 64; block_base < valid_rows;
-         block_base += push_cta_count * 64) {
-        if (threadIdx.x == 0) {
-            unsigned int done;
-            do {
-                asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
-                             : "=r"(done)
-                             : "l"(g.down_ready + (block_base >> 6))
-                             : "memory");
-                if (done < tiles_expected) __nanosleep(256);
-            } while (done < tiles_expected);
-        }
-        __syncthreads();
-
-        const int block_rows = valid_rows - block_base < 64
-                                   ? valid_rows - block_base
-                                   : 64;
-        for (int r = warp; r < block_rows; r += WARPS) {
-            const int row = block_base + r;
-            const int peer_rank = g.schedule_peer_rank[row];
-            const int peer_token_idx = g.schedule_peer_token_idx[row];
-            if (peer_rank < 0 || peer_rank >= g.ep_size
-                || peer_token_idx < 0
-                || peer_token_idx >= g.num_local_tokens * g.topk)
-                continue;
-            const auto *src = reinterpret_cast<const uint4 *>(g.routed_y)
-                              + static_cast<size_t>(row) * row_vectors;
-            auto *dst =
-                reinterpret_cast<uint4 *>(g.combine_peer[peer_rank])
-                + static_cast<size_t>(peer_token_idx) * row_vectors;
-            #pragma unroll 4
-            for (int i = lane; i < row_vectors; i += 32)
-                dst[i] = src[i];
-        }
+    for (int r = warp; r < block_rows; r += WARPS) {
+        const int row = block_base + r;
+        const int peer_rank = g.schedule_peer_rank[row];
+        const int peer_token_idx = g.schedule_peer_token_idx[row];
+        if (peer_rank < 0 || peer_rank >= g.ep_size || peer_token_idx < 0
+            || peer_token_idx >= g.num_local_tokens * g.topk)
+            continue;
+        const auto *src = reinterpret_cast<const uint4 *>(g.routed_y)
+                          + static_cast<size_t>(row) * row_vectors;
+        auto *dst = reinterpret_cast<uint4 *>(g.combine_peer[peer_rank])
+                    + static_cast<size_t>(peer_token_idx) * row_vectors;
+        #pragma unroll 4
+        for (int i = lane; i < row_vectors; i += 32)
+            dst[i] = src[i];
     }
-
-    // Fused arrive over the push CTAs only (GEMM CTAs exit without joining):
-    // gather each CTA's stores via the block sync, release once from thread
-    // 0, and let the last CTA acquire the chain before the multicast arrive.
     __syncthreads();
     if (threadIdx.x == 0) {
         asm volatile("{fence.release.sys;}" ::: "memory");
+        const unsigned int active_blocks = static_cast<unsigned int>(
+            (valid_rows + 63) / 64);
         const unsigned int finished =
             atomicAdd(g.completion_counter, 1u) + 1u;
-        if (finished == static_cast<unsigned int>(push_cta_count)) {
+        if (finished == active_blocks) {
             asm volatile("{fence.acquire.sys;}" ::: "memory");
             *g.completion_counter = 0u;  // reset for the next graph replay
             const unsigned int expected =
@@ -252,23 +232,32 @@ __device__ __forceinline__ void gemm_role(const globals &g,
     warpgroup::store(d_smem, out);
     warpgroup::sync(0);
     warpgroup::store(g.D, d_smem, {m_tile, n_tile});
-    // Publish tile completion: the syncthreads gathers every thread's D
-    // stores to thread 0, whose gpu-scope release-add the push CTAs pair
-    // with ld.acquire -- same closed chain as the dispatch cut.
+    // Join this M64 block's completion count.  The syncthreads gathers every
+    // thread's D stores to thread 0, whose gpu-scope release-add makes them
+    // visible through the counter's atomic chain; the CTA that observes the
+    // final count acquires that chain (so all n_tiles worth of D rows are
+    // readable) and pushes the whole block to the peers.
     __syncthreads();
+    __shared__ unsigned int block_done;
     if (threadIdx.x == 0) {
-        asm volatile("{red.release.gpu.global.add.u32 [%0], 1;}" ::
-                     "l"(g.down_ready + m_tile) : "memory");
+        unsigned int prior;
+        asm volatile("{atom.add.release.gpu.global.u32 %0, [%1], 1;}"
+                     : "=r"(prior)
+                     : "l"(g.down_ready + m_tile) : "memory");
+        block_done = prior + 1u;
+    }
+    __syncthreads();
+    if (block_done == static_cast<unsigned int>(g.n_tiles)) {
+        if (threadIdx.x == 0)
+            asm volatile("{fence.acquire.gpu;}" ::: "memory");
+        __syncthreads();
+        push_block(g, m_tile);
     }
 }
 
 __cluster_dims__(2, 1, 1) __launch_bounds__(THREADS, 1)
 __global__ void kernel(const __grid_constant__ globals g) {
-    const int cluster_idx = clusterIdx().x;
-    if (cluster_idx < g.push_clusters)
-        push_role(g);
-    else
-        gemm_role(g, cluster_idx - g.push_clusters);
+    gemm_role(g, clusterIdx().x);
 }
 
 inline void entry_out(
@@ -282,7 +271,7 @@ inline void entry_out(
     const at::Tensor &down_ready, const at::Tensor &combine_completion,
     const at::Tensor &barrier_target,
     const at::Tensor &barrier_expected_scratch,
-    int64_t barrier_buffer_multicast_ptr, int64_t push_clusters) {
+    int64_t barrier_buffer_multicast_ptr) {
     const int64_t schedule_capacity = down_input.size(0);
     TORCH_CHECK(down_input.dim() == 2 && down_input.is_cuda()
                     && down_input.scalar_type() == at::kFloat8_e4m3fn
@@ -345,8 +334,6 @@ inline void entry_out(
     }
     TORCH_CHECK(barrier_buffer_multicast_ptr > 0,
                 "barrier multicast pointer must be positive");
-    TORCH_CHECK(push_clusters > 0 && push_clusters <= 32,
-                "push_clusters must be in [1,32]");
     kittens::py::device_check(down_input, down_input_scale, m_indices,
                               weight, weight_scale);
     kittens::py::device_check(down_input, routed_y);
@@ -373,7 +360,6 @@ inline void entry_out(
     g.hidden_size = n;
     g.topk = static_cast<int>(topk);
     g.schedule_capacity = static_cast<int>(schedule_capacity);
-    g.push_clusters = static_cast<int>(push_clusters);
     g.down_ready =
         reinterpret_cast<unsigned int *>(down_ready.data_ptr<int>());
     g.completion_counter = reinterpret_cast<unsigned int *>(
@@ -391,8 +377,7 @@ inline void entry_out(
     g.n_tiles = n / 64;
 
     const int m_tiles = static_cast<int>(schedule_capacity / 64);
-    const int total_ctas =
-        static_cast<int>(push_clusters) * 2 + m_tiles * g.n_tiles;
+    const int total_ctas = m_tiles * g.n_tiles;
     constexpr int PIPE_DEPTH = 2;
     constexpr int SMEM =
         PIPE_DEPTH * (sizeof(a_st) + sizeof(b_st)) + sizeof(d_st) + 1024;
