@@ -153,9 +153,23 @@ __device__ __forceinline__ void copy_role(const globals &g) {
             const float *src_scale =
                 g.x_scale_peer[peer_rank]
                 + static_cast<size_t>(source_row) * g.scale_columns;
-            #pragma unroll 4
-            for (int i = lane; i < fp8_vectors; i += 32)
-                dst_vectors[i] = src_vectors[i];
+            // Stage through registers: all of a chunk's remote loads issue
+            // before any store, so their latencies overlap.  The interleaved
+            // load/store form serialized on the possible dst/src alias.
+            constexpr int VEC_CHUNK = 8;  // 32 lanes x 8 x 16B = 4KB per pass
+            uint4 buffer[VEC_CHUNK];
+            for (int base = 0; base < fp8_vectors; base += 32 * VEC_CHUNK) {
+                #pragma unroll
+                for (int j = 0; j < VEC_CHUNK; ++j) {
+                    const int i = base + lane + j * 32;
+                    if (i < fp8_vectors) buffer[j] = src_vectors[i];
+                }
+                #pragma unroll
+                for (int j = 0; j < VEC_CHUNK; ++j) {
+                    const int i = base + lane + j * 32;
+                    if (i < fp8_vectors) dst_vectors[i] = buffer[j];
+                }
+            }
             for (int i = lane; i < g.scale_columns; i += 32)
                 dst_scale[i] = src_scale[i];
         } else {
