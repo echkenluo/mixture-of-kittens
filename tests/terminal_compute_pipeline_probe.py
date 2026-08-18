@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Exact single-kernel probe for terminal W13 -> activation -> W2 compute.
 
-The reference path is the repository's existing split cluster-2 contiguous
-WGMMA kernel, followed by the established 256-thread activation oracle, then
-the same split WGMMA kernel for W2.  The candidate executes every numerical
-task from the committed 65-task/M64 device cursor inside one fixed-resident
-cluster-worker kernel.  All four exposed boundaries are compared bitwise.
+The split reference independently launches W13 and W2, but its activation
+kernel intentionally shares ``activate_quant_worker`` with the candidate.  It
+therefore proves the persistent-kernel integration, not activation arithmetic
+independently.  ``--require-sglang-reference`` adds the production SGLang
+activation kernel as that independent oracle, matching terminal_activation_probe.
+
+The cursor follows native reverse-macrobatch and per-minibatch stage order.  Its
+stage-local M-major order is an intentional port choice and is not claimed to
+equal native MoK's expert-segment 2-D swizzle.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -26,17 +31,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rows",
         default="64,128",
-        help="comma-separated positive M64 row counts",
+        help=(
+            "additional comma-separated capacity=active M64 cases; required "
+            "serial, reverse-tail, capacity-tail, and empty cases always run"
+        ),
     )
     parser.add_argument("--seeds", type=int, default=2)
-    parser.add_argument("--experts", type=int, default=1)
+    parser.add_argument("--experts", type=int, default=2)
     parser.add_argument("--limit", type=float, default=10.0)
+    parser.add_argument(
+        "--require-sglang-reference",
+        action="store_true",
+        help="require production SGLang activation exactness in this run",
+    )
     parser.add_argument(
         "--verbose-build",
         action="store_true",
         help="show the complete nvcc/ptxas build log",
     )
     return parser.parse_args()
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    capacity_rows: int
+    active_rows: int
+    minibatch_rows: int
+    macrobatch_rows: int
+
+
+def build_cases(extra_rows: list[int]) -> list[Case]:
+    required = [
+        # One worker executes all 65 logical tasks and repeatedly reuses the
+        # same two mbarriers/phase bitfields across W13, activation, and W2.
+        Case("serial65", 64, 64, 64, 64),
+        Case("multi_m64", 128, 128, 128, 128),
+        # Active rows 256..319 (the partial last macrobatch) are decoded first,
+        # followed by the two minibatches in macrobatch zero.  The last capacity
+        # M64 is inactive and must retain every sentinel/counter zero.
+        Case("reverse_partial_capacity", 384, 320, 128, 256),
+        Case("empty_rank", 64, 0, 64, 64),
+    ]
+    required.extend(
+        Case(f"flat_{rows}", rows, rows, rows, rows) for rows in extra_rows
+    )
+    unique: dict[tuple[int, int, int, int], Case] = {}
+    for case in required:
+        unique.setdefault(
+            (
+                case.capacity_rows,
+                case.active_rows,
+                case.minibatch_rows,
+                case.macrobatch_rows,
+            ),
+            case,
+        )
+    return list(unique.values())
 
 
 def thunderkittens_include() -> Path:
@@ -105,28 +156,53 @@ def mismatch_count(reference: torch.Tensor, candidate: torch.Tensor) -> int:
 
 
 def require_exact(
-    name: str, rows: int, seed: int, reference: torch.Tensor, candidate: torch.Tensor
+    name: str,
+    case: Case,
+    workers: int,
+    seed: int,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
 ) -> None:
     mismatches = mismatch_count(reference, candidate)
     if mismatches:
         raise RuntimeError(
-            f"{name} mismatch rows={rows} seed={seed} count={mismatches}"
+            f"{name} mismatch case={case.name} workers={workers} "
+            f"seed={seed} count={mismatches}"
+        )
+
+
+def require_state(
+    name: str, case: Case, workers: int, tensor: torch.Tensor, expected: int
+) -> None:
+    if tensor.numel() and not bool((tensor == expected).all()):
+        raise RuntimeError(
+            f"{name} mismatch case={case.name} workers={workers} "
+            f"expected={expected}"
         )
 
 
 def main() -> int:
     args = parse_args()
-    rows_cases = sorted({int(value) for value in args.rows.split(",") if value})
-    if not rows_cases or any(rows <= 0 or rows % 64 for rows in rows_cases):
+    extra_rows = sorted({int(value) for value in args.rows.split(",") if value})
+    if any(rows <= 0 or rows % 64 for rows in extra_rows):
         raise ValueError("--rows must contain positive M64 multiples")
-    if 64 not in rows_cases or not any(rows > 64 for rows in rows_cases):
-        raise ValueError("the probe requires both single-M64 and multi-M64 cases")
-    if args.seeds < 1 or args.experts < 1:
-        raise ValueError("--seeds and --experts must be positive")
+    if args.seeds < 1:
+        raise ValueError("--seeds must be positive")
+    if args.experts < 2:
+        raise ValueError("--experts must be at least 2 for task-local selection")
+    cases = build_cases(extra_rows)
 
     torch.cuda.set_device(0)
     module = build_extension(args.verbose_build)
+    sglang_reference = None
+    if args.require_sglang_reference:
+        from sglang.jit_kernel.dsv4 import (
+            silu_and_mul_contig_post_quant_dynamic,
+        )
+
+        sglang_reference = silu_and_mul_contig_post_quant_dynamic
     attrs = [int(value) for value in module.attributes()]
+    worker_cases = sorted({1, attrs[5]})
     print(
         "TERMINAL_COMPUTE_ATTR"
         f"|regs={attrs[0]}|static_smem={attrs[1]}|local={attrs[2]}"
@@ -143,131 +219,373 @@ def main() -> int:
         w2 = make_fp8((args.experts, 4096, 2048), generator)
         w2_scale = make_scale((args.experts, 32, 16), generator)
 
-        for rows in rows_cases:
-            x = make_fp8((rows, 4096), generator)
-            x_scale = make_scale((rows, 32), generator)
+        for case in cases:
+            capacity_rows = case.capacity_rows
+            active_rows = case.active_rows
+            capacity_tiles = capacity_rows // 64
+            active_tiles = active_rows // 64
+            active_tasks = active_tiles * 65
+            capacity_tasks = capacity_tiles * 65
+
+            x = make_fp8((capacity_rows, 4096), generator)
+            x_scale = make_scale((capacity_rows, 32), generator)
             # Each M64 tile uses one expert, matching the contiguous grouped
-            # contract.  Cycling experts also verifies task-local selection.
-            m_indices = torch.empty(rows, dtype=torch.int32, device="cuda")
-            for m_tile in range(rows // 64):
+            # contract.  At least two active M64s select distinct experts.
+            m_indices = torch.empty(
+                capacity_rows, dtype=torch.int32, device="cuda"
+            )
+            for m_tile in range(capacity_tiles):
                 m_indices[m_tile * 64 : (m_tile + 1) * 64] = (
                     m_tile % args.experts
                 )
-            num_tokens = torch.tensor([rows], dtype=torch.int32, device="cuda")
+            if active_tiles >= 2:
+                active_experts = m_indices[:active_rows:64]
+                if int(torch.unique(active_experts).numel()) < 2:
+                    raise RuntimeError(
+                        f"multi-expert coverage missing for case={case.name}"
+                    )
+            num_tokens = torch.tensor(
+                [active_rows], dtype=torch.int32, device="cuda"
+            )
 
             gate_up_ref = torch.empty(
-                (rows, 4096), dtype=torch.bfloat16, device="cuda"
+                (capacity_rows, 4096), dtype=torch.bfloat16, device="cuda"
             )
             hidden_ref = torch.empty(
-                (rows, 2048), dtype=torch.float8_e4m3fn, device="cuda"
+                (capacity_rows, 2048),
+                dtype=torch.float8_e4m3fn,
+                device="cuda",
             )
             hidden_scale_ref = torch.empty(
-                (rows, 16), dtype=torch.float32, device="cuda"
+                (capacity_rows, 16), dtype=torch.float32, device="cuda"
             )
             y_ref = torch.empty(
-                (rows, 4096), dtype=torch.bfloat16, device="cuda"
+                (capacity_rows, 4096), dtype=torch.bfloat16, device="cuda"
             )
-            module.run_split(
-                x,
-                x_scale,
-                w13,
-                w13_scale,
-                w2,
-                w2_scale,
-                m_indices,
-                gate_up_ref,
-                hidden_ref,
-                hidden_scale_ref,
-                y_ref,
-                args.limit,
-            )
-
-            gate_up = torch.full_like(gate_up_ref, float("nan"))
-            hidden = torch.empty_like(hidden_ref)
-            hidden.view(torch.uint8).fill_(0x7F)
-            hidden_scale = torch.full_like(hidden_scale_ref, float("nan"))
-            y = torch.full_like(y_ref, float("nan"))
-            m_tiles = rows // 64
-            total_tasks = m_tiles * 65
-            cursor = torch.zeros(1, dtype=torch.int32, device="cuda")
-            worker_ticket = torch.zeros(
-                max(256, attrs[5]), dtype=torch.int32, device="cuda"
-            )
-            gate_up_ready = torch.zeros(
-                (m_tiles, 16), dtype=torch.int32, device="cuda"
-            )
-            hidden_ready = torch.zeros(m_tiles, dtype=torch.int32, device="cuda")
-            y_ready = torch.zeros(m_tiles, dtype=torch.int32, device="cuda")
-            task_visits = torch.zeros(
-                total_tasks, dtype=torch.int32, device="cuda"
-            )
-            errors = torch.zeros(1, dtype=torch.int32, device="cuda")
-
-            # One minibatch contains the whole case so rows>64 exercises the
-            # decoder's stage-major ordering across multiple M64 tiles.
-            module.run_terminal(
-                x,
-                x_scale,
-                w13,
-                w13_scale,
-                w2,
-                w2_scale,
-                m_indices,
-                num_tokens,
-                gate_up,
-                hidden,
-                hidden_scale,
-                y,
-                cursor,
-                worker_ticket,
-                gate_up_ready,
-                hidden_ready,
-                y_ready,
-                task_visits,
-                errors,
-                rows,
-                rows,
-                args.limit,
-            )
-            torch.cuda.synchronize()
-
-            require_exact("gate", rows, seed, gate_up_ref[:, :2048], gate_up[:, :2048])
-            require_exact("up", rows, seed, gate_up_ref[:, 2048:], gate_up[:, 2048:])
-            require_exact("activation_fp8", rows, seed, hidden_ref, hidden)
-            require_exact(
-                "activation_scale", rows, seed, hidden_scale_ref, hidden_scale
-            )
-            require_exact("w2", rows, seed, y_ref, y)
-
-            observed_cursor = int(cursor.item())
-            observed_errors = int(errors.item())
-            if observed_cursor != total_tasks:
-                raise RuntimeError(
-                    f"cursor mismatch rows={rows}: {observed_cursor} != {total_tasks}"
+            if active_rows:
+                module.run_split(
+                    x,
+                    x_scale,
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    m_indices,
+                    gate_up_ref,
+                    hidden_ref,
+                    hidden_scale_ref,
+                    y_ref,
+                    args.limit,
                 )
-            if observed_errors != 0:
-                raise RuntimeError(
-                    f"device decode errors rows={rows}: {observed_errors}"
+
+            sglang_hidden = None
+            sglang_scale = None
+            if sglang_reference is not None and active_rows:
+                sglang_hidden = torch.empty_like(hidden_ref)
+                sglang_scale = torch.empty_like(hidden_scale_ref)
+                active_tokens = torch.tensor(
+                    [active_rows], dtype=torch.int32, device="cuda"
                 )
-            if not bool((task_visits == 1).all()):
-                raise RuntimeError(f"task visit mismatch rows={rows}")
-            if not bool((gate_up_ready == 2).all()):
-                raise RuntimeError(f"gate/up counter mismatch rows={rows}")
-            if not bool((hidden_ready == 1).all()):
-                raise RuntimeError(f"hidden counter mismatch rows={rows}")
-            if not bool((y_ready == 32).all()):
-                raise RuntimeError(f"y counter mismatch rows={rows}")
+                sglang_reference(
+                    input=gate_up_ref,
+                    output=sglang_hidden,
+                    output_scale=sglang_scale,
+                    active_tokens=active_tokens,
+                    quant_group_size=128,
+                    scale_ue8m0=False,
+                    transposed=False,
+                    swiglu_limit=args.limit,
+                    swizzle=False,
+                )
+                torch.cuda.synchronize()
+                require_exact(
+                    "sglang_activation_fp8_vs_split",
+                    case,
+                    0,
+                    seed,
+                    sglang_hidden[:active_rows],
+                    hidden_ref[:active_rows],
+                )
+                require_exact(
+                    "sglang_activation_scale_vs_split",
+                    case,
+                    0,
+                    seed,
+                    sglang_scale[:active_rows],
+                    hidden_scale_ref[:active_rows],
+                )
 
-            print(
-                "TERMINAL_COMPUTE_EXACT"
-                f"|rows={rows}|m64={m_tiles}|seed={seed}"
-                "|gate=1|up=1|activation_fp8=1|activation_scale=1|w2=1"
-                f"|tasks={total_tasks}|gate_up_counter=2"
-                "|hidden_counter=1|y_counter=32",
-                flush=True,
-            )
+            for workers in worker_cases:
+                gate_up = torch.full_like(gate_up_ref, float("nan"))
+                hidden = torch.empty_like(hidden_ref)
+                hidden.view(torch.uint8).fill_(0x7F)
+                hidden_scale = torch.full_like(hidden_scale_ref, float("nan"))
+                y = torch.full_like(y_ref, float("nan"))
+                initial_gate_up = gate_up.clone()
+                initial_hidden = hidden.clone()
+                initial_hidden_scale = hidden_scale.clone()
+                initial_y = y.clone()
 
-    print("TERMINAL_COMPUTE_PIPELINE_PROBE|result=PASS", flush=True)
+                cursor = torch.zeros(1, dtype=torch.int32, device="cuda")
+                worker_ticket = torch.zeros(
+                    max(256, attrs[5]), dtype=torch.int32, device="cuda"
+                )
+                gate_up_ready = torch.zeros(
+                    (capacity_tiles, 16), dtype=torch.int32, device="cuda"
+                )
+                hidden_ready = torch.zeros(
+                    capacity_tiles, dtype=torch.int32, device="cuda"
+                )
+                y_ready = torch.zeros(
+                    capacity_tiles, dtype=torch.int32, device="cuda"
+                )
+                task_visits = torch.zeros(
+                    capacity_tasks, dtype=torch.int32, device="cuda"
+                )
+                errors = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+                module.run_terminal(
+                    x,
+                    x_scale,
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    m_indices,
+                    num_tokens,
+                    gate_up,
+                    hidden,
+                    hidden_scale,
+                    y,
+                    cursor,
+                    worker_ticket,
+                    gate_up_ready,
+                    hidden_ready,
+                    y_ready,
+                    task_visits,
+                    errors,
+                    workers,
+                    case.minibatch_rows,
+                    case.macrobatch_rows,
+                    args.limit,
+                )
+                torch.cuda.synchronize()
+
+                if active_rows:
+                    require_exact(
+                        "gate",
+                        case,
+                        workers,
+                        seed,
+                        gate_up_ref[:active_rows, :2048],
+                        gate_up[:active_rows, :2048],
+                    )
+                    require_exact(
+                        "up",
+                        case,
+                        workers,
+                        seed,
+                        gate_up_ref[:active_rows, 2048:],
+                        gate_up[:active_rows, 2048:],
+                    )
+                    require_exact(
+                        "activation_fp8",
+                        case,
+                        workers,
+                        seed,
+                        hidden_ref[:active_rows],
+                        hidden[:active_rows],
+                    )
+                    require_exact(
+                        "activation_scale",
+                        case,
+                        workers,
+                        seed,
+                        hidden_scale_ref[:active_rows],
+                        hidden_scale[:active_rows],
+                    )
+                    require_exact(
+                        "w2",
+                        case,
+                        workers,
+                        seed,
+                        y_ref[:active_rows],
+                        y[:active_rows],
+                    )
+                    if sglang_hidden is not None and sglang_scale is not None:
+                        require_exact(
+                            "sglang_activation_fp8_vs_candidate",
+                            case,
+                            workers,
+                            seed,
+                            sglang_hidden[:active_rows],
+                            hidden[:active_rows],
+                        )
+                        require_exact(
+                            "sglang_activation_scale_vs_candidate",
+                            case,
+                            workers,
+                            seed,
+                            sglang_scale[:active_rows],
+                            hidden_scale[:active_rows],
+                        )
+
+                # Inactive capacity rows are a contract boundary, not padding
+                # that the active-only cursor is permitted to overwrite.
+                require_exact(
+                    "inactive_gate_up",
+                    case,
+                    workers,
+                    seed,
+                    initial_gate_up[active_rows:],
+                    gate_up[active_rows:],
+                )
+                require_exact(
+                    "inactive_hidden",
+                    case,
+                    workers,
+                    seed,
+                    initial_hidden[active_rows:],
+                    hidden[active_rows:],
+                )
+                require_exact(
+                    "inactive_hidden_scale",
+                    case,
+                    workers,
+                    seed,
+                    initial_hidden_scale[active_rows:],
+                    hidden_scale[active_rows:],
+                )
+                require_exact(
+                    "inactive_y",
+                    case,
+                    workers,
+                    seed,
+                    initial_y[active_rows:],
+                    y[active_rows:],
+                )
+
+                observed_cursor = int(cursor.item())
+                observed_errors = int(errors.item())
+                if observed_cursor != active_tasks:
+                    raise RuntimeError(
+                        f"cursor mismatch case={case.name} workers={workers}: "
+                        f"{observed_cursor} != {active_tasks}"
+                    )
+                if observed_errors != 0:
+                    raise RuntimeError(
+                        f"device decode errors case={case.name} "
+                        f"workers={workers}: {observed_errors}"
+                    )
+                require_state(
+                    "active task visits",
+                    case,
+                    workers,
+                    task_visits[:active_tasks],
+                    1,
+                )
+                require_state(
+                    "inactive task visits",
+                    case,
+                    workers,
+                    task_visits[active_tasks:],
+                    0,
+                )
+                require_state(
+                    "active gate/up counters",
+                    case,
+                    workers,
+                    gate_up_ready[:active_tiles],
+                    2,
+                )
+                require_state(
+                    "inactive gate/up counters",
+                    case,
+                    workers,
+                    gate_up_ready[active_tiles:],
+                    0,
+                )
+                require_state(
+                    "active hidden counters",
+                    case,
+                    workers,
+                    hidden_ready[:active_tiles],
+                    1,
+                )
+                require_state(
+                    "inactive hidden counters",
+                    case,
+                    workers,
+                    hidden_ready[active_tiles:],
+                    0,
+                )
+                require_state(
+                    "active y counters",
+                    case,
+                    workers,
+                    y_ready[:active_tiles],
+                    32,
+                )
+                require_state(
+                    "inactive y counters",
+                    case,
+                    workers,
+                    y_ready[active_tiles:],
+                    0,
+                )
+
+                if case.name == "serial65" and workers == 1:
+                    if active_tasks != 65:
+                        raise RuntimeError("serial phase case must contain 65 tasks")
+                    print(
+                        "TERMINAL_COMPUTE_PHASE_WRAP"
+                        "|workers=1|tasks=65|persistent_mbarrier=1"
+                        "|w13_to_activation_to_w2=1",
+                        flush=True,
+                    )
+
+                print(
+                    "TERMINAL_COMPUTE_EXACT"
+                    f"|case={case.name}|capacity_rows={capacity_rows}"
+                    f"|active_rows={active_rows}|seed={seed}|workers={workers}"
+                    f"|minibatch_rows={case.minibatch_rows}"
+                    f"|macrobatch_rows={case.macrobatch_rows}"
+                    "|order=reverse-macro+stage-major+m-major-port"
+                    "|native_swizzle_equivalent=0"
+                    f"|gate={int(active_rows > 0)}|up={int(active_rows > 0)}"
+                    f"|activation_fp8={int(active_rows > 0)}"
+                    f"|activation_scale={int(active_rows > 0)}"
+                    f"|w2={int(active_rows > 0)}|tasks={active_tasks}"
+                    "|inactive_unchanged=1|counters_exact=1"
+                    f"|sglang_activation={int(sglang_reference is not None)}",
+                    flush=True,
+                )
+
+    if sglang_reference is None:
+        print(
+            "TERMINAL_COMPUTE_ACTIVATION_ORACLE"
+            "|shared_helper_integration_exact=1|independent_sglang=0"
+            "|formal_command_add=--require-sglang-reference",
+            flush=True,
+        )
+    else:
+        print(
+            "TERMINAL_COMPUTE_ACTIVATION_ORACLE"
+            "|shared_helper_integration_exact=1|independent_sglang=1"
+            "|fp8_exact=1|scale_exact=1",
+            flush=True,
+        )
+    print(
+        "TERMINAL_COMPUTE_WORKER_SCAN"
+        f"|workers={','.join(str(value) for value in worker_cases)}"
+        f"|max={attrs[5]}|result=PASS",
+        flush=True,
+    )
+    print(
+        "TERMINAL_COMPUTE_PIPELINE_PROBE"
+        f"|sglang_oracle={int(sglang_reference is not None)}|result=PASS",
+        flush=True,
+    )
     return 0
 
 

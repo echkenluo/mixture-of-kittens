@@ -72,10 +72,12 @@ __device__ __forceinline__ unsigned int claim_bounded(
     }
 }
 
-// Test-only fixed-resident worker.  The launch uses exactly the device-wide
-// active-cluster limit reported for this kernel, so every cursor owner is
-// resident.  Each cursor ordinal is decoded on device with the committed
-// stage-major 65-task/M64 mapping.
+// Test-only fixed-resident worker.  The launch uses a caller-selected prefix
+// of the device-wide active-cluster limit, so every cursor owner is resident.
+// Each cursor ordinal is decoded on device with the committed reverse-macro,
+// stage-major, port-local M-major 65-task/M64 mapping.  The M-major order is a
+// deliberate port choice; it is not the native kernel's expert-segment 2-D
+// swizzle.
 __cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
 __global__ void terminal_kernel(const __grid_constant__ terminal_globals g) {
     const int cta_rank = cluster_ctarank();
@@ -307,8 +309,8 @@ void run_terminal(
         const at::Tensor &cursor, const at::Tensor &worker_ticket,
         const at::Tensor &gate_up_ready, const at::Tensor &hidden_ready,
         const at::Tensor &y_ready, const at::Tensor &task_visits,
-        const at::Tensor &errors, int64_t minibatch_rows,
-        int64_t macrobatch_rows, double limit) {
+        const at::Tensor &errors, int64_t worker_clusters,
+        int64_t minibatch_rows, int64_t macrobatch_rows, double limit) {
     check_common(
         x, x_scale, w13, w13_scale, w2, w2_scale, m_indices,
         gate_up, hidden, hidden_scale, y);
@@ -348,11 +350,13 @@ void run_terminal(
                 "minibatch/macrobatch rows violate the logical contract");
 
     c10::cuda::CUDAGuard guard(x.device());
-    const int clusters = resident_clusters();
+    const int max_clusters = resident_clusters();
+    TORCH_CHECK(worker_clusters >= 1 && worker_clusters <= max_clusters,
+                "worker_clusters must be in [1,resident_clusters]");
     TORCH_CHECK(worker_ticket.is_cuda() && worker_ticket.is_contiguous()
                     && worker_ticket.scalar_type() == at::kInt
-                    && worker_ticket.numel() >= clusters,
-                "worker_ticket must have one int32 per resident cluster");
+                    && worker_ticket.numel() >= worker_clusters,
+                "worker_ticket must have one int32 per launched worker cluster");
     kittens::py::device_check(
         x, num_tokens, cursor, worker_ticket, gate_up_ready,
         hidden_ready, y_ready, task_visits, errors);
@@ -407,7 +411,8 @@ void run_terminal(
     };
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
-    terminal_kernel<<<clusters * terminal::CLUSTER_CTAS,
+    terminal_kernel<<<static_cast<int>(worker_clusters)
+                          * terminal::CLUSTER_CTAS,
                       kThreads, kDynamicSmem, stream>>>(globals);
     CUDACHECK(cudaGetLastError());
 }
