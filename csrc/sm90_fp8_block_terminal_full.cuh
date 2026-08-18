@@ -1387,6 +1387,9 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
         init_semaphore(inputs_arrived[threadIdx.x], 0, 1);
         init_semaphore(inputs_finished[threadIdx.x], 0, 1);
         init_semaphore(inputs_ready[threadIdx.x], 0, 2);
+        // mbarrier.init is a generic-proxy write.  Publish every slot to the
+        // async proxy before any later TMA load names the barrier.
+        asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory");
     }
     everyone::tma::cluster::sync();
 

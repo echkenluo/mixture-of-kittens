@@ -44,6 +44,7 @@ def check_source_contract() -> None:
         "decode_communication_cursor",
         "communication_total_tickets",
         "fence.proxy.async.global",
+        "fence.proxy.async.shared::cta",
         "worker_failed",
         "progress_timeouts",
         "overlap_witness",
