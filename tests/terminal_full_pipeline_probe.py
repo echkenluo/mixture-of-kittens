@@ -86,6 +86,57 @@ def check_source_contract() -> None:
         )
     if header.count("__global__ void kernel") != 1:
         raise RuntimeError("full header must expose exactly one kernel")
+    production_required = (
+        "production_input_barrier(g, cluster, cta_rank)",
+        "production_completion_epilogue(g, cta_rank)",
+        "multimem.red.release.sys.global.add.u32",
+        "atom.add.acq_rel.gpu.global.u32",
+        "atom.cas.release.gpu.global.u32",
+        "st.release.gpu.global.u32",
+        "st.release.sys.global.u64",
+        "TRAP_CLAIMED = ~0ull",
+        "__threadfence_system()",
+    )
+    missing_production = [
+        needle for needle in production_required if needle not in header
+    ]
+    if missing_production:
+        raise RuntimeError(
+            f"production control plane missing: {missing_production}"
+        )
+    nullable_fields = (
+        "barrier_flag", "barrier_target", "barrier_multicast_ptr",
+        "input_expected_scratch", "in_use", "epilogue_done",
+        "producer_done", "push_done", "terminate", "trap_record",
+    )
+    missing_null_defaults = [
+        field for field in nullable_fields
+        if not re.search(rf"\*{field}\s*=\s*nullptr", header)
+    ]
+    if missing_null_defaults:
+        raise RuntimeError(
+            "probe-compatible production fields lack null defaults: "
+            f"{missing_null_defaults}"
+        )
+    kernel_body = header[header.find("__global__ void kernel") :]
+    comm_branch = kernel_body[
+        kernel_body.find("if (cluster == COMM_CLUSTER)") :
+        kernel_body.find("production_completion_epilogue")
+    ]
+    if "communication_role(g, cta_rank);\n        return;" in comm_branch:
+        raise RuntimeError("communication role bypasses common lease epilogue")
+    closure_required = (
+        "g.producer_done) >= total_tasks",
+        "g.comm_closed) >= 1u",
+        "g.push_done) >= active_rows",
+        "g.reduce_done) >= total_tokens",
+        "compute::add_release_gpu(g.producer_done, 1u)",
+        "compute::add_release_gpu(g.push_done, 1u)",
+        "compute::store_release_gpu(g.comm_closed, 2u)",
+    )
+    missing_closure = [item for item in closure_required if item not in header]
+    if missing_closure:
+        raise RuntimeError(f"production closure contract missing: {missing_closure}")
     probe_start = header.find("try_reduce_one_ready_token")
     probe_end = header.find("compute_and_reduce_role", probe_start)
     probe = header[probe_start:probe_end]
