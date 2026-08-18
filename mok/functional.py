@@ -1611,6 +1611,8 @@ def _validate_terminal_forward(
     macrobatch_rows: int,
     swiglu_limit: float,
     spin_limit: int,
+    *,
+    inputs_preloaded: bool = False,
 ) -> None:
     """Host-only validation run before the terminal lease is acquired."""
     if not isinstance(workspace, MoKFP8TerminalWorkspace):
@@ -1953,7 +1955,12 @@ def _validate_terminal_forward(
         for field in workspace.__dataclass_fields__
         if isinstance((value := getattr(workspace, field)), torch.Tensor)
     }
-    if (
+    if inputs_preloaded:
+        if x is not workspace.x_buffer or x_scale is not workspace.x_scale_buffer:
+            raise ValueError(
+                "preloaded terminal inputs must be the workspace x buffers"
+            )
+    elif (
         x.untyped_storage().data_ptr() in workspace_storages
         or x_scale.untyped_storage().data_ptr() in workspace_storages
     ):
@@ -2003,16 +2010,25 @@ def megakernel_fp8_block_leased(
     macrobatch_rows: int = 131072,
     swiglu_limit: float = 10.0,
     spin_limit: int = 1 << 27,
+    inputs_preloaded: bool = False,
 ) -> torch.Tensor:
     """Launch a prevalidated terminal forward while its lease is held.
 
     This is the only leased sub-entry.  It deliberately performs no host-side
     validation and no lease transition: the owning wrapper must validate every
-    argument before acquire.  The terminal kernel itself releases the lease
-    after materializing ``output``; there is no Python release tail.
+    argument before acquire.  ``inputs_preloaded=True`` is reserved for the
+    from-topk preloaded entry and requires the exact symmetric workspace
+    tensors; it skips both input copies.  The terminal kernel itself releases
+    the lease after materializing ``output``; there is no Python release tail.
     """
-    workspace.x_buffer.copy_(x)
-    workspace.x_scale_buffer.copy_(x_scale)
+    if inputs_preloaded:
+        if x is not workspace.x_buffer or x_scale is not workspace.x_scale_buffer:
+            raise RuntimeError(
+                "preloaded terminal inputs must be the workspace x buffers"
+            )
+    else:
+        workspace.x_buffer.copy_(x)
+        workspace.x_scale_buffer.copy_(x_scale)
     fp8_block_megakernel_prepare_out(
         topk_ids,
         workspace.route_ready,
@@ -2195,6 +2211,165 @@ def megakernel_fp8_block(
     )
 
 
+def _terminal_workspace_schedule(
+    workspace: MoKFP8TerminalWorkspace,
+) -> MoKSchedule:
+    return MoKSchedule(
+        peer_rank=workspace.schedule_peer_rank,
+        peer_token_idx=workspace.schedule_peer_token_idx,
+        num_tokens=workspace.schedule_num_tokens,
+        tokens_per_expert=workspace.schedule_tokens_per_expert,
+        expert_padding=64,
+    )
+
+
+def _validate_and_acquire_terminal_from_topk(
+    workspace: MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+    inputs_preloaded: bool = False,
+) -> None:
+    if not isinstance(workspace, MoKFP8TerminalWorkspace):
+        raise TypeError("workspace must be a MoKFP8TerminalWorkspace")
+    if not isinstance(config, MoKConfig):
+        raise TypeError("config must be a MoKConfig")
+    schedule = _terminal_workspace_schedule(workspace)
+    require_fp8_block_megakernel()
+    _validate_terminal_forward(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        config.minibatch_size,
+        config.macrobatch_size,
+        swiglu_limit,
+        spin_limit,
+        inputs_preloaded=inputs_preloaded,
+    )
+    topk_ids_int32 = _validate_build_schedule_inputs(
+        workspace,
+        config,
+        topk_ids,
+        num_local_experts=workspace.num_local_experts,
+        expert_padding=64,
+    )
+    # The terminal forward contract already requires int32, so validation
+    # above must not materialize a conversion before the lease boundary.
+    if topk_ids_int32 is not topk_ids:
+        raise RuntimeError("terminal schedule validation unexpectedly copied routes")
+
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
+
+
+def acquire_megakernel_fp8_block_from_topk_lease(
+    workspace: MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+) -> None:
+    """Validate and acquire a terminal lease before direct input population.
+
+    This is the first half of the preloaded from-topk transaction.  It
+    validates the complete terminal call against ``workspace.x_buffer`` and
+    ``workspace.x_scale_buffer`` without writing either tensor, then launches
+    the normal graph-safe lease acquire.  After success, the caller must write
+    both buffers on the same stream and invoke
+    :func:`megakernel_fp8_block_from_topk_preloaded_leased`.
+    """
+    _validate_and_acquire_terminal_from_topk(
+        workspace,
+        config,
+        workspace.x_buffer,
+        workspace.x_scale_buffer,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        swiglu_limit=swiglu_limit,
+        spin_limit=spin_limit,
+        inputs_preloaded=True,
+    )
+
+
+def megakernel_fp8_block_from_topk_preloaded_leased(
+    workspace: MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+) -> torch.Tensor:
+    """Build the route schedule and run terminal on leased preloaded inputs.
+
+    All host validation and the lease transition belong to
+    :func:`acquire_megakernel_fp8_block_from_topk_lease`.  This half performs
+    only stream-ordered device work and never copies the symmetric input
+    buffers.  The terminal kernel releases the lease after writing ``output``.
+    """
+    schedule = _build_schedule_validated(
+        workspace,
+        config,
+        topk_ids,
+        num_local_experts=workspace.num_local_experts,
+        expert_padding=64,
+    )
+    return megakernel_fp8_block_leased(
+        workspace,
+        schedule,
+        workspace.x_buffer,
+        workspace.x_scale_buffer,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        minibatch_rows=config.minibatch_size,
+        macrobatch_rows=config.macrobatch_size,
+        swiglu_limit=swiglu_limit,
+        spin_limit=spin_limit,
+        inputs_preloaded=True,
+    )
+
+
 def megakernel_fp8_block_from_topk(
     workspace: MoKFP8TerminalWorkspace,
     config: MoKConfig,
@@ -2220,21 +2395,9 @@ def megakernel_fp8_block_from_topk(
     No fallback, dynamic allocation, host read, or Python release occurs in
     this forward path.
     """
-    if not isinstance(workspace, MoKFP8TerminalWorkspace):
-        raise TypeError("workspace must be a MoKFP8TerminalWorkspace")
-    if not isinstance(config, MoKConfig):
-        raise TypeError("config must be a MoKConfig")
-    schedule = MoKSchedule(
-        peer_rank=workspace.schedule_peer_rank,
-        peer_token_idx=workspace.schedule_peer_token_idx,
-        num_tokens=workspace.schedule_num_tokens,
-        tokens_per_expert=workspace.schedule_tokens_per_expert,
-        expert_padding=64,
-    )
-    require_fp8_block_megakernel()
-    _validate_terminal_forward(
+    _validate_and_acquire_terminal_from_topk(
         workspace,
-        schedule,
+        config,
         x,
         x_scale,
         w13,
@@ -2244,30 +2407,13 @@ def megakernel_fp8_block_from_topk(
         topk_weights,
         topk_ids,
         output,
-        config.minibatch_size,
-        config.macrobatch_size,
-        swiglu_limit,
-        spin_limit,
-    )
-    topk_ids_int32 = _validate_build_schedule_inputs(
-        workspace,
-        config,
-        topk_ids,
-        num_local_experts=workspace.num_local_experts,
-        expert_padding=64,
-    )
-    # The terminal forward contract already requires int32, so validation
-    # above must not materialize a conversion before the lease boundary.
-    if topk_ids_int32 is not topk_ids:
-        raise RuntimeError("terminal schedule validation unexpectedly copied routes")
-
-    workspace_lease_acquire(
-        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+        swiglu_limit=swiglu_limit,
+        spin_limit=spin_limit,
     )
     schedule = _build_schedule_validated(
         workspace,
         config,
-        topk_ids_int32,
+        topk_ids,
         num_local_experts=workspace.num_local_experts,
         expert_padding=64,
     )

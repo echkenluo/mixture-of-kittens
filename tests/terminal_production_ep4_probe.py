@@ -19,10 +19,12 @@ import torch.distributed as dist
 
 from mok.functional import (
     MoKSchedule,
+    acquire_megakernel_fp8_block_from_topk_lease,
     create_fp8_terminal_workspace,
     format_trap_record,
     megakernel_fp8_block,
     megakernel_fp8_block_from_topk,
+    megakernel_fp8_block_from_topk_preloaded_leased,
     megakernel_fp8_block_leased,
 )
 from mok.ops import fp8_block_megakernel_prewarm
@@ -207,9 +209,7 @@ def check_python_entry_contract() -> None:
 
     orchestrator_source = inspect.getsource(megakernel_fp8_block_from_topk)
     orchestrator_order = (
-        "_validate_terminal_forward(",
-        "_validate_build_schedule_inputs(",
-        "workspace_lease_acquire(",
+        "_validate_and_acquire_terminal_from_topk(",
         "_build_schedule_validated(",
         "megakernel_fp8_block_leased(",
     )
@@ -220,6 +220,25 @@ def check_python_entry_contract() -> None:
         raise RuntimeError(
             f"terminal orchestrator launch order changed: {positions}"
         )
+
+    acquire_source = inspect.getsource(
+        acquire_megakernel_fp8_block_from_topk_lease
+    )
+    if "_validate_and_acquire_terminal_from_topk(" not in acquire_source:
+        raise RuntimeError("preloaded terminal acquire must own validation+lease")
+    preloaded_source = inspect.getsource(
+        megakernel_fp8_block_from_topk_preloaded_leased
+    )
+    preloaded_order = (
+        "_build_schedule_validated(",
+        "megakernel_fp8_block_leased(",
+        "inputs_preloaded=True",
+    )
+    positions = [preloaded_source.find(needle) for needle in preloaded_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise RuntimeError(f"terminal preloaded launch order changed: {positions}")
+    if ".copy_(" in preloaded_source:
+        raise RuntimeError("preloaded terminal entry must not copy inputs")
 
 
 def main() -> int:

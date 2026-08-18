@@ -19,9 +19,11 @@ import torch.distributed as dist
 
 from mok.functional import (
     MoKConfig,
+    acquire_megakernel_fp8_block_from_topk_lease,
     acquire_workspace_lease,
     create_fp8_terminal_workspace,
     megakernel_fp8_block_from_topk,
+    megakernel_fp8_block_from_topk_preloaded_leased,
     megakernel_fp8_block_leased,
     release_workspace_lease,
 )
@@ -86,9 +88,7 @@ def require_exact(
 def check_orchestrator_source_contract() -> None:
     orchestrator = inspect.getsource(megakernel_fp8_block_from_topk)
     ordered = (
-        "_validate_terminal_forward(",
-        "_validate_build_schedule_inputs(",
-        "workspace_lease_acquire(",
+        "_validate_and_acquire_terminal_from_topk(",
         "_build_schedule_validated(",
         "megakernel_fp8_block_leased(",
     )
@@ -121,6 +121,23 @@ def check_orchestrator_source_contract() -> None:
         raise RuntimeError("leased terminal path must contain one compute kernel")
     if "workspace_lease_acquire" in leased or "workspace_lease_release" in leased:
         raise RuntimeError("leased terminal path must not alter lease ownership")
+
+    acquire = inspect.getsource(acquire_megakernel_fp8_block_from_topk_lease)
+    if "_validate_and_acquire_terminal_from_topk(" not in acquire:
+        raise RuntimeError("preloaded acquire must validate before taking the lease")
+    preloaded = inspect.getsource(
+        megakernel_fp8_block_from_topk_preloaded_leased
+    )
+    ordered = (
+        "_build_schedule_validated(",
+        "megakernel_fp8_block_leased(",
+        "inputs_preloaded=True",
+    )
+    positions = [preloaded.find(needle) for needle in ordered]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise RuntimeError(f"terminal preloaded order changed: {positions}")
+    if ".copy_(" in preloaded:
+        raise RuntimeError("preloaded terminal path must not stage inputs")
 
 
 def make_expected_schedule(
