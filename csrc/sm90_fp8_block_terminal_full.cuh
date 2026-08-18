@@ -1369,11 +1369,14 @@ __device__ void compute_and_reduce_role(
             a_smem, b_smem, d_smem,
             inputs_arrived, inputs_finished, inputs_ready);
 
-        everyone::tma::cluster::sync();
+        // Every producer body returns through its own final cluster sync after
+        // draining WGMMA/TMA output and publishing the stage-ready counter.
+        // The next loop iteration's ticket publication sync is therefore the
+        // task-boundary convergence; repeating two more cluster barriers here
+        // serialized every M64/N128 subtile without strengthening ordering.
         if (cta_rank == 0 && threadIdx.x == 0
                 && g.producer_done != nullptr)
             compute::add_release_gpu(g.producer_done, 1u);
-        everyone::tma::cluster::sync();
 
         // Sampling every task from both CTAs produced tens of thousands of
         // guaranteed-empty system-scope probes before combine publication.
