@@ -154,6 +154,71 @@ class MoKFP8RouteWorkspace:
     epilogue_done: torch.Tensor   # (1,) int32 release completion counter
 
 
+@dataclass(slots=True)
+class MoKFP8TerminalWorkspace:
+    """Caller-owned storage for the terminal SM90 FP8 megakernel.
+
+    This remains separate from :class:`MoKFP8RouteWorkspace`: terminal work
+    must not inherit the K1/K2 ticket and readiness protocol.
+    """
+
+    group_name: str
+    ep_rank: int
+    ep_size: int
+    device: torch.device
+    num_local_tokens: int
+    padded_num_local_tokens: int
+    hidden_size: int
+    intermediate_size: int
+    topk: int
+    num_local_experts: int
+    schedule_capacity: int
+    compute_clusters: int
+    x_buffer: torch.Tensor
+    x_buffer_handle: Any
+    x_buffer_ptrs: list[int]
+    x_scale_buffer: torch.Tensor
+    x_scale_buffer_handle: Any
+    x_scale_buffer_ptrs: list[int]
+    combine_buffer: torch.Tensor
+    combine_buffer_handle: Any
+    combine_buffer_ptrs: list[int]
+    route_ready: torch.Tensor
+    route_ready_handle: Any
+    route_ready_ptrs: list[int]
+    barrier_buffer: torch.Tensor
+    barrier_buffer_handle: Any
+    barrier_buffer_ptrs: list[int]
+    barrier_buffer_multicast_ptr: int
+    barrier_target: torch.Tensor
+    input_expected_scratch: torch.Tensor
+    routed_x: torch.Tensor
+    routed_x_scale: torch.Tensor
+    m_indices: torch.Tensor
+    gate_up: torch.Tensor
+    down_input: torch.Tensor
+    down_input_scale: torch.Tensor
+    routed_y: torch.Tensor
+    x_routed_ready: torch.Tensor
+    gate_up_tile_ready: torch.Tensor
+    hidden_row_block_ready: torch.Tensor
+    y_routed_ready: torch.Tensor
+    y_routed_done: torch.Tensor
+    epilogue_claim: torch.Tensor
+    next_logical_cluster: torch.Tensor
+    next_reduce_probe: torch.Tensor
+    worker_ticket: torch.Tensor  # (compute_clusters,) compute-role publish slot
+    producer_done: torch.Tensor
+    comm_closed: torch.Tensor
+    push_done: torch.Tensor
+    reduce_done: torch.Tensor
+    terminate: torch.Tensor
+    epilogue_done: torch.Tensor
+    in_use: torch.Tensor
+    trap_record: torch.Tensor
+    trap_record_ptr: int
+
+
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
 _FP8_ROUTE_WORKSPACE_CACHE: dict[
     tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
@@ -606,6 +671,311 @@ def create_fp8_route_workspace(
         trap_record_ptr=trap_record_ptr,
         in_use=in_use,
         epilogue_done=epilogue_done,
+    )
+
+
+def create_fp8_terminal_workspace(
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    num_local_tokens: int,
+    schedule_capacity: int,
+    num_local_experts: int,
+    compute_clusters: int,
+) -> MoKFP8TerminalWorkspace:
+    """Allocate the graph-stable storage for the terminal H20 forward.
+
+    The first terminal specialization is intentionally fixed to EP4,
+    H4096/I2048/top-6.  ``schedule_capacity`` is physical routed-row storage,
+    not the active device-side token count, and must therefore already include
+    padding to an M64 boundary.  This factory only owns storage: it does not
+    invoke a terminal op or prepare route flags for a particular forward.
+    """
+    import os
+
+    hidden_size = 4096
+    intermediate_size = 2048
+    topk = 6
+    ep_size_required = 4
+    m_tile = 64
+    w13_n128_tiles = intermediate_size // 128
+
+    if not dist.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized")
+    if not isinstance(group, dist.ProcessGroup):
+        raise TypeError("group must be a torch.distributed.ProcessGroup")
+    if not isinstance(device, torch.device):
+        raise TypeError("device must be a torch.device")
+    if device.type != "cuda":
+        raise ValueError("device must be a CUDA device")
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    device = torch.device("cuda", device_index)
+    if device_index != torch.cuda.current_device():
+        raise ValueError("terminal workspace device must be the current CUDA device")
+    if torch.cuda.get_device_capability(device) != (9, 0):
+        raise NotImplementedError("the terminal FP8 workspace requires SM90")
+    if os.environ.get("MOK_SM90_EXPERIMENTAL") != "1":
+        raise NotImplementedError(
+            "MoK terminal SM90 support is experimental; set "
+            "MOK_SM90_EXPERIMENTAL=1 to proceed"
+        )
+    if type(num_local_tokens) is not int or num_local_tokens <= 0:
+        raise ValueError("num_local_tokens must be a positive integer")
+    if (
+        type(schedule_capacity) is not int
+        or schedule_capacity <= 0
+        or schedule_capacity % m_tile != 0
+    ):
+        raise ValueError(
+            "schedule_capacity must be a positive multiple of 64"
+        )
+    if schedule_capacity < num_local_tokens * topk:
+        raise ValueError(
+            "schedule_capacity must hold at least one rank's routed tokens"
+        )
+    if (
+        type(num_local_experts) is not int
+        or not 1 <= num_local_experts <= 256
+    ):
+        raise ValueError("num_local_experts must be an integer in [1, 256]")
+    if type(compute_clusters) is not int or compute_clusters <= 0:
+        raise ValueError("compute_clusters must be a positive integer")
+
+    group_name = group.group_name
+    if not isinstance(group_name, str) or not group_name:
+        raise RuntimeError("process group must have a nonempty group_name")
+    ep_rank = dist.get_rank(group=group)
+    ep_size = dist.get_world_size(group=group)
+    if ep_size != ep_size_required:
+        raise ValueError("the terminal FP8 workspace currently requires EP4")
+    if not 0 <= ep_rank < ep_size:
+        raise RuntimeError("current process is not a member of the EP group")
+
+    padded_num_local_tokens = (
+        (num_local_tokens + m_tile - 1) // m_tile * m_tile
+    )
+    m_tiles = schedule_capacity // m_tile
+
+    # Symmetric allocations must have the same shape and rendezvous order on
+    # every rank.  Check the complete graph bucket before entering rendezvous.
+    local_shape = torch.tensor(
+        [
+            num_local_tokens,
+            padded_num_local_tokens,
+            schedule_capacity,
+            num_local_experts,
+            compute_clusters,
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    gathered_shapes = torch.empty(
+        ep_size * local_shape.numel(), dtype=torch.int64, device=device
+    )
+    dist.all_gather_into_tensor(gathered_shapes, local_shape, group=group)
+    gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
+    if not torch.all(gathered_shapes == local_shape).item():
+        raise ValueError(
+            "terminal workspaces require identical graph buckets on all EP ranks"
+        )
+
+    symm_mem.enable_symm_mem_for_group(group_name)
+    x_buffer = symm_mem.empty(
+        num_local_tokens,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_buffer_handle = symm_mem.rendezvous(x_buffer, group_name)
+    x_buffer_ptrs = [
+        int(x_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    x_scale_buffer = symm_mem.empty(
+        num_local_tokens,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    x_scale_buffer_handle = symm_mem.rendezvous(x_scale_buffer, group_name)
+    x_scale_buffer_ptrs = [
+        int(x_scale_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    combine_buffer = symm_mem.empty(
+        padded_num_local_tokens * topk,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    combine_buffer_handle = symm_mem.rendezvous(combine_buffer, group_name)
+    combine_buffer_ptrs = [
+        int(combine_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    # Invalid routes are initialized to one and valid routes to zero by the
+    # future leased prepare step.  Do not blanket-zero this storage here.
+    route_ready = symm_mem.empty(
+        padded_num_local_tokens,
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    route_ready_handle = symm_mem.rendezvous(route_ready, group_name)
+    route_ready_ptrs = [
+        int(route_ready_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+
+    barrier_buffer = symm_mem.empty(1, dtype=torch.int32, device=device)
+    barrier_buffer.zero_()
+    barrier_buffer_handle = symm_mem.rendezvous(barrier_buffer, group_name)
+    barrier_buffer_ptrs = [
+        int(barrier_buffer_handle.buffer_ptrs[peer_rank])
+        for peer_rank in range(ep_size)
+    ]
+    barrier_buffer_multicast_ptr = int(barrier_buffer_handle.multicast_ptr)
+    barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
+    input_expected_scratch = torch.zeros(
+        1, dtype=torch.int32, device=device
+    )
+
+    routed_x = torch.empty(
+        schedule_capacity,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    routed_x_scale = torch.empty(
+        schedule_capacity,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    m_indices = torch.empty(
+        schedule_capacity, dtype=torch.int32, device=device
+    )
+    gate_up = torch.empty(
+        schedule_capacity,
+        2 * intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    down_input = torch.empty(
+        schedule_capacity,
+        intermediate_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    down_input_scale = torch.empty(
+        schedule_capacity,
+        intermediate_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    routed_y = torch.empty(
+        schedule_capacity,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    # Capacity-sized readiness arrays and graph-stable cursor/closure state.
+    x_routed_ready = torch.zeros(m_tiles, dtype=torch.int32, device=device)
+    gate_up_tile_ready = torch.zeros(
+        m_tiles, w13_n128_tiles, dtype=torch.int32, device=device
+    )
+    hidden_row_block_ready = torch.zeros(
+        m_tiles, dtype=torch.int32, device=device
+    )
+    y_routed_ready = torch.zeros(m_tiles, dtype=torch.int32, device=device)
+    y_routed_done = torch.zeros(m_tiles, dtype=torch.int32, device=device)
+    epilogue_claim = torch.zeros(
+        padded_num_local_tokens, dtype=torch.int32, device=device
+    )
+    next_logical_cluster = torch.zeros(1, dtype=torch.int32, device=device)
+    next_reduce_probe = torch.zeros(1, dtype=torch.int32, device=device)
+    worker_ticket = torch.zeros(
+        compute_clusters, dtype=torch.int32, device=device
+    )
+    producer_done = torch.zeros(1, dtype=torch.int32, device=device)
+    comm_closed = torch.zeros(1, dtype=torch.int32, device=device)
+    push_done = torch.zeros(1, dtype=torch.int32, device=device)
+    reduce_done = torch.zeros(1, dtype=torch.int32, device=device)
+    terminate = torch.zeros(1, dtype=torch.int32, device=device)
+    epilogue_done = torch.zeros(1, dtype=torch.int32, device=device)
+    in_use = torch.zeros(1, dtype=torch.int32, device=device)
+    # Keep the fatal record host-readable after a device trap poisons the CUDA
+    # context.  The future terminal entry resolves this host address to the
+    # device mapping; no per-forward allocation or CUDA call is needed here.
+    trap_record = torch.zeros(8, dtype=torch.int64).pin_memory()
+    trap_record_ptr = trap_record.data_ptr()
+
+    dist.barrier(
+        group=group, async_op=True, device_ids=[device_index]
+    ).block_current_stream()
+
+    return MoKFP8TerminalWorkspace(
+        group_name=group_name,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        device=device,
+        num_local_tokens=num_local_tokens,
+        padded_num_local_tokens=padded_num_local_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topk=topk,
+        num_local_experts=num_local_experts,
+        schedule_capacity=schedule_capacity,
+        compute_clusters=compute_clusters,
+        x_buffer=x_buffer,
+        x_buffer_handle=x_buffer_handle,
+        x_buffer_ptrs=x_buffer_ptrs,
+        x_scale_buffer=x_scale_buffer,
+        x_scale_buffer_handle=x_scale_buffer_handle,
+        x_scale_buffer_ptrs=x_scale_buffer_ptrs,
+        combine_buffer=combine_buffer,
+        combine_buffer_handle=combine_buffer_handle,
+        combine_buffer_ptrs=combine_buffer_ptrs,
+        route_ready=route_ready,
+        route_ready_handle=route_ready_handle,
+        route_ready_ptrs=route_ready_ptrs,
+        barrier_buffer=barrier_buffer,
+        barrier_buffer_handle=barrier_buffer_handle,
+        barrier_buffer_ptrs=barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr=barrier_buffer_multicast_ptr,
+        barrier_target=barrier_target,
+        input_expected_scratch=input_expected_scratch,
+        routed_x=routed_x,
+        routed_x_scale=routed_x_scale,
+        m_indices=m_indices,
+        gate_up=gate_up,
+        down_input=down_input,
+        down_input_scale=down_input_scale,
+        routed_y=routed_y,
+        x_routed_ready=x_routed_ready,
+        gate_up_tile_ready=gate_up_tile_ready,
+        hidden_row_block_ready=hidden_row_block_ready,
+        y_routed_ready=y_routed_ready,
+        y_routed_done=y_routed_done,
+        epilogue_claim=epilogue_claim,
+        next_logical_cluster=next_logical_cluster,
+        next_reduce_probe=next_reduce_probe,
+        worker_ticket=worker_ticket,
+        producer_done=producer_done,
+        comm_closed=comm_closed,
+        push_done=push_done,
+        reduce_done=reduce_done,
+        terminate=terminate,
+        epilogue_done=epilogue_done,
+        in_use=in_use,
+        trap_record=trap_record,
+        trap_record_ptr=trap_record_ptr,
     )
 
 
