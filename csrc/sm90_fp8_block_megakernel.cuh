@@ -306,14 +306,11 @@ MOK_TERMINAL_HD int64_t communication_total_tickets(
         const logical_shape &shape) {
     if (!shape.valid || shape.num_macrobatches == 0)
         return 0;
-    int64_t total = communication_rounds(
-        shape, shape.num_macrobatches - 1);
-    for (int q = shape.num_macrobatches - 1; q >= 0; --q) {
-        total += communication_rounds(shape, q);
-        if (q > 0)
-            total += communication_rounds(shape, q - 1);
-    }
-    return total;
+    // Every active row is dispatched once and combined once.  One dense
+    // cluster ticket carries two four-row CTA tasks, so the complete D/C
+    // sequence always contains num_tokens / 4 tickets.  Keeping this closed
+    // form out of the resident kernel avoids a Q-dependent decoder loop.
+    return static_cast<int64_t>(shape.num_tokens) / 4;
 }
 
 MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
@@ -324,8 +321,9 @@ MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
     if (!shape.valid || cursor_ordinal < 0 || cursor_ordinal >= total)
         return result;
 
-    int64_t remaining = cursor_ordinal;
+    int remaining = static_cast<int>(cursor_ordinal);
     const int last = shape.num_macrobatches - 1;
+    const int full_rounds = shape.macrobatch_rows / COMM_ROWS_PER_TICKET;
     const int initial_dispatch = communication_rounds(shape, last);
     if (remaining < initial_dispatch) {
         result.valid = true;
@@ -336,37 +334,53 @@ MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
     }
     remaining -= initial_dispatch;
 
-    for (int q = last; q >= 0; --q) {
-        const int combine_rounds = communication_rounds(shape, q);
-        const int dispatch_rounds = q > 0
-            ? communication_rounds(shape, q - 1) : 0;
-        const int64_t segment = static_cast<int64_t>(combine_rounds)
-            + dispatch_rounds;
-        if (remaining >= segment) {
-            remaining -= segment;
-            continue;
-        }
-
-        const int paired = combine_rounds < dispatch_rounds
-            ? combine_rounds : dispatch_rounds;
-        const int64_t paired_tickets = static_cast<int64_t>(2) * paired;
-        if (remaining < paired_tickets) {
-            result.valid = true;
-            result.round = static_cast<int>(remaining / 2);
-            if ((remaining & 1) == 0) {
-                result.stage = communication_stage::combine;
-                result.macrobatch = q;
-            } else {
-                result.stage = communication_stage::dispatch;
-                result.macrobatch = q - 1;
-            }
-            return result;
-        }
-
-        remaining -= paired_tickets;
+    // Q=1 closes directly with C(0).
+    if (shape.num_macrobatches == 1) {
         result.valid = true;
-        result.round = paired + static_cast<int>(remaining);
-        if (combine_rounds > paired) {
+        result.stage = communication_stage::combine;
+        result.macrobatch = 0;
+        result.round = remaining;
+        return result;
+    }
+
+    // The tail macrobatch can be shorter than A.  Pair its C(last) rounds
+    // with the same prefix of D(last-1), then drain the remaining full-macro
+    // dispatch rounds exactly as the native max(C,D) loop does.
+    const int tail_paired = 2 * initial_dispatch;
+    if (remaining < tail_paired) {
+        result.valid = true;
+        result.round = remaining / 2;
+        if ((remaining & 1) == 0) {
+            result.stage = communication_stage::combine;
+            result.macrobatch = last;
+        } else {
+            result.stage = communication_stage::dispatch;
+            result.macrobatch = last - 1;
+        }
+        return result;
+    }
+    remaining -= tail_paired;
+    const int tail_dispatch_remainder = full_rounds - initial_dispatch;
+    if (remaining < tail_dispatch_remainder) {
+        result.valid = true;
+        result.stage = communication_stage::dispatch;
+        result.macrobatch = last - 1;
+        result.round = initial_dispatch + remaining;
+        return result;
+    }
+    remaining -= tail_dispatch_remainder;
+
+    // All interior macrobatches are full, so each segment has the same
+    // 2*full_rounds C(q),D(q-1) alternating shape and can be decoded in O(1).
+    const int interior_segments = shape.num_macrobatches - 2;
+    const int interior_tickets = interior_segments * 2 * full_rounds;
+    if (remaining < interior_tickets) {
+        const int segment = remaining / (2 * full_rounds);
+        const int local = remaining - segment * 2 * full_rounds;
+        const int q = last - 1 - segment;
+        result.valid = true;
+        result.round = local / 2;
+        if ((local & 1) == 0) {
             result.stage = communication_stage::combine;
             result.macrobatch = q;
         } else {
@@ -375,6 +389,13 @@ MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
         }
         return result;
     }
+    remaining -= interior_tickets;
+
+    // Final C(0) has no following dispatch.
+    result.valid = true;
+    result.stage = communication_stage::combine;
+    result.macrobatch = 0;
+    result.round = remaining;
     return result;
 }
 
