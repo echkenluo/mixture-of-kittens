@@ -314,7 +314,7 @@ void run_full(
         const at::Tensor &dispatch_tiles_done,
         const at::Tensor &compute_started,
         const at::Tensor &overlap_witness,
-        int64_t compute_clusters, int64_t minibatch_rows,
+        int64_t ep_rank, int64_t compute_clusters, int64_t minibatch_rows,
         int64_t macrobatch_rows,
         int64_t overlap_delay_cycles, int64_t spin_limit, double limit) {
     c10::cuda::CUDAGuard guard(peer_x.device());
@@ -324,6 +324,8 @@ void run_full(
     const int scales = hidden_size / 128;
     TORCH_CHECK(rows == 64 || rows == 128,
                 "full probe supports 64/128 active rows");
+    TORCH_CHECK(ep_rank >= 0 && ep_rank < terminal::EP_SIZE,
+                "ep_rank must be in [0, EP_SIZE)");
     TORCH_CHECK(num_tokens.is_cuda() && num_tokens.is_contiguous()
                     && num_tokens.scalar_type() == at::kInt
                     && num_tokens.numel() == 1,
@@ -350,6 +352,28 @@ void run_full(
                     && progress_timeouts.scalar_type() == at::kInt
                     && progress_timeouts.numel() == 1,
                 "progress_timeouts must be CUDA int32 [1]");
+    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous()
+                    && weights.scalar_type() == at::kFloat
+                    && weights.numel()
+                        == local_tokens * terminal::TOP_K,
+                "weights must be rank-local float32 [local_tokens, TOP_K]");
+    TORCH_CHECK(topk_ids.is_cuda() && topk_ids.is_contiguous()
+                    && topk_ids.scalar_type() == at::kInt
+                    && topk_ids.numel()
+                        == local_tokens * terminal::TOP_K,
+                "topk_ids must be rank-local int32 [local_tokens, TOP_K]");
+    TORCH_CHECK(output.is_cuda() && output.is_contiguous()
+                    && output.scalar_type() == at::kBFloat16
+                    && output.numel() == local_tokens * hidden_size,
+                "output must be rank-local BF16 [local_tokens, hidden]");
+    TORCH_CHECK(epilogue_claim.is_cuda() && epilogue_claim.is_contiguous()
+                    && epilogue_claim.scalar_type() == at::kInt
+                    && epilogue_claim.numel() == local_tokens,
+                "epilogue_claim must be rank-local int32 [local_tokens]");
+    TORCH_CHECK(reduce_visits.is_cuda() && reduce_visits.is_contiguous()
+                    && reduce_visits.scalar_type() == at::kInt
+                    && reduce_visits.numel() == local_tokens,
+                "reduce_visits must be rank-local int32 [local_tokens]");
 
     gemm_problem w13_problem{
         kittens::py::tensor_to_gl<a_gl>(
@@ -403,6 +427,8 @@ void run_full(
         g.route_ready_peer[peer] = ready_base
             + static_cast<size_t>(peer) * local_tokens * terminal::TOP_K;
     }
+    g.combine_local = g.combine_peer[ep_rank];
+    g.route_ready_local = g.route_ready_peer[ep_rank];
     g.routed_x = reinterpret_cast<uint8_t *>(routed_x.data_ptr());
     g.routed_x_scale = routed_x_scale.data_ptr<float>();
     g.m_indices = m_indices.data_ptr<int>();
@@ -411,6 +437,7 @@ void run_full(
     g.num_tokens = num_tokens.data_ptr<int>();
     g.tokens_per_expert = tokens_per_expert.data_ptr<int>();
     g.ep_size = terminal::EP_SIZE;
+    g.ep_rank = static_cast<int>(ep_rank);
     g.num_local_tokens = local_tokens;
     g.hidden_size = hidden_size;
     g.scale_columns = scales;

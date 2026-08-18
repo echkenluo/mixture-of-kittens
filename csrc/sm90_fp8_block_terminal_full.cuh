@@ -1,12 +1,14 @@
 #pragma once
 
-// Single-GPU peer-emulation milestone for the terminal SM90 FP8 forward.
+// Rank-local reduction milestone for the terminal SM90 FP8 forward.  The
+// probe still supplies emulated peer pointers for remote pushes, but each
+// invocation owns exactly one EP rank's combine/ready/claim/output domain.
 // M1 launches one permanently resident communication cluster plus N compute
 // clusters, with 1 + N bounded by the measured active-cluster limit.  Every
 // compute CTA performs only one nonblocking ready-token probe at a task or
 // wait boundary; NOT_READY work remains unclaimed, while a winning CTA
-// reduces one token and then resumes compute claims.  There is no grid/rank
-// barrier, split path, or fallback in this kernel.
+// reduces one local token and then resumes compute claims.  There is no
+// grid/rank barrier, split path, or fallback in this kernel.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -66,6 +68,7 @@ struct globals {
     const int *num_tokens;
     const int *tokens_per_expert;
     int ep_size;
+    int ep_rank;
     int num_local_tokens;
     int hidden_size;
     int scale_columns;
@@ -74,8 +77,12 @@ struct globals {
     int schedule_capacity;
 
     const uint8_t *routed_y;
+    // Peer arrays are producer-only symmetric destinations.  Reduction must
+    // never walk remote rank domains; it consumes these rank-local aliases.
     uint8_t *combine_peer[terminal::EP_SIZE];
     unsigned int *route_ready_peer[terminal::EP_SIZE];
+    const uint8_t *combine_local;
+    unsigned int *route_ready_local;
     const int *push_order;
 
     const float *weights;
@@ -258,7 +265,7 @@ __device__ void communication_role(
     // opportunistic compute CTAs have reduced every token.  This wait cannot
     // exclude a producer: all dispatch and push work is already complete.
     const unsigned int total_tokens = static_cast<unsigned int>(
-        g.ep_size * g.num_local_tokens);
+        g.num_local_tokens);
     if (threadIdx.x == 0) {
         wait_ok = bounded_wait_gpu(
             g.reduce_done, total_tokens, g.spin_limit) ? 1 : 0;
@@ -272,7 +279,8 @@ __device__ void communication_role(
     everyone::tma::cluster::sync();
 }
 
-// One CTA probes exactly one round-robin token and returns immediately for
+// One CTA probes exactly one rank-local round-robin token and returns
+// immediately for
 // NOT_READY, ALREADY_CLAIMED, or an invalid/empty domain.  Only a CTA that won
 // the ready-token CAS enters the column-parallel reduction.  This bounded
 // primitive is safe to call between producer tasks: it never waits for a
@@ -280,44 +288,30 @@ __device__ void communication_role(
 template <typename GemmProblem>
 __device__ route::claim_result try_reduce_one_ready_token(
         const globals<GemmProblem> &g) {
-    __shared__ int selected_peer;
     __shared__ int selected_token;
     __shared__ int selected_result;
-    const int tokens_per_peer = g.num_local_tokens;
-    const int total_tokens = g.ep_size * tokens_per_peer;
+    const int total_tokens = g.num_local_tokens;
 
     if (threadIdx.x == 0) {
         const unsigned int probe = atomicAdd(g.next_reduce_probe, 1u);
-        const int global_token = total_tokens == 0
+        const int local_token = total_tokens == 0
             ? -1
             : static_cast<int>(probe % total_tokens);
-        selected_peer = global_token < 0
-            ? -1
-            : global_token / tokens_per_peer;
-        selected_token = global_token < 0
-            ? -1
-            : global_token % tokens_per_peer;
-        selected_result = global_token < 0
+        selected_token = local_token;
+        selected_result = local_token < 0
             ? static_cast<int>(route::claim_result::invalid_token)
             : static_cast<int>(route::try_claim_ready_token(
-                g.route_ready_peer[selected_peer],
-                g.epilogue_claim + selected_peer * tokens_per_peer,
-                selected_token, tokens_per_peer));
+                g.route_ready_local, g.epilogue_claim,
+                selected_token, total_tokens));
     }
     __syncthreads();
 
     if (selected_result
             == static_cast<int>(route::claim_result::claimed)) {
-        const size_t route_stride =
-            static_cast<size_t>(tokens_per_peer) * terminal::TOP_K;
-        const size_t output_stride =
-            static_cast<size_t>(tokens_per_peer) * g.hidden_size;
         const auto *combine = reinterpret_cast<const __nv_bfloat16 *>(
-            g.combine_peer[selected_peer]);
+            g.combine_local);
         route::reduce_claimed_token(
-            combine, g.weights + selected_peer * route_stride,
-            g.topk_ids + selected_peer * route_stride,
-            g.output + selected_peer * output_stride,
+            combine, g.weights, g.topk_ids, g.output,
             selected_token, g.hidden_size,
             threadIdx.x, blockDim.x);
         route::release_fence_system();
@@ -327,9 +321,7 @@ __device__ route::claim_result try_reduce_one_ready_token(
     if (threadIdx.x == 0
             && selected_result
                 == static_cast<int>(route::claim_result::claimed)) {
-        const int global_token =
-            selected_peer * tokens_per_peer + selected_token;
-        atomicAdd(g.reduce_visits + global_token, 1u);
+        atomicAdd(g.reduce_visits + selected_token, 1u);
         atomicAdd(g.reduce_done, 1u);
         if (compute::load_acquire_gpu(g.comm_closed) == 0u)
             atomicOr(g.overlap_witness, OVERLAP_REDUCE_COMM);
@@ -364,7 +356,7 @@ __device__ void compute_and_reduce_role(
     const unsigned int total_tasks =
         static_cast<unsigned int>(shape.total_tasks);
     const unsigned int total_tokens = static_cast<unsigned int>(
-        g.ep_size * g.num_local_tokens);
+        g.num_local_tokens);
 
     while (true) {
         if (cta_rank == 0 && threadIdx.x == 0) {
