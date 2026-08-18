@@ -115,9 +115,17 @@ def parse_args() -> argparse.Namespace:
     )
     if not args.tokens or any(value <= 0 for value in args.tokens):
         raise ValueError("--tokens must contain positive integers")
-    if set(args.baselines) != set(DEFAULT_BASELINES):
-        raise ValueError("--baselines must contain split and k1k2 exactly")
+    if (
+        not args.baselines
+        or not set(args.baselines).issubset(DEFAULT_BASELINES)
+        or len(set(args.baselines)) != len(args.baselines)
+    ):
+        raise ValueError("--baselines must be a unique subset of split,k1k2")
     if not args.smoke:
+        if set(args.baselines) != set(DEFAULT_BASELINES):
+            raise ValueError(
+                "formal run requires both split and k1k2 baselines"
+            )
         if args.tokens != DEFAULT_TOKENS:
             raise ValueError(
                 "formal run requires --tokens 128,766,2048; use --smoke "
@@ -884,6 +892,19 @@ def benchmark_cell(
             args, cell, runners, baseline, device
         )
         stage(f"measure_{baseline}_end")
+        if rank == 0:
+            comparison = comparisons[baseline]
+            print(
+                "TERMINAL_PRODUCTION_BENCH_COMPARISON"
+                f"|tokens={cell.effective_tokens}|baseline={baseline}"
+                f"|terminal_ms="
+                f"{comparison['terminal_midpoint_p50_ms']:.6f}"
+                f"|baseline_ms={comparison[baseline]['p50_ms']:.6f}"
+                f"|speedup="
+                f"{comparison['baseline_over_terminal_speedup']:.6f}"
+                f"|aa_drift={comparison['terminal_aa_drift']:.6f}",
+                flush=True,
+            )
         assert_terminal_closed(terminal_workspace, cell)
         assert_route_closed(route_workspace, baseline)
     result = {
