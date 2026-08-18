@@ -7,6 +7,7 @@
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
 #include "sm90_fp8_block_gemm_combine.cuh"
+#include "sm90_fp8_block_terminal_entry.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::entrypoint, "",
@@ -249,6 +250,65 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("in_use"));
     m.def("fp8_block_dispatch_gemm_prewarm",
           &mok_sm90::fp8_block_dispatch_gemm::entry_prewarm, "",
+          pybind11::arg("device_index"));
+    m.def("fp8_block_megakernel_prepare_out",
+          &mok_sm90::fp8_block_terminal_entry::entry_prepare_out, "",
+          pybind11::arg("topk_ids"), pybind11::arg("route_ready"),
+          pybind11::arg("x_routed_ready"),
+          pybind11::arg("gate_up_tile_ready"),
+          pybind11::arg("hidden_row_block_ready"),
+          pybind11::arg("y_routed_ready"),
+          pybind11::arg("y_routed_done"),
+          pybind11::arg("epilogue_claim"),
+          pybind11::arg("next_logical_cluster"),
+          pybind11::arg("next_reduce_probe"),
+          pybind11::arg("worker_ticket"), pybind11::arg("producer_done"),
+          pybind11::arg("comm_closed"), pybind11::arg("push_done"),
+          pybind11::arg("reduce_done"), pybind11::arg("terminate"),
+          pybind11::arg("epilogue_done"),
+          pybind11::arg("input_expected_scratch"));
+    m.def("fp8_block_megakernel_out",
+          &mok_sm90::fp8_block_terminal_entry::entry_out, "",
+          pybind11::arg("x_buffer"), pybind11::arg("x_ptrs"),
+          pybind11::arg("x_scale_buffer"),
+          pybind11::arg("x_scale_ptrs"), pybind11::arg("routed_x"),
+          pybind11::arg("routed_x_scale"), pybind11::arg("m_indices"),
+          pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("tokens_per_expert"), pybind11::arg("w13"),
+          pybind11::arg("w13_scale"), pybind11::arg("gate_up"),
+          pybind11::arg("down_input"),
+          pybind11::arg("down_input_scale"), pybind11::arg("w2"),
+          pybind11::arg("w2_scale"), pybind11::arg("routed_y"),
+          pybind11::arg("combine_buffer"),
+          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("route_ready"),
+          pybind11::arg("route_ready_ptrs"),
+          pybind11::arg("topk_weights"), pybind11::arg("topk_ids"),
+          pybind11::arg("output"), pybind11::arg("x_routed_ready"),
+          pybind11::arg("gate_up_tile_ready"),
+          pybind11::arg("hidden_row_block_ready"),
+          pybind11::arg("y_routed_ready"),
+          pybind11::arg("y_routed_done"),
+          pybind11::arg("epilogue_claim"),
+          pybind11::arg("next_logical_cluster"),
+          pybind11::arg("next_reduce_probe"),
+          pybind11::arg("worker_ticket"), pybind11::arg("producer_done"),
+          pybind11::arg("comm_closed"), pybind11::arg("push_done"),
+          pybind11::arg("reduce_done"), pybind11::arg("terminate"),
+          pybind11::arg("epilogue_done"), pybind11::arg("in_use"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("input_expected_scratch"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("trap_record_ptr"), pybind11::arg("ep_rank"),
+          pybind11::arg("compute_clusters"),
+          pybind11::arg("minibatch_rows"),
+          pybind11::arg("macrobatch_rows"),
+          pybind11::arg("swiglu_limit"), pybind11::arg("spin_limit"));
+    m.def("fp8_block_megakernel_prewarm",
+          &mok_sm90::fp8_block_terminal_entry::entry_prewarm, "",
           pybind11::arg("device_index"));
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
