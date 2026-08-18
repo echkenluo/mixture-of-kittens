@@ -1382,8 +1382,9 @@ __device__ void compute_and_reduce_role(
         if (cta_rank == 0
                 && ticket % REDUCE_TASK_PROBE_STRIDE == 0u) {
             const route::claim_result result = try_reduce_one_ready_token(g);
-            if (result == route::claim_result::claimed)
-                reduced_by_this_cta = true;
+            if (threadIdx.x == 0
+                    && result == route::claim_result::claimed)
+                reduced_before_compute = 1u;
         }
     }
 }
