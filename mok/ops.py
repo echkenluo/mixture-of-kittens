@@ -899,18 +899,24 @@ def require_fp8_block_megakernel() -> None:
         )
 
 
-def fp8_block_megakernel_prewarm(device_index: int) -> int:
+def fp8_block_megakernel_prewarm(
+    device_index: int, comm_clusters: int = 1
+) -> int:
     """Warm the terminal megakernel occupancy cache outside graph capture.
 
     Unlike the legacy K1 helper, the terminal path has no unsupported-op
     fallback: all three production entry points must be present before a
     graph-stable workspace can be created.  Returns the maximum number of
-    compute clusters after reserving the fixed communication cluster.
+    compute clusters after reserving ``comm_clusters`` communication roles.
     """
     if type(device_index) is not int or device_index < 0:
         raise ValueError("device_index must be a nonnegative integer")
+    if type(comm_clusters) is not int or comm_clusters <= 0:
+        raise ValueError("comm_clusters must be a positive integer")
     require_fp8_block_megakernel()
-    maximum = int(_C.fp8_block_megakernel_prewarm(device_index))
+    maximum = int(
+        _C.fp8_block_megakernel_prewarm(device_index, comm_clusters)
+    )
     if maximum <= 0:
         raise RuntimeError(
             "terminal FP8 megakernel occupancy prewarm returned no compute "
@@ -970,6 +976,11 @@ def _terminal_peer_ptrs(name: str, pointers: list[int]) -> None:
         "epilogue_claim",
         "next_logical_cluster",
         "next_reduce_probe",
+        "role_cursor",
+        "cluster_role",
+        "dispatch_tile_cursor",
+        "dispatch_tiles_done",
+        "push_tile_cursor",
         "worker_ticket",
         "comm_owner",
         "comm_worker_ticket",
@@ -993,6 +1004,11 @@ def fp8_block_megakernel_prepare_out(
     epilogue_claim: torch.Tensor,
     next_logical_cluster: torch.Tensor,
     next_reduce_probe: torch.Tensor,
+    role_cursor: torch.Tensor,
+    cluster_role: torch.Tensor,
+    dispatch_tile_cursor: torch.Tensor,
+    dispatch_tiles_done: torch.Tensor,
+    push_tile_cursor: torch.Tensor,
     worker_ticket: torch.Tensor,
     comm_owner: torch.Tensor,
     comm_worker_ticket: torch.Tensor,
@@ -1079,11 +1095,36 @@ def fp8_block_megakernel_prepare_out(
         raise ValueError(
             "worker_ticket must be contiguous CUDA int32 [compute_clusters]"
         )
+    if (
+        not cluster_role.is_cuda
+        or cluster_role.device != device
+        or cluster_role.dtype != torch.int32
+        or not cluster_role.is_contiguous()
+        or cluster_role.ndim != 1
+        or cluster_role.numel() <= worker_ticket.numel()
+    ):
+        raise ValueError("cluster_role must be contiguous CUDA int32 [C+N]")
+    if (
+        not comm_worker_ticket.is_cuda
+        or comm_worker_ticket.device != device
+        or comm_worker_ticket.dtype != torch.int32
+        or not comm_worker_ticket.is_contiguous()
+        or comm_worker_ticket.ndim != 1
+        or comm_worker_ticket.numel() <= 0
+        or cluster_role.numel()
+        != worker_ticket.numel() + comm_worker_ticket.numel()
+    ):
+        raise ValueError(
+            "comm_worker_ticket and worker_ticket must partition cluster_role"
+        )
     for name, tensor in (
         ("next_logical_cluster", next_logical_cluster),
         ("next_reduce_probe", next_reduce_probe),
+        ("role_cursor", role_cursor),
+        ("dispatch_tile_cursor", dispatch_tile_cursor),
+        ("dispatch_tiles_done", dispatch_tiles_done),
+        ("push_tile_cursor", push_tile_cursor),
         ("comm_owner", comm_owner),
-        ("comm_worker_ticket", comm_worker_ticket),
         ("producer_done", producer_done),
         ("comm_closed", comm_closed),
         ("push_done", push_done),
@@ -1104,6 +1145,11 @@ def fp8_block_megakernel_prepare_out(
         epilogue_claim,
         next_logical_cluster,
         next_reduce_probe,
+        role_cursor,
+        cluster_role,
+        dispatch_tile_cursor,
+        dispatch_tiles_done,
+        push_tile_cursor,
         worker_ticket,
         comm_owner,
         comm_worker_ticket,
@@ -1138,6 +1184,11 @@ def fp8_block_megakernel_prepare_out(
         "epilogue_claim",
         "next_logical_cluster",
         "next_reduce_probe",
+        "role_cursor",
+        "cluster_role",
+        "dispatch_tile_cursor",
+        "dispatch_tiles_done",
+        "push_tile_cursor",
         "worker_ticket",
         "comm_owner",
         "comm_worker_ticket",
@@ -1188,6 +1239,11 @@ def fp8_block_megakernel_out(
     epilogue_claim: torch.Tensor,
     next_logical_cluster: torch.Tensor,
     next_reduce_probe: torch.Tensor,
+    role_cursor: torch.Tensor,
+    cluster_role: torch.Tensor,
+    dispatch_tile_cursor: torch.Tensor,
+    dispatch_tiles_done: torch.Tensor,
+    push_tile_cursor: torch.Tensor,
     worker_ticket: torch.Tensor,
     comm_owner: torch.Tensor,
     comm_worker_ticket: torch.Tensor,
@@ -1204,6 +1260,7 @@ def fp8_block_megakernel_out(
     barrier_multicast_ptr: int,
     trap_record_ptr: int,
     ep_rank: int,
+    comm_clusters: int,
     compute_clusters: int,
     minibatch_rows: int,
     macrobatch_rows: int,
@@ -1412,11 +1469,24 @@ def fp8_block_megakernel_out(
         shape=(padded_tokens,),
     )
     if (
+        type(comm_clusters) is not int
+        or comm_clusters <= 0
+        or comm_clusters > (1 << 31) - 1
+    ):
+        raise ValueError("comm_clusters must be a positive int32")
+    if (
         type(compute_clusters) is not int
         or compute_clusters <= 0
         or compute_clusters > (1 << 31) - 1
     ):
         raise ValueError("compute_clusters must be a positive int32")
+    _terminal_tensor(
+        "cluster_role",
+        cluster_role,
+        device=device,
+        dtype=torch.int32,
+        shape=(comm_clusters + compute_clusters,),
+    )
     _terminal_tensor(
         "worker_ticket",
         worker_ticket,
@@ -1424,11 +1494,21 @@ def fp8_block_megakernel_out(
         dtype=torch.int32,
         shape=(compute_clusters,),
     )
+    _terminal_tensor(
+        "comm_worker_ticket",
+        comm_worker_ticket,
+        device=device,
+        dtype=torch.int32,
+        shape=(comm_clusters,),
+    )
     for name, tensor in (
         ("next_logical_cluster", next_logical_cluster),
         ("next_reduce_probe", next_reduce_probe),
+        ("role_cursor", role_cursor),
+        ("dispatch_tile_cursor", dispatch_tile_cursor),
+        ("dispatch_tiles_done", dispatch_tiles_done),
+        ("push_tile_cursor", push_tile_cursor),
         ("comm_owner", comm_owner),
-        ("comm_worker_ticket", comm_worker_ticket),
         ("producer_done", producer_done),
         ("comm_closed", comm_closed),
         ("push_done", push_done),
@@ -1511,6 +1591,11 @@ def fp8_block_megakernel_out(
         epilogue_claim,
         next_logical_cluster,
         next_reduce_probe,
+        role_cursor,
+        cluster_role,
+        dispatch_tile_cursor,
+        dispatch_tiles_done,
+        push_tile_cursor,
         worker_ticket,
         comm_owner,
         comm_worker_ticket,
@@ -1527,6 +1612,7 @@ def fp8_block_megakernel_out(
         barrier_multicast_ptr,
         trap_record_ptr,
         ep_rank,
+        comm_clusters,
         compute_clusters,
         minibatch_rows,
         macrobatch_rows,

@@ -476,6 +476,7 @@ void run_full(
     MOK_STATE_PTR(x_ready, x_ready);
     MOK_STATE_PTR(cursor, cursor);
     MOK_STATE_PTR(worker_ticket, worker_ticket);
+    MOK_STATE_PTR(comm_worker_ticket, comm_worker_ticket);
     MOK_STATE_PTR(worker_failed, worker_failed);
     MOK_STATE_PTR(next_reduce_probe, next_reduce_probe);
     MOK_STATE_PTR(reduce_done, reduce_done);
@@ -495,7 +496,6 @@ void run_full(
         // connect the production closure plane.  With no non-owner in the
         // grid, task_visits proves that every producer ran on the owner.
         MOK_STATE_PTR(comm_owner, comm_owner);
-        MOK_STATE_PTR(comm_worker_ticket, comm_worker_ticket);
         MOK_STATE_PTR(producer_done, producer_done);
         MOK_STATE_PTR(push_done, push_done);
         MOK_STATE_PTR(terminate, terminate);

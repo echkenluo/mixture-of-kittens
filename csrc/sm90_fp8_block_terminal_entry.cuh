@@ -74,10 +74,17 @@ struct prepare_globals {
     int64_t epilogue_claim_count;
     unsigned int *next_logical_cluster;
     unsigned int *next_reduce_probe;
+    unsigned int *role_cursor;
+    unsigned int *cluster_role;
+    int64_t cluster_role_count;
+    unsigned int *dispatch_tile_cursor;
+    unsigned int *dispatch_tiles_done;
+    unsigned int *push_tile_cursor;
     unsigned int *worker_ticket;
     int64_t worker_ticket_count;
     unsigned int *comm_owner;
     unsigned int *comm_worker_ticket;
+    int64_t comm_worker_ticket_count;
     unsigned int *producer_done;
     unsigned int *comm_closed;
     unsigned int *push_done;
@@ -120,12 +127,19 @@ __global__ void prepare_kernel(prepare_globals g) {
             g.y_routed_done, g.y_routed_done_count, index);
         clear_if_present(
             g.epilogue_claim, g.epilogue_claim_count, index);
+        if (index < g.cluster_role_count)
+            g.cluster_role[index] = full::UNCLAIMED_COMM;
         clear_if_present(g.worker_ticket, g.worker_ticket_count, index);
+        clear_if_present(
+            g.comm_worker_ticket, g.comm_worker_ticket_count, index);
         if (index == 0) {
             *g.next_logical_cluster = 0u;
             *g.next_reduce_probe = 0u;
+            *g.role_cursor = 0u;
+            *g.dispatch_tile_cursor = 0u;
+            *g.dispatch_tiles_done = 0u;
+            *g.push_tile_cursor = 0u;
             *g.comm_owner = full::UNCLAIMED_COMM;
-            *g.comm_worker_ticket = 0u;
             *g.producer_done = 0u;
             *g.comm_closed = 0u;
             *g.push_done = 0u;
@@ -169,6 +183,11 @@ inline void entry_prepare_out(
     const at::Tensor &epilogue_claim,
     const at::Tensor &next_logical_cluster,
     const at::Tensor &next_reduce_probe,
+    const at::Tensor &role_cursor,
+    const at::Tensor &cluster_role,
+    const at::Tensor &dispatch_tile_cursor,
+    const at::Tensor &dispatch_tiles_done,
+    const at::Tensor &push_tile_cursor,
     const at::Tensor &worker_ticket,
     const at::Tensor &comm_owner,
     const at::Tensor &comm_worker_ticket,
@@ -205,13 +224,29 @@ inline void entry_prepare_out(
     check_i32_state(next_logical_cluster, device, 1,
                     "next_logical_cluster");
     check_i32_state(next_reduce_probe, device, 1, "next_reduce_probe");
+    check_i32_state(role_cursor, device, 1, "role_cursor");
+    check_i32_state(dispatch_tile_cursor, device, 1,
+                    "dispatch_tile_cursor");
+    check_i32_state(dispatch_tiles_done, device, 1,
+                    "dispatch_tiles_done");
+    check_i32_state(push_tile_cursor, device, 1, "push_tile_cursor");
+    check_cuda_contiguous(cluster_role, at::kInt, device, "cluster_role");
+    TORCH_CHECK(cluster_role.dim() == 1 && cluster_role.numel() > 1,
+                "cluster_role must be nonempty int32 [C+N]");
     check_cuda_contiguous(worker_ticket, at::kInt, device, "worker_ticket");
     TORCH_CHECK(worker_ticket.dim() == 1 && worker_ticket.numel() > 0,
                 "worker_ticket must be nonempty int32 [compute_clusters]");
+    check_cuda_contiguous(
+        comm_worker_ticket, at::kInt, device, "comm_worker_ticket");
+    TORCH_CHECK(comm_worker_ticket.dim() == 1
+                    && comm_worker_ticket.numel() > 0,
+                "comm_worker_ticket must be nonempty int32 [comm_clusters]");
+    TORCH_CHECK(cluster_role.numel()
+                    == worker_ticket.numel() + comm_worker_ticket.numel(),
+                "cluster_role must contain C+N entries");
     for (const auto &[tensor, name] :
-         std::array<std::pair<const at::Tensor *, const char *>, 10>{{
+         std::array<std::pair<const at::Tensor *, const char *>, 9>{{
              {&comm_owner, "comm_owner"},
-             {&comm_worker_ticket, "comm_worker_ticket"},
              {&producer_done, "producer_done"},
              {&comm_closed, "comm_closed"},
              {&push_done, "push_done"},
@@ -233,8 +268,12 @@ inline void entry_prepare_out(
         u32_ptr(y_routed_done), y_routed_done.numel(),
         u32_ptr(epilogue_claim), epilogue_claim.numel(),
         u32_ptr(next_logical_cluster), u32_ptr(next_reduce_probe),
+        u32_ptr(role_cursor), u32_ptr(cluster_role), cluster_role.numel(),
+        u32_ptr(dispatch_tile_cursor), u32_ptr(dispatch_tiles_done),
+        u32_ptr(push_tile_cursor),
         u32_ptr(worker_ticket), worker_ticket.numel(),
         u32_ptr(comm_owner), u32_ptr(comm_worker_ticket),
+        comm_worker_ticket.numel(),
         u32_ptr(producer_done),
         u32_ptr(comm_closed), u32_ptr(push_done), u32_ptr(reduce_done),
         u32_ptr(terminate), u32_ptr(epilogue_done),
@@ -244,7 +283,8 @@ inline void entry_prepare_out(
         g.route_count, g.x_routed_ready_count,
         g.gate_up_tile_ready_count, g.hidden_row_block_ready_count,
         g.y_routed_ready_count, g.y_routed_done_count,
-        g.epilogue_claim_count, g.worker_ticket_count, int64_t{1}});
+        g.epilogue_claim_count, g.cluster_role_count,
+        g.worker_ticket_count, g.comm_worker_ticket_count, int64_t{1}});
     const int blocks = static_cast<int>(std::min<int64_t>(
         4096, (g.max_count + PREPARE_THREADS - 1) / PREPARE_THREADS));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device.index());
@@ -300,12 +340,18 @@ inline int prewarm(int device_index) {
     return clusters;
 }
 
-inline int64_t entry_prewarm(int64_t device_index) {
+inline int64_t entry_prewarm(
+        int64_t device_index, int64_t comm_clusters = full::COMM_CLUSTERS) {
     TORCH_CHECK(device_index >= std::numeric_limits<int>::min()
                     && device_index <= std::numeric_limits<int>::max(),
                 "device_index does not fit int");
+    TORCH_CHECK(comm_clusters > 0
+                    && comm_clusters <= std::numeric_limits<int>::max(),
+                "comm_clusters must be a positive int");
     const int resident = prewarm(static_cast<int>(device_index));
-    return static_cast<int64_t>(resident - full::COMM_CLUSTERS);
+    TORCH_CHECK(comm_clusters < resident,
+                "terminal kernel must retain at least one compute cluster");
+    return static_cast<int64_t>(resident - comm_clusters);
 }
 
 inline void entry_out(
@@ -334,6 +380,11 @@ inline void entry_out(
     const at::Tensor &epilogue_claim,
     const at::Tensor &next_logical_cluster,
     const at::Tensor &next_reduce_probe,
+    const at::Tensor &role_cursor,
+    const at::Tensor &cluster_role,
+    const at::Tensor &dispatch_tile_cursor,
+    const at::Tensor &dispatch_tiles_done,
+    const at::Tensor &push_tile_cursor,
     const at::Tensor &worker_ticket,
     const at::Tensor &comm_owner,
     const at::Tensor &comm_worker_ticket,
@@ -344,7 +395,7 @@ inline void entry_out(
     const at::Tensor &barrier_target,
     const at::Tensor &input_expected_scratch,
     int64_t barrier_buffer_multicast_ptr, int64_t trap_record_ptr,
-    int64_t ep_rank, int64_t compute_clusters,
+    int64_t ep_rank, int64_t comm_clusters, int64_t compute_clusters,
     int64_t minibatch_rows, int64_t macrobatch_rows,
     double swiglu_limit, int64_t spin_limit) {
     const at::Device device = routed_x.device();
@@ -495,6 +546,12 @@ inline void entry_out(
     check_i32_state(next_logical_cluster, device, 1,
                     "next_logical_cluster");
     check_i32_state(next_reduce_probe, device, 1, "next_reduce_probe");
+    check_i32_state(role_cursor, device, 1, "role_cursor");
+    check_i32_state(dispatch_tile_cursor, device, 1,
+                    "dispatch_tile_cursor");
+    check_i32_state(dispatch_tiles_done, device, 1,
+                    "dispatch_tiles_done");
+    check_i32_state(push_tile_cursor, device, 1, "push_tile_cursor");
     check_i32_state(producer_done, device, 1, "producer_done");
     check_i32_state(comm_closed, device, 1, "comm_closed");
     check_i32_state(push_done, device, 1, "push_done");
@@ -507,12 +564,21 @@ inline void entry_out(
     check_i32_state(input_expected_scratch, device, 1,
                     "input_expected_scratch");
 
+    TORCH_CHECK(comm_clusters > 0
+                    && comm_clusters <= std::numeric_limits<int>::max(),
+                "comm_clusters must be a positive int");
     TORCH_CHECK(compute_clusters > 0
                     && compute_clusters <= std::numeric_limits<int>::max(),
                 "compute_clusters must be a positive int");
+    TORCH_CHECK(comm_clusters
+                    <= std::numeric_limits<int>::max() - compute_clusters,
+                "C+N terminal clusters overflow int");
+    check_i32_state(cluster_role, device,
+                    comm_clusters + compute_clusters, "cluster_role");
     check_i32_state(worker_ticket, device, compute_clusters, "worker_ticket");
     check_i32_state(comm_owner, device, 1, "comm_owner");
-    check_i32_state(comm_worker_ticket, device, 1, "comm_worker_ticket");
+    check_i32_state(comm_worker_ticket, device, comm_clusters,
+                    "comm_worker_ticket");
     TORCH_CHECK(minibatch_rows > 0 && minibatch_rows % terminal::M_TILE == 0
                     && minibatch_rows <= std::numeric_limits<int>::max(),
                 "minibatch_rows must be a positive M64-aligned int");
@@ -544,8 +610,8 @@ inline void entry_out(
                     "call fp8_block_megakernel_prewarm at workspace creation");
         resident = prewarm(device_index);
     }
-    TORCH_CHECK(full::COMM_CLUSTERS + compute_clusters <= resident,
-                "requested 1+N terminal clusters exceed resident capacity");
+    TORCH_CHECK(comm_clusters + compute_clusters <= resident,
+                "requested C+N terminal clusters exceed resident capacity");
 
     gemm_problem w13_problem{
         kittens::py::tensor_to_gl<a_gl>(const_cast<at::Tensor &>(routed_x)),
@@ -611,6 +677,11 @@ inline void entry_out(
     g.epilogue_claim = u32_ptr(epilogue_claim);
     g.x_ready = u32_ptr(x_routed_ready);
     g.cursor = u32_ptr(next_logical_cluster);
+    g.role_cursor = u32_ptr(role_cursor);
+    g.cluster_role = u32_ptr(cluster_role);
+    g.dispatch_tile_cursor = u32_ptr(dispatch_tile_cursor);
+    g.dispatch_tiles_done = u32_ptr(dispatch_tiles_done);
+    g.push_tile_cursor = u32_ptr(push_tile_cursor);
     g.worker_ticket = u32_ptr(worker_ticket);
     g.comm_owner = u32_ptr(comm_owner);
     g.comm_worker_ticket = u32_ptr(comm_worker_ticket);
@@ -625,7 +696,6 @@ inline void entry_out(
     g.reduce_visits = nullptr;
     g.errors = nullptr;
     g.progress_timeouts = nullptr;
-    g.dispatch_tiles_done = nullptr;
     g.compute_started = nullptr;
     g.overlap_witness = nullptr;
     g.barrier_flag = u32_ptr(barrier_buffer);
@@ -639,6 +709,7 @@ inline void entry_out(
     g.push_done = u32_ptr(push_done);
     g.terminate = u32_ptr(terminate);
     g.trap_record = utils::mok_resolve_trap_record(trap_record_ptr);
+    g.comm_clusters = static_cast<int>(comm_clusters);
     g.compute_clusters = static_cast<int>(compute_clusters);
     g.minibatch_rows = static_cast<int>(minibatch_rows);
     g.macrobatch_rows = static_cast<int>(macrobatch_rows);
@@ -647,7 +718,7 @@ inline void entry_out(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_index);
     full::kernel<gemm_problem>
-        <<<(full::COMM_CLUSTERS + g.compute_clusters)
+        <<<(g.comm_clusters + g.compute_clusters)
                    * terminal::CLUSTER_CTAS,
            terminal::THREADS_PER_CTA, DYNAMIC_SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());

@@ -177,6 +177,7 @@ class MoKFP8TerminalWorkspace:
     topk: int
     num_local_experts: int
     schedule_capacity: int
+    comm_clusters: int
     compute_clusters: int
     max_compute_clusters: int
     x_buffer: torch.Tensor
@@ -220,9 +221,14 @@ class MoKFP8TerminalWorkspace:
     epilogue_claim: torch.Tensor
     next_logical_cluster: torch.Tensor
     next_reduce_probe: torch.Tensor
+    role_cursor: torch.Tensor
+    cluster_role: torch.Tensor
+    dispatch_tile_cursor: torch.Tensor
+    dispatch_tiles_done: torch.Tensor
+    push_tile_cursor: torch.Tensor
     worker_ticket: torch.Tensor  # (compute_clusters,) compute-role publish slot
-    comm_owner: torch.Tensor  # (1,) elected physical comm cluster or -1
-    comm_worker_ticket: torch.Tensor  # (1,) elected owner publish slot
+    comm_owner: torch.Tensor  # (1,) physical cluster holding role 0 or -1
+    comm_worker_ticket: torch.Tensor  # (comm_clusters,) per-role publish slots
     producer_done: torch.Tensor
     comm_closed: torch.Tensor
     push_done: torch.Tensor
@@ -239,7 +245,7 @@ _FP8_ROUTE_WORKSPACE_CACHE: dict[
     tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
 ] = {}
 _FP8_TERMINAL_WORKSPACE_CACHE: dict[
-    tuple[str, int, int, int, int, int], MoKFP8TerminalWorkspace
+    tuple[str, int, int, int, int, int, int], MoKFP8TerminalWorkspace
 ] = {}
 
 
@@ -699,6 +705,7 @@ def create_fp8_terminal_workspace(
     num_local_tokens: int,
     schedule_capacity: int,
     num_local_experts: int,
+    comm_clusters: int = 1,
     compute_clusters: int | None = None,
 ) -> MoKFP8TerminalWorkspace:
     """Allocate the graph-stable storage for the terminal H20 forward.
@@ -762,7 +769,11 @@ def create_fp8_terminal_workspace(
         or not 1 <= num_local_experts <= 256
     ):
         raise ValueError("num_local_experts must be an integer in [1, 256]")
-    max_compute_clusters = fp8_block_megakernel_prewarm(device_index)
+    if type(comm_clusters) is not int or comm_clusters <= 0:
+        raise ValueError("comm_clusters must be a positive integer")
+    max_compute_clusters = fp8_block_megakernel_prewarm(
+        device_index, comm_clusters
+    )
     if compute_clusters is None:
         compute_clusters = max_compute_clusters
     elif (
@@ -798,6 +809,7 @@ def create_fp8_terminal_workspace(
             padded_num_local_tokens,
             schedule_capacity,
             num_local_experts,
+            comm_clusters,
             compute_clusters,
         ],
         dtype=torch.int64,
@@ -960,11 +972,23 @@ def create_fp8_terminal_workspace(
     )
     next_logical_cluster = torch.zeros(1, dtype=torch.int32, device=device)
     next_reduce_probe = torch.zeros(1, dtype=torch.int32, device=device)
+    role_cursor = torch.zeros(1, dtype=torch.int32, device=device)
+    cluster_role = torch.full(
+        (comm_clusters + compute_clusters,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    dispatch_tile_cursor = torch.zeros(1, dtype=torch.int32, device=device)
+    dispatch_tiles_done = torch.zeros(1, dtype=torch.int32, device=device)
+    push_tile_cursor = torch.zeros(1, dtype=torch.int32, device=device)
     worker_ticket = torch.zeros(
         compute_clusters, dtype=torch.int32, device=device
     )
     comm_owner = torch.full((1,), -1, dtype=torch.int32, device=device)
-    comm_worker_ticket = torch.zeros(1, dtype=torch.int32, device=device)
+    comm_worker_ticket = torch.zeros(
+        comm_clusters, dtype=torch.int32, device=device
+    )
     producer_done = torch.zeros(1, dtype=torch.int32, device=device)
     comm_closed = torch.zeros(1, dtype=torch.int32, device=device)
     push_done = torch.zeros(1, dtype=torch.int32, device=device)
@@ -985,7 +1009,9 @@ def create_fp8_terminal_workspace(
     print(
         f"MOK_TERMINAL_OCCUPANCY|device={device_index}"
         f"|max_compute_clusters={max_compute_clusters}"
-        f"|compute_clusters={compute_clusters}",
+        f"|comm_clusters={comm_clusters}"
+        f"|compute_clusters={compute_clusters}"
+        f"|physical_clusters={comm_clusters + compute_clusters}",
         flush=True,
     )
 
@@ -1001,6 +1027,7 @@ def create_fp8_terminal_workspace(
         topk=topk,
         num_local_experts=num_local_experts,
         schedule_capacity=schedule_capacity,
+        comm_clusters=comm_clusters,
         compute_clusters=compute_clusters,
         max_compute_clusters=max_compute_clusters,
         x_buffer=x_buffer,
@@ -1050,6 +1077,11 @@ def create_fp8_terminal_workspace(
         epilogue_claim=epilogue_claim,
         next_logical_cluster=next_logical_cluster,
         next_reduce_probe=next_reduce_probe,
+        role_cursor=role_cursor,
+        cluster_role=cluster_role,
+        dispatch_tile_cursor=dispatch_tile_cursor,
+        dispatch_tiles_done=dispatch_tiles_done,
+        push_tile_cursor=push_tile_cursor,
         worker_ticket=worker_ticket,
         comm_owner=comm_owner,
         comm_worker_ticket=comm_worker_ticket,
@@ -1072,6 +1104,7 @@ def get_fp8_terminal_workspace(
     num_local_tokens: int,
     schedule_capacity: int,
     num_local_experts: int,
+    comm_clusters: int = 1,
     compute_clusters: int | None = None,
 ) -> MoKFP8TerminalWorkspace:
     """Return a cached graph-stable terminal workspace.
@@ -1088,6 +1121,8 @@ def get_fp8_terminal_workspace(
         type(compute_clusters) is not int or compute_clusters <= 0
     ):
         raise ValueError("compute_clusters must be None or a positive integer")
+    if type(comm_clusters) is not int or comm_clusters <= 0:
+        raise ValueError("comm_clusters must be a positive integer")
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
@@ -1098,6 +1133,7 @@ def get_fp8_terminal_workspace(
         num_local_tokens,
         schedule_capacity,
         num_local_experts,
+        comm_clusters,
         cluster_key,
     )
     cached_workspace = _FP8_TERMINAL_WORKSPACE_CACHE.get(cache_key)
@@ -1110,6 +1146,7 @@ def get_fp8_terminal_workspace(
         num_local_tokens=num_local_tokens,
         schedule_capacity=schedule_capacity,
         num_local_experts=num_local_experts,
+        comm_clusters=comm_clusters,
         compute_clusters=compute_clusters,
     )
     _FP8_TERMINAL_WORKSPACE_CACHE[cache_key] = workspace
@@ -1589,6 +1626,7 @@ def _validate_terminal_forward(
         or workspace.schedule_capacity % 64 != 0
         or workspace.padded_num_local_tokens < workspace.num_local_tokens
         or workspace.padded_num_local_tokens % 64 != 0
+        or workspace.comm_clusters <= 0
         or workspace.compute_clusters <= 0
         or workspace.compute_clusters > workspace.max_compute_clusters
     ):
@@ -1787,16 +1825,31 @@ def _validate_terminal_forward(
         (padded_tokens,),
     )
     tensor(
+        "workspace.cluster_role",
+        workspace.cluster_role,
+        torch.int32,
+        (workspace.comm_clusters + workspace.compute_clusters,),
+    )
+    tensor(
         "workspace.worker_ticket",
         workspace.worker_ticket,
         torch.int32,
         (workspace.compute_clusters,),
     )
+    tensor(
+        "workspace.comm_worker_ticket",
+        workspace.comm_worker_ticket,
+        torch.int32,
+        (workspace.comm_clusters,),
+    )
     for name, value in (
         ("next_logical_cluster", workspace.next_logical_cluster),
         ("next_reduce_probe", workspace.next_reduce_probe),
+        ("role_cursor", workspace.role_cursor),
+        ("dispatch_tile_cursor", workspace.dispatch_tile_cursor),
+        ("dispatch_tiles_done", workspace.dispatch_tiles_done),
+        ("push_tile_cursor", workspace.push_tile_cursor),
         ("comm_owner", workspace.comm_owner),
-        ("comm_worker_ticket", workspace.comm_worker_ticket),
         ("producer_done", workspace.producer_done),
         ("comm_closed", workspace.comm_closed),
         ("push_done", workspace.push_done),
@@ -1969,6 +2022,11 @@ def megakernel_fp8_block_leased(
         workspace.epilogue_claim,
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
+        workspace.role_cursor,
+        workspace.cluster_role,
+        workspace.dispatch_tile_cursor,
+        workspace.dispatch_tiles_done,
+        workspace.push_tile_cursor,
         workspace.worker_ticket,
         workspace.comm_owner,
         workspace.comm_worker_ticket,
@@ -2015,6 +2073,11 @@ def megakernel_fp8_block_leased(
         workspace.epilogue_claim,
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
+        workspace.role_cursor,
+        workspace.cluster_role,
+        workspace.dispatch_tile_cursor,
+        workspace.dispatch_tiles_done,
+        workspace.push_tile_cursor,
         workspace.worker_ticket,
         workspace.comm_owner,
         workspace.comm_worker_ticket,
@@ -2031,6 +2094,7 @@ def megakernel_fp8_block_leased(
         workspace.barrier_buffer_multicast_ptr,
         workspace.trap_record_ptr,
         workspace.ep_rank,
+        workspace.comm_clusters,
         workspace.compute_clusters,
         minibatch_rows,
         macrobatch_rows,

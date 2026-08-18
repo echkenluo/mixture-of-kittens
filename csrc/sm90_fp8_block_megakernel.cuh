@@ -221,6 +221,29 @@ MOK_TERMINAL_HD ordered_minibatch_range decode_ordered_minibatch(
     return result;
 }
 
+// Map a dense communication-queue ticket onto the same reverse-macrobatch,
+// ordered-minibatch M64 traversal used by the logical compute decoder.  The
+// queue is deliberately dense: a communication role may be admitted late, so
+// work cannot be statically striped by role id.
+MOK_TERMINAL_HD int decode_ordered_m_tile(
+        const logical_shape &shape, int tile_ordinal) {
+    if (!shape.valid || tile_ordinal < 0
+            || tile_ordinal >= shape.num_tokens / M_TILE)
+        return -1;
+
+    int remaining = tile_ordinal;
+    for (int ordered = 0; ordered < shape.num_global_minibatches; ++ordered) {
+        const ordered_minibatch_range range =
+            decode_ordered_minibatch(shape, ordered);
+        if (!range.valid)
+            return -1;
+        if (remaining < range.active_m_tiles)
+            return range.first_m_tile + remaining;
+        remaining -= range.active_m_tiles;
+    }
+    return -1;
+}
+
 MOK_TERMINAL_HD ordinal_range stage_range(
         const ordered_minibatch_range &range, logical_stage stage) {
     ordinal_range result{range.all.begin, range.all.begin};

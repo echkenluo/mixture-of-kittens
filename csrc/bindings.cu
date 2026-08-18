@@ -262,6 +262,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("epilogue_claim"),
           pybind11::arg("next_logical_cluster"),
           pybind11::arg("next_reduce_probe"),
+          pybind11::arg("role_cursor"), pybind11::arg("cluster_role"),
+          pybind11::arg("dispatch_tile_cursor"),
+          pybind11::arg("dispatch_tiles_done"),
+          pybind11::arg("push_tile_cursor"),
           pybind11::arg("worker_ticket"), pybind11::arg("comm_owner"),
           pybind11::arg("comm_worker_ticket"),
           pybind11::arg("producer_done"),
@@ -296,6 +300,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("epilogue_claim"),
           pybind11::arg("next_logical_cluster"),
           pybind11::arg("next_reduce_probe"),
+          pybind11::arg("role_cursor"), pybind11::arg("cluster_role"),
+          pybind11::arg("dispatch_tile_cursor"),
+          pybind11::arg("dispatch_tiles_done"),
+          pybind11::arg("push_tile_cursor"),
           pybind11::arg("worker_ticket"), pybind11::arg("comm_owner"),
           pybind11::arg("comm_worker_ticket"),
           pybind11::arg("producer_done"),
@@ -307,13 +315,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input_expected_scratch"),
           pybind11::arg("barrier_buffer_multicast_ptr"),
           pybind11::arg("trap_record_ptr"), pybind11::arg("ep_rank"),
+          pybind11::arg("comm_clusters"),
           pybind11::arg("compute_clusters"),
           pybind11::arg("minibatch_rows"),
           pybind11::arg("macrobatch_rows"),
           pybind11::arg("swiglu_limit"), pybind11::arg("spin_limit"));
     m.def("fp8_block_megakernel_prewarm",
           &mok_sm90::fp8_block_terminal_entry::entry_prewarm, "",
-          pybind11::arg("device_index"));
+          pybind11::arg("device_index"),
+          pybind11::arg("comm_clusters") = 1);
 #endif
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
