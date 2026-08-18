@@ -43,46 +43,46 @@ struct golden_coordinate {
     int minibatch;
     int global_m;
     terminal::logical_stage stage;
-    int n128;
+    int n256;
 };
 
 // nt=256, S=A=128: ordered j=0 is q=1/gm=2..3, then j=1 is
 // q=0/gm=0..1.  These points pin every stage boundary and both M64s.
 const golden_coordinate BALANCED_Q2_GOLDEN[] = {
     {0, 0, 1, 0, 2, terminal::logical_stage::gate, 0},
-    {15, 0, 1, 0, 2, terminal::logical_stage::gate, 15},
-    {16, 0, 1, 0, 3, terminal::logical_stage::gate, 0},
-    {31, 0, 1, 0, 3, terminal::logical_stage::gate, 15},
-    {32, 0, 1, 0, 2, terminal::logical_stage::up, 0},
-    {63, 0, 1, 0, 3, terminal::logical_stage::up, 15},
-    {64, 0, 1, 0, 2, terminal::logical_stage::activation, 0},
-    {65, 0, 1, 0, 3, terminal::logical_stage::activation, 0},
-    {66, 0, 1, 0, 2, terminal::logical_stage::w2, 0},
-    {97, 0, 1, 0, 2, terminal::logical_stage::w2, 31},
-    {98, 0, 1, 0, 3, terminal::logical_stage::w2, 0},
-    {129, 0, 1, 0, 3, terminal::logical_stage::w2, 31},
-    {130, 1, 0, 0, 0, terminal::logical_stage::gate, 0},
-    {259, 1, 0, 0, 1, terminal::logical_stage::w2, 31},
+    {7, 0, 1, 0, 2, terminal::logical_stage::gate, 7},
+    {8, 0, 1, 0, 3, terminal::logical_stage::gate, 0},
+    {15, 0, 1, 0, 3, terminal::logical_stage::gate, 7},
+    {16, 0, 1, 0, 2, terminal::logical_stage::up, 0},
+    {31, 0, 1, 0, 3, terminal::logical_stage::up, 7},
+    {32, 0, 1, 0, 2, terminal::logical_stage::activation, 0},
+    {33, 0, 1, 0, 3, terminal::logical_stage::activation, 0},
+    {34, 0, 1, 0, 2, terminal::logical_stage::w2, 0},
+    {49, 0, 1, 0, 2, terminal::logical_stage::w2, 15},
+    {50, 0, 1, 0, 3, terminal::logical_stage::w2, 0},
+    {65, 0, 1, 0, 3, terminal::logical_stage::w2, 15},
+    {66, 1, 0, 0, 0, terminal::logical_stage::gate, 0},
+    {131, 1, 0, 0, 1, terminal::logical_stage::w2, 15},
 };
 
 // nt=1088, S=256, A=512: L=1, so the one-M64 partial tail at q=2
 // is j=0.  Full ranges then walk (q,b)=(1,0),(1,1),(0,0),(0,1).
 const golden_coordinate SKEW_Q3_PARTIAL_GOLDEN[] = {
     {0, 0, 2, 0, 16, terminal::logical_stage::gate, 0},
-    {15, 0, 2, 0, 16, terminal::logical_stage::gate, 15},
-    {16, 0, 2, 0, 16, terminal::logical_stage::up, 0},
-    {31, 0, 2, 0, 16, terminal::logical_stage::up, 15},
-    {32, 0, 2, 0, 16, terminal::logical_stage::activation, 0},
-    {33, 0, 2, 0, 16, terminal::logical_stage::w2, 0},
-    {64, 0, 2, 0, 16, terminal::logical_stage::w2, 31},
-    {65, 1, 1, 0, 8, terminal::logical_stage::gate, 0},
-    {324, 1, 1, 0, 11, terminal::logical_stage::w2, 31},
-    {325, 2, 1, 1, 12, terminal::logical_stage::gate, 0},
-    {584, 2, 1, 1, 15, terminal::logical_stage::w2, 31},
-    {585, 3, 0, 0, 0, terminal::logical_stage::gate, 0},
-    {844, 3, 0, 0, 3, terminal::logical_stage::w2, 31},
-    {845, 4, 0, 1, 4, terminal::logical_stage::gate, 0},
-    {1104, 4, 0, 1, 7, terminal::logical_stage::w2, 31},
+    {7, 0, 2, 0, 16, terminal::logical_stage::gate, 7},
+    {8, 0, 2, 0, 16, terminal::logical_stage::up, 0},
+    {15, 0, 2, 0, 16, terminal::logical_stage::up, 7},
+    {16, 0, 2, 0, 16, terminal::logical_stage::activation, 0},
+    {17, 0, 2, 0, 16, terminal::logical_stage::w2, 0},
+    {32, 0, 2, 0, 16, terminal::logical_stage::w2, 15},
+    {33, 1, 1, 0, 8, terminal::logical_stage::gate, 0},
+    {164, 1, 1, 0, 11, terminal::logical_stage::w2, 15},
+    {165, 2, 1, 1, 12, terminal::logical_stage::gate, 0},
+    {296, 2, 1, 1, 15, terminal::logical_stage::w2, 15},
+    {297, 3, 0, 0, 0, terminal::logical_stage::gate, 0},
+    {428, 3, 0, 0, 3, terminal::logical_stage::w2, 15},
+    {429, 4, 0, 1, 4, terminal::logical_stage::gate, 0},
+    {560, 4, 0, 1, 7, terminal::logical_stage::w2, 15},
 };
 
 [[noreturn]] void fail(const std::string &message) {
@@ -111,7 +111,7 @@ void check_golden_set(const probe_case &test,
                     && minibatch.minibatch == expected.minibatch
                     && actual.global_m == expected.global_m
                     && actual.stage == expected.stage
-                    && actual.n128 == expected.n128,
+                    && actual.n256 == expected.n256,
                 std::string(test.name) + ": golden coordinate mismatch at "
                     + std::to_string(expected.ordinal));
     }
@@ -141,24 +141,24 @@ void check_stage_decode_interlock(
             terminal::decode_logical_cursor(shape, ordinal);
         const int64_t local = ordinal - ordinals.begin;
         int expected_m = minibatch.first_m_tile;
-        int expected_n128 = 0;
+        int expected_n256 = 0;
         if (stage == terminal::logical_stage::gate
                 || stage == terminal::logical_stage::up) {
             expected_m += static_cast<int>(
                 local / terminal::W13_CLUSTER_TASKS);
-            expected_n128 = static_cast<int>(
+            expected_n256 = static_cast<int>(
                 local % terminal::W13_CLUSTER_TASKS);
         } else if (stage == terminal::logical_stage::activation) {
             expected_m += static_cast<int>(local);
         } else {
             expected_m += static_cast<int>(
                 local / terminal::W2_CLUSTER_TASKS);
-            expected_n128 = static_cast<int>(
+            expected_n256 = static_cast<int>(
                 local % terminal::W2_CLUSTER_TASKS);
         }
         require(coordinate.valid && coordinate.stage == stage
                     && coordinate.global_m == expected_m
-                    && coordinate.n128 == expected_n128,
+                    && coordinate.n256 == expected_n256,
                 std::string(test.name) + ": stage/decode interlock at "
                     + std::to_string(ordinal));
     }
@@ -174,17 +174,17 @@ int canonical_cluster_task(const terminal::logical_coordinate &coordinate,
     const int activation_size = m_tiles;
     if (coordinate.stage == terminal::logical_stage::gate)
         return coordinate.global_m * terminal::W13_CLUSTER_TASKS
-            + coordinate.n128;
+            + coordinate.n256;
     if (coordinate.stage == terminal::logical_stage::up)
         return gate_size
             + coordinate.global_m * terminal::W13_CLUSTER_TASKS
-            + coordinate.n128;
+            + coordinate.n256;
     if (coordinate.stage == terminal::logical_stage::activation)
         return gate_size + up_size + coordinate.global_m;
     if (coordinate.stage == terminal::logical_stage::w2)
         return gate_size + up_size + activation_size
             + coordinate.global_m * terminal::W2_CLUSTER_TASKS
-            + coordinate.n128;
+            + coordinate.n256;
     return -1;
 }
 
@@ -234,7 +234,7 @@ void check_counter_contract(const probe_case &test,
                 std::string(test.name) + ": counter aggregate arrivals");
         if (capacity_m_tiles > 0) {
             const int n = counter == terminal::ready_counter::gate_up_tile
-                ? terminal::W13_N_TILES - 1
+                ? terminal::W13_N128_COUNTERS - 1
                 : 0;
             require(terminal::counter_index(counter, 0, 0) == 0,
                     std::string(test.name) + ": counter first index");
@@ -267,29 +267,29 @@ void check_counter_contract(const probe_case &test,
             std::string(test.name) + ": expanded N64 subtile formula");
     require(terminal::counter_arrivals_per_cluster_task(
                 terminal::ready_counter::gate_up_tile,
-                terminal::logical_stage::gate) == 1
+                terminal::logical_stage::gate) == 2
                 && terminal::counter_arrivals_per_cluster_task(
                     terminal::ready_counter::gate_up_tile,
-                    terminal::logical_stage::up) == 1
+                    terminal::logical_stage::up) == 2
                 && terminal::counter_arrivals_per_cluster_task(
                     terminal::ready_counter::hidden_row_block,
                     terminal::logical_stage::activation) == 1
                 && terminal::counter_arrivals_per_cluster_task(
                     terminal::ready_counter::y_routed,
-                    terminal::logical_stage::w2) == 1,
+                    terminal::logical_stage::w2) == 2,
             std::string(test.name) + ": cluster publication delta");
     require(terminal::counter_entries_touched_per_cluster_task(
                 terminal::ready_counter::gate_up_tile,
-                terminal::logical_stage::gate) == 1
+                terminal::logical_stage::gate) == 2
                 && terminal::counter_arrival_delta_per_entry(
                     terminal::ready_counter::gate_up_tile,
                     terminal::logical_stage::gate) == 1
                 && terminal::counter_entries_touched_per_cluster_task(
                        terminal::ready_counter::y_routed,
-                       terminal::logical_stage::w2) == 1
+                    terminal::logical_stage::w2) == 1
                 && terminal::counter_arrival_delta_per_entry(
                     terminal::ready_counter::y_routed,
-                    terminal::logical_stage::w2) == 1,
+                    terminal::logical_stage::w2) == 2,
             std::string(test.name) + ": counter entry/delta contract");
 }
 
@@ -495,7 +495,7 @@ void check_host_case(const probe_case &test) {
     std::vector<int> work_visits(
         static_cast<size_t>(m_tiles * terminal::N64_SUBTILES_PER_M64), 0);
     std::vector<int> gate_up_arrivals(
-        static_cast<size_t>(m_tiles * terminal::W13_N_TILES), 0);
+        static_cast<size_t>(m_tiles * terminal::W13_N128_COUNTERS), 0);
     std::vector<int> hidden_arrivals(static_cast<size_t>(m_tiles), 0);
     std::vector<int> y_arrivals(static_cast<size_t>(m_tiles), 0);
     for (int64_t ordinal = 0; ordinal < shape.total_tasks; ++ordinal) {
@@ -522,43 +522,60 @@ void check_host_case(const probe_case &test) {
                 std::string(test.name) + ": x counter out of bounds");
         if (coordinate.stage == terminal::logical_stage::gate
                 || coordinate.stage == terminal::logical_stage::up) {
-            for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
-                const int n64 = terminal::n64_for_cta(coordinate, rank);
-                const int work_key = canonical_n64_subtile(
-                    coordinate, m_tiles, n64);
-                require(n64 == terminal::CLUSTER_CTAS * coordinate.n128 + rank
-                            && work_key >= 0
-                            && work_key < static_cast<int>(work_visits.size()),
-                        std::string(test.name) + ": invalid W13 CTA expansion");
-                ++work_visits[work_key];
-            }
-            const auto gu_index = terminal::counter_index(
-                terminal::ready_counter::gate_up_tile,
-                coordinate.global_m, coordinate.n128);
-            require(gu_index >= 0
-                        && gu_index < static_cast<int64_t>(
-                            gate_up_arrivals.size()),
-                    std::string(test.name)
-                        + ": gate/up counter out of bounds");
-            gate_up_arrivals[static_cast<size_t>(gu_index)] +=
-                terminal::counter_arrival_delta_per_entry(
+            for (int subtask = 0;
+                 subtask < terminal::N128_SUBTASKS_PER_N256; ++subtask) {
+                const int n128 = terminal::n128_for_subtask(
+                    coordinate, subtask);
+                require(n128 == 2 * coordinate.n256 + subtask,
+                        std::string(test.name)
+                            + ": invalid W13 N128 subtask expansion");
+                for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
+                    const int n64 = terminal::n64_for_subtask_cta(
+                        coordinate, subtask, rank);
+                    const int work_key = canonical_n64_subtile(
+                        coordinate, m_tiles, n64);
+                    require(n64 == 4 * coordinate.n256 + 2 * subtask + rank
+                                && work_key >= 0
+                                && work_key
+                                    < static_cast<int>(work_visits.size()),
+                            std::string(test.name)
+                                + ": invalid W13 sequential expansion");
+                    ++work_visits[work_key];
+                }
+                const auto gu_index = terminal::counter_index(
                     terminal::ready_counter::gate_up_tile,
-                    coordinate.stage);
+                    coordinate.global_m, n128);
+                require(gu_index >= 0
+                            && gu_index < static_cast<int64_t>(
+                                gate_up_arrivals.size()),
+                        std::string(test.name)
+                            + ": gate/up counter out of bounds");
+                gate_up_arrivals[static_cast<size_t>(gu_index)] +=
+                    terminal::counter_arrival_delta_per_entry(
+                        terminal::ready_counter::gate_up_tile,
+                        coordinate.stage);
+            }
         } else if (coordinate.stage == terminal::logical_stage::activation) {
             hidden_arrivals[coordinate.global_m] +=
                 terminal::counter_arrivals_per_cluster_task(
                     terminal::ready_counter::hidden_row_block,
                     coordinate.stage);
         } else {
-            for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
-                const int n64 = terminal::n64_for_cta(coordinate, rank);
-                const int work_key = canonical_n64_subtile(
-                    coordinate, m_tiles, n64);
-                require(n64 == terminal::CLUSTER_CTAS * coordinate.n128 + rank
-                            && work_key >= 0
-                            && work_key < static_cast<int>(work_visits.size()),
-                        std::string(test.name) + ": invalid W2 CTA expansion");
-                ++work_visits[work_key];
+            for (int subtask = 0;
+                 subtask < terminal::N128_SUBTASKS_PER_N256; ++subtask) {
+                for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
+                    const int n64 = terminal::n64_for_subtask_cta(
+                        coordinate, subtask, rank);
+                    const int work_key = canonical_n64_subtile(
+                        coordinate, m_tiles, n64);
+                    require(n64 == 4 * coordinate.n256 + 2 * subtask + rank
+                                && work_key >= 0
+                                && work_key
+                                    < static_cast<int>(work_visits.size()),
+                            std::string(test.name)
+                                + ": invalid W2 sequential expansion");
+                    ++work_visits[work_key];
+                }
             }
             y_arrivals[coordinate.global_m] +=
                 terminal::counter_arrivals_per_cluster_task(
@@ -640,7 +657,7 @@ __global__ void device_decode_probe(terminal::logical_shape shape,
                 shape.schedule_capacity / terminal::M_TILE;
             const int last_n =
                 counter == terminal::ready_counter::gate_up_tile
-                ? terminal::W13_N_TILES - 1
+                ? terminal::W13_N128_COUNTERS - 1
                 : 0;
             if (cardinality <= 0
                     || terminal::counter_index(counter, 0, 0) != 0
@@ -667,31 +684,42 @@ __global__ void device_decode_probe(terminal::logical_shape shape,
         return;
     }
 
-    for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
-        const int n64 = terminal::n64_for_cta(coordinate, rank);
-        const int work_key = canonical_n64_subtile(coordinate, m_tiles, n64);
-        if (n64 != terminal::CLUSTER_CTAS * coordinate.n128 + rank
-                || work_key < 0
-                || work_key >= m_tiles * terminal::N64_SUBTILES_PER_M64) {
-            atomicAdd(errors, 1);
-            continue;
+    for (int subtask = 0;
+         subtask < terminal::N128_SUBTASKS_PER_N256; ++subtask) {
+        for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
+            const int n64 = terminal::n64_for_subtask_cta(
+                coordinate, subtask, rank);
+            const int work_key = canonical_n64_subtile(
+                coordinate, m_tiles, n64);
+            if (n64 != 4 * coordinate.n256 + 2 * subtask + rank
+                    || work_key < 0
+                    || work_key
+                        >= m_tiles * terminal::N64_SUBTILES_PER_M64) {
+                atomicAdd(errors, 1);
+                continue;
+            }
+            atomicAdd(work_visits + work_key, 1);
         }
-        atomicAdd(work_visits + work_key, 1);
     }
     if (coordinate.stage == terminal::logical_stage::gate
             || coordinate.stage == terminal::logical_stage::up) {
-        const int64_t counter = terminal::counter_index(
-            terminal::ready_counter::gate_up_tile,
-            coordinate.global_m, coordinate.n128);
-        if (counter < 0
-                || counter >= static_cast<int64_t>(m_tiles)
-                    * terminal::W13_N_TILES)
-            atomicAdd(errors, 1);
-        else
-            atomicAdd(gate_up_arrivals + counter,
-                      terminal::counter_arrival_delta_per_entry(
-                          terminal::ready_counter::gate_up_tile,
-                          coordinate.stage));
+        for (int subtask = 0;
+             subtask < terminal::N128_SUBTASKS_PER_N256; ++subtask) {
+            const int n128 = terminal::n128_for_subtask(
+                coordinate, subtask);
+            const int64_t counter = terminal::counter_index(
+                terminal::ready_counter::gate_up_tile,
+                coordinate.global_m, n128);
+            if (counter < 0
+                    || counter >= static_cast<int64_t>(m_tiles)
+                        * terminal::W13_N128_COUNTERS)
+                atomicAdd(errors, 1);
+            else
+                atomicAdd(gate_up_arrivals + counter,
+                          terminal::counter_arrival_delta_per_entry(
+                              terminal::ready_counter::gate_up_tile,
+                              coordinate.stage));
+        }
     }
     if (coordinate.stage == terminal::logical_stage::w2)
         atomicAdd(y_arrivals + coordinate.global_m,
@@ -711,7 +739,9 @@ void check_device_case(const probe_case &test) {
             * terminal::N64_SUBTILES_PER_M64,
         1));
     const size_t gate_up_count = static_cast<size_t>(std::max(
-        test.num_tokens / terminal::M_TILE * terminal::W13_N_TILES, 1));
+        test.num_tokens / terminal::M_TILE
+            * terminal::W13_N128_COUNTERS,
+        1));
     const size_t m_count = static_cast<size_t>(std::max(
         test.num_tokens / terminal::M_TILE, 1));
     int *device_cluster_visits = nullptr;
@@ -797,7 +827,8 @@ void check_device_case(const probe_case &test) {
         test.num_tokens / terminal::M_TILE
         * terminal::N64_SUBTILES_PER_M64);
     const size_t active_gate_up = static_cast<size_t>(
-        test.num_tokens / terminal::M_TILE * terminal::W13_N_TILES);
+        test.num_tokens / terminal::M_TILE
+        * terminal::W13_N128_COUNTERS);
     const size_t active_m = static_cast<size_t>(
         test.num_tokens / terminal::M_TILE);
     require(std::all_of(work_visits.begin(),

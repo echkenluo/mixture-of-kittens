@@ -58,13 +58,12 @@ constexpr unsigned int COMM_CONTROL_STAGE_MASK = 0xffu;
 constexpr unsigned int COMM_CONTROL_VALID = 1u << 30;
 constexpr unsigned int COMM_CONTROL_CLOSES_M64 = 1u << 31;
 
-// Producer tasks outnumber final tokens by roughly six to one, and every
-// bounded probe performs six system-scope acquire loads even when no incoming
-// route is ready.  Keep opportunistic reduction in the compute loop, but let
-// one CTA sample it once per eight logical tasks.  Cursor exhaustion and the
-// communication-role drain remain exhaustive, so this cadence changes only
-// overlap frequency, never completion or exactly-once ownership.
-constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 8u;
+// Each N256 ticket contains exactly two legacy N128 tasks.  Sample once per
+// four new tickets to preserve the base candidate's one-probe-per-eight-N128
+// work cadence; otherwise ticket compression would accidentally halve reduce
+// overlap in addition to removing cursor/task boundaries.  Cursor exhaustion
+// and the communication-role drain remain exhaustive.
+constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 4u;
 
 // Production fatal record uses the same two-phase host-mapped protocol as
 // K1: slot 0 is first claimed with ~0ull, slots 1..7 are populated, then the
@@ -450,7 +449,7 @@ __device__ __forceinline__ bool owner_task_ready(
             terminal::ready_counter::gate_up_tile,
             coordinate.global_m, 0);
 #pragma unroll
-        for (int n128 = 0; n128 < terminal::W13_N_TILES; ++n128) {
+        for (int n128 = 0; n128 < terminal::W13_N128_COUNTERS; ++n128) {
             if (compute::load_acquire_gpu(g.ready.gate_up_ready + base + n128)
                     < 2u)
                 return false;
@@ -791,7 +790,7 @@ __device__ void communication_role(
                     const unsigned int ready = compute::load_acquire_gpu(
                         g.ready.y_ready + m);
                     const unsigned int decision =
-                        ready >= terminal::W2_N_TILES
+                        ready >= terminal::W2_N128_EQUIVALENTS
                             ? DONE_TICKET : WAIT_SIGNAL;
                     asm volatile(
                         "{st.release.cluster.global.u32 [%0], %1;}" ::
@@ -824,7 +823,7 @@ __device__ void communication_role(
                     const unsigned int produced = compute::load_acquire_gpu(
                         g.producer_done);
                     unsigned int next = WAIT_SIGNAL;
-                    if (ready >= terminal::W2_N_TILES) {
+                    if (ready >= terminal::W2_N128_EQUIVALENTS) {
                         next = DONE_TICKET;
                     } else {
                         if (produced != leader_last_producer) {
@@ -836,7 +835,7 @@ __device__ void communication_role(
                         if (leader_idle_windows >= g.spin_limit)
                             trap_commit(
                                 g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
-                                m, terminal::W2_N_TILES, ready,
+                                m, terminal::W2_N128_EQUIVALENTS, ready,
                                 compute::load_acquire_gpu(g.cursor),
                                 leader_idle_windows);
                     }
@@ -857,14 +856,15 @@ __device__ void communication_role(
         } else {
             if (threadIdx.x == 0) {
                 wait_ok = bounded_wait_gpu(
-                    g.ready.y_ready + m, terminal::W2_N_TILES,
+                    g.ready.y_ready + m,
+                    terminal::W2_N128_EQUIVALENTS,
                     g.spin_limit) ? 1 : 0;
             }
             __syncthreads();
             if (!wait_ok && threadIdx.x == 0) {
                 if (g.trap_record != nullptr)
                     trap_commit(g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
-                                m, terminal::W2_N_TILES, 0, 0,
+                                m, terminal::W2_N128_EQUIVALENTS, 0, 0,
                                 g.spin_limit);
                 if (g.comm_failed != nullptr)
                     atomicExch(g.comm_failed, 1u);

@@ -15,6 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(__file__).with_suffix(".cu")
 HEADER = ROOT / "csrc" / "sm90_fp8_block_terminal_full.cuh"
+COMPUTE_HEADER = ROOT / "csrc" / "sm90_fp8_block_terminal_compute.cuh"
+PRIMITIVE_HEADER = ROOT / "csrc" / "sm90_fp8_block_pipeline_primitives.cuh"
+DECODER_HEADER = ROOT / "csrc" / "sm90_fp8_block_megakernel.cuh"
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +32,9 @@ def parse_args() -> argparse.Namespace:
 
 def check_source_contract() -> None:
     header = HEADER.read_text(encoding="utf-8")
+    compute_header = COMPUTE_HEADER.read_text(encoding="utf-8")
+    primitive_header = PRIMITIVE_HEADER.read_text(encoding="utf-8")
+    decoder_header = DECODER_HEADER.read_text(encoding="utf-8")
     source = SOURCE.read_text(encoding="utf-8")
     driver = Path(__file__).read_text(encoding="utf-8")
     required = (
@@ -60,6 +66,59 @@ def check_source_contract() -> None:
     missing = [needle for needle in required if needle not in header]
     if missing:
         raise RuntimeError(f"full terminal wiring missing: {missing}")
+    sequential_required = (
+        (decoder_header, "TASKS_PER_M64 == 33"),
+        (decoder_header, "N128_SUBTASKS_PER_N256 = 2"),
+        (compute_header, "run_sequential_n128_subtask"),
+        (compute_header, "SEQUENTIAL_N128_LIVE_ACCUMULATOR_WORDS == 64"),
+        (compute_header, "terminal::N128_SUBTASKS_PER_N256"),
+        (compute_header, "add_release_gpu(ready.gate_up_ready + index, 1u)"),
+        (compute_header, "ready.y_ready + index,"),
+        (header, "allocator.allocate<compute::b_st, compute::PIPE_DEPTH>()"),
+        (header, "REDUCE_TASK_PROBE_STRIDE = 4u"),
+    )
+    missing_sequential = [
+        needle for text, needle in sequential_required if needle not in text
+    ]
+    if missing_sequential:
+        raise RuntimeError(
+            f"sequential N256 terminal wiring missing: {missing_sequential}"
+        )
+    helper_begin = compute_header.find("run_sequential_n128_subtask")
+    helper_end = compute_header.find("// The caller supplies", helper_begin)
+    helper = compute_header[helper_begin:helper_end]
+    primitive_unchanged = (
+        "arithmetic_n256" not in primitive_header
+        and "b_st (&b_smem)[PIPE_DEPTH]" in primitive_header
+        and primitive_header.count("acc_rt total;") == 1
+        and primitive_header.count("acc_rt partial;") == 1
+    )
+    helper_order = (
+        helper.count("pipeline::run_tile(") == 1
+        and helper.find("pipeline::run_tile(") < helper.find("warpgroup::sync(0)")
+        < helper.find("everyone::tma::cluster::sync()")
+    )
+    sequential_loops = compute_header.count(
+        "#pragma unroll 1\n    for (int subtask"
+    ) == 2
+    if not primitive_unchanged or not helper_order or not sequential_loops:
+        raise RuntimeError(
+            "sequential N256 must reuse legacy arithmetic and drain each subtile"
+        )
+    forbidden_scheduler_shortcuts = (
+        "COMPUTE_SUPER_TICKET",
+        "claim_range_bounded",
+        "reserve_ticket",
+    )
+    leaked_shortcuts = [
+        needle for needle in forbidden_scheduler_shortcuts
+        if needle in header or needle in compute_header or needle in decoder_header
+    ]
+    if leaked_shortcuts:
+        raise RuntimeError(
+            f"scheduler-only range reservation leaked into candidate: "
+            f"{leaked_shortcuts}"
+        )
     forbidden = (
         "grid.sync",
         "cooperative_groups",
@@ -275,7 +334,9 @@ def check_source_contract() -> None:
         "|reduce_probe=bounded_one_shot|not_ready_wait=0"
         "|comm_timeline=native_dense_dcd"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
-        "|split_fallback=0|core_arithmetic_copy=0|result=PASS",
+        "|logical_ticket=M64xN256|n128_subtasks=2|tasks_per_m64=33"
+        "|legacy_arithmetic=1|split_fallback=0"
+        "|core_arithmetic_copy=0|result=PASS",
         flush=True,
     )
 
@@ -566,7 +627,7 @@ def run_device(args: argparse.Namespace) -> None:
             )
 
             m_tiles = rows // 64
-            total_tasks = rows // 64 * 65
+            total_tasks = rows // 64 * 33
             for compute_clusters in compute_cases:
                 owner_only = compute_clusters == 0
                 for ep_rank in range(4):

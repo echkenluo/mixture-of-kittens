@@ -172,6 +172,11 @@ constexpr int kDynamicSmem =
     full::compute::PIPE_DEPTH
         * (sizeof(full::compute::a_st) + sizeof(full::compute::b_st))
     + sizeof(full::compute::d_st) + 1024;
+static_assert(kDynamicSmem == 41984,
+              "sequential N256 must retain legacy shared memory");
+static_assert(
+    full::compute::SEQUENTIAL_N128_LIVE_ACCUMULATOR_WORDS == 64,
+    "sequential N256 must retain legacy accumulator budget");
 
 int resident_clusters() {
     CUDACHECK(cudaFuncSetAttribute(

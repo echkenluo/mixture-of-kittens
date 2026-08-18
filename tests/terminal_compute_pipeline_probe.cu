@@ -75,7 +75,7 @@ __device__ __forceinline__ unsigned int claim_bounded(
 // Test-only fixed-resident worker.  The launch uses a caller-selected prefix
 // of the device-wide active-cluster limit, so every cursor owner is resident.
 // Each cursor ordinal is decoded on device with the committed reverse-macro,
-// stage-major, port-local M-major 65-task/M64 mapping.  The M-major order is a
+// stage-major, port-local M-major 33-ticket/M64 mapping.  The M-major order is a
 // deliberate port choice; it is not the native kernel's expert-segment 2-D
 // swizzle.
 __cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
@@ -173,6 +173,10 @@ void reference_activation_kernel(
 constexpr int kDynamicSmem =
     compute::PIPE_DEPTH * (sizeof(compute::a_st) + sizeof(compute::b_st))
     + sizeof(compute::d_st) + 1024;
+static_assert(kDynamicSmem == 41984,
+              "sequential N256 must retain legacy shared memory");
+static_assert(compute::SEQUENTIAL_N128_LIVE_ACCUMULATOR_WORDS == 64,
+              "sequential N256 must retain legacy accumulator budget");
 
 int resident_clusters() {
     CUDACHECK(cudaFuncSetAttribute(
@@ -329,7 +333,7 @@ void run_terminal(
     TORCH_CHECK(gate_up_ready.is_cuda() && gate_up_ready.is_contiguous()
                     && gate_up_ready.scalar_type() == at::kInt
                     && gate_up_ready.numel()
-                           == m_tiles * terminal::W13_N_TILES,
+                           == m_tiles * terminal::W13_N128_COUNTERS,
                 "gate_up_ready must be int32 [M64,16]");
     TORCH_CHECK(hidden_ready.is_cuda() && hidden_ready.is_contiguous()
                     && hidden_ready.scalar_type() == at::kInt

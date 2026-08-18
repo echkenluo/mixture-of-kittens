@@ -52,6 +52,8 @@ struct gemm_problem {
 constexpr int DYNAMIC_SMEM =
     compute::PIPE_DEPTH * (sizeof(compute::a_st) + sizeof(compute::b_st))
     + sizeof(compute::d_st) + 1024;
+static_assert(DYNAMIC_SMEM == 41984,
+              "sequential N256 must retain the legacy shared-memory budget");
 constexpr int PREPARE_THREADS = 256;
 
 struct prepare_globals {
@@ -214,7 +216,7 @@ inline void entry_prepare_out(
     check_i32_state(x_routed_ready, device, m_tiles, "x_routed_ready");
     check_i32_state(
         gate_up_tile_ready, device,
-        m_tiles * terminal::W13_N_TILES, "gate_up_tile_ready");
+        m_tiles * terminal::W13_N128_COUNTERS, "gate_up_tile_ready");
     check_i32_state(hidden_row_block_ready, device, m_tiles,
                     "hidden_row_block_ready");
     check_i32_state(y_routed_ready, device, m_tiles, "y_routed_ready");
@@ -535,7 +537,7 @@ inline void entry_out(
 
     check_i32_state(x_routed_ready, device, m_tiles, "x_routed_ready");
     check_i32_state(gate_up_tile_ready, device,
-                    m_tiles * terminal::W13_N_TILES,
+                    m_tiles * terminal::W13_N128_COUNTERS,
                     "gate_up_tile_ready");
     check_i32_state(hidden_row_block_ready, device, m_tiles,
                     "hidden_row_block_ready");

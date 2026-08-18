@@ -62,6 +62,23 @@ def check_source_contract() -> None:
         raise RuntimeError(f"forbidden legacy scaffold in target header: {matches}")
     if "__global__" in text:
         raise RuntimeError("logical-decoder milestone must not define a kernel body")
+    sequential_required = (
+        "N_TILE = 256",
+        "N128_SUBTASKS_PER_N256 = 2",
+        "W13_N128_COUNTERS == 16",
+        "W13_CLUSTER_TASKS == 8",
+        "W2_CLUSTER_TASKS == 16",
+        "TASKS_PER_M64 == 33",
+        "n128_for_subtask",
+        "n64_for_subtask_cta",
+    )
+    missing_sequential = [
+        item for item in sequential_required if item not in text
+    ]
+    if missing_sequential:
+        raise RuntimeError(
+            f"sequential N256 decoder contract missing: {missing_sequential}"
+        )
     communication_required = (
         "COMM_ROWS_PER_CTA_TASK = 4",
         "communication_total_tickets",
@@ -85,6 +102,7 @@ def check_source_contract() -> None:
         )
     print(
         "TERMINAL_LOGICAL_DECODER_STATIC"
+        "|logical_ticket=M64xN256|n128_subtasks=2|tasks_per_m64=33"
         "|legacy_scaffold=0|kernel_body=0|native_comm_decoder=1|result=PASS"
     )
 

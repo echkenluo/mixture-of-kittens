@@ -63,9 +63,9 @@ class Case:
 
 def build_cases(extra_rows: list[int]) -> list[Case]:
     required = [
-        # One worker executes all 65 logical tasks and repeatedly reuses the
-        # same two mbarriers/phase bitfields across W13, activation, and W2.
-        Case("serial65", 64, 64, 64, 64),
+        # One worker executes all 33 logical tickets.  Every compute ticket
+        # sequentially reuses the same mbarriers/phase bits for two N128 tiles.
+        Case("serial33x2", 64, 64, 64, 64),
         Case("multi_m64", 128, 128, 128, 128),
         # Active rows 256..319 (the partial last macrobatch) are decoded first,
         # followed by the two minibatches in macrobatch zero.  The last capacity
@@ -202,6 +202,11 @@ def main() -> int:
 
         sglang_reference = silu_and_mul_contig_post_quant
     attrs = [int(value) for value in module.attributes()]
+    if attrs[2] != 0 or attrs[4] != 41984:
+        raise RuntimeError(
+            "sequential N256 resource budget violated: "
+            f"local_bytes={attrs[2]} launch_smem={attrs[4]}"
+        )
     worker_cases = sorted({1, attrs[5]})
     print(
         "TERMINAL_COMPUTE_ATTR"
@@ -224,8 +229,8 @@ def main() -> int:
             active_rows = case.active_rows
             capacity_tiles = capacity_rows // 64
             active_tiles = active_rows // 64
-            active_tasks = active_tiles * 65
-            capacity_tasks = capacity_tiles * 65
+            active_tasks = active_tiles * 33
+            capacity_tasks = capacity_tiles * 33
 
             x = make_fp8((capacity_rows, 4096), generator)
             x_scale = make_scale((capacity_rows, 32), generator)
@@ -530,12 +535,13 @@ def main() -> int:
                     0,
                 )
 
-                if case.name == "serial65" and workers == 1:
-                    if active_tasks != 65:
-                        raise RuntimeError("serial phase case must contain 65 tasks")
+                if case.name == "serial33x2" and workers == 1:
+                    if active_tasks != 33:
+                        raise RuntimeError("serial phase case must contain 33 tickets")
                     print(
                         "TERMINAL_COMPUTE_PHASE_WRAP"
-                        "|workers=1|tasks=65|persistent_mbarrier=1"
+                        "|workers=1|tickets=33|n128_subtasks=2"
+                        "|persistent_mbarrier=1"
                         "|w13_to_activation_to_w2=1",
                         flush=True,
                     )

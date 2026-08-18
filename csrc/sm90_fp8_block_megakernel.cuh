@@ -15,13 +15,16 @@ constexpr int EP_SIZE = 4;
 constexpr int CLUSTER_CTAS = 2;
 constexpr int THREADS_PER_CTA = 128;
 constexpr int M_TILE = 64;
-constexpr int N_TILE = 128;
-constexpr int W13_N_TILES = INTERMEDIATE_SIZE / N_TILE;
-constexpr int W2_N_TILES = HIDDEN_SIZE / N_TILE;
-constexpr int W13_CLUSTER_TASKS = W13_N_TILES;
-constexpr int W2_CLUSTER_TASKS = W2_N_TILES;
-constexpr int W13_N64_SUBTILES = CLUSTER_CTAS * W13_N_TILES;
-constexpr int W2_N64_SUBTILES = CLUSTER_CTAS * W2_N_TILES;
+constexpr int N_TILE = 256;
+constexpr int N128_SUBTASK_TILE = 128;
+constexpr int N64_WGMMA_TILE = 64;
+constexpr int N128_SUBTASKS_PER_N256 = 2;
+constexpr int W13_N128_COUNTERS = INTERMEDIATE_SIZE / N128_SUBTASK_TILE;
+constexpr int W2_N128_EQUIVALENTS = HIDDEN_SIZE / N128_SUBTASK_TILE;
+constexpr int W13_CLUSTER_TASKS = INTERMEDIATE_SIZE / N_TILE;
+constexpr int W2_CLUSTER_TASKS = HIDDEN_SIZE / N_TILE;
+constexpr int W13_N64_SUBTILES = INTERMEDIATE_SIZE / N64_WGMMA_TILE;
+constexpr int W2_N64_SUBTILES = HIDDEN_SIZE / N64_WGMMA_TILE;
 constexpr int TASKS_PER_M64 =
     2 * W13_CLUSTER_TASKS + 1 + W2_CLUSTER_TASKS;
 constexpr int N64_SUBTILES_PER_M64 =
@@ -40,16 +43,18 @@ static_assert(EP_SIZE == 4, "terminal specialization freezes EP4");
 static_assert(CLUSTER_CTAS == 2, "terminal specialization freezes cluster2");
 static_assert(THREADS_PER_CTA == 128,
               "terminal specialization freezes 128 threads per CTA");
-static_assert(M_TILE == 64 && N_TILE == 128,
-              "terminal specialization freezes M64/N128");
-static_assert(W13_N_TILES == 16 && W2_N_TILES == 32,
-              "terminal specialization tile counts changed");
-static_assert(W13_CLUSTER_TASKS == 16 && W2_CLUSTER_TASKS == 32,
-              "cluster-level N128 task counts changed");
+static_assert(M_TILE == 64 && N_TILE == 256,
+              "terminal specialization freezes M64/N256 logical tasks");
+static_assert(N128_SUBTASKS_PER_N256 == 2,
+              "each N256 ticket must execute two sequential N128 subtiles");
+static_assert(W13_N128_COUNTERS == 16 && W2_N128_EQUIVALENTS == 32,
+              "legacy N128 readiness cardinality changed");
+static_assert(W13_CLUSTER_TASKS == 8 && W2_CLUSTER_TASKS == 16,
+              "cluster-level N256 ticket counts changed");
 static_assert(W13_N64_SUBTILES == 32 && W2_N64_SUBTILES == 64,
               "CTA-level N64 subtile counts changed");
-static_assert(TASKS_PER_M64 == 65,
-              "terminal specialization must expose 65 cluster tasks/M64");
+static_assert(TASKS_PER_M64 == 33,
+              "terminal specialization must expose 33 cluster tasks/M64");
 static_assert(N64_SUBTILES_PER_M64 == 128,
               "expanded CTA N64 subtile cardinality changed");
 static_assert(COMM_ROWS_PER_CTA_TASK == 4
@@ -126,7 +131,7 @@ struct logical_coordinate {
     bool valid;
     logical_stage stage;
     int global_m;
-    int n128;
+    int n256;
 };
 
 static_assert(sizeof(logical_coordinate) == 16,
@@ -484,28 +489,28 @@ MOK_TERMINAL_HD logical_coordinate decode_logical_cursor(
         result.stage = logical_stage::gate;
         stage_local = static_cast<int>(local_task);
         m_in_minibatch = stage_local / W13_CLUSTER_TASKS;
-        result.n128 = stage_local % W13_CLUSTER_TASKS;
+        result.n256 = stage_local % W13_CLUSTER_TASKS;
     } else if (local_task
                    < static_cast<int64_t>(2 * W13_CLUSTER_TASKS) * r) {
         result.stage = logical_stage::up;
         stage_local = static_cast<int>(
             local_task - static_cast<int64_t>(W13_CLUSTER_TASKS) * r);
         m_in_minibatch = stage_local / W13_CLUSTER_TASKS;
-        result.n128 = stage_local % W13_CLUSTER_TASKS;
+        result.n256 = stage_local % W13_CLUSTER_TASKS;
     } else if (local_task
                    < static_cast<int64_t>(2 * W13_CLUSTER_TASKS + 1) * r) {
         result.stage = logical_stage::activation;
         stage_local = static_cast<int>(
             local_task - static_cast<int64_t>(2 * W13_CLUSTER_TASKS) * r);
         m_in_minibatch = stage_local;
-        result.n128 = 0;
+        result.n256 = 0;
     } else {
         result.stage = logical_stage::w2;
         stage_local = static_cast<int>(
             local_task
             - static_cast<int64_t>(2 * W13_CLUSTER_TASKS + 1) * r);
         m_in_minibatch = stage_local / W2_CLUSTER_TASKS;
-        result.n128 = stage_local % W2_CLUSTER_TASKS;
+        result.n256 = stage_local % W2_CLUSTER_TASKS;
     }
 
     result.valid = m_in_minibatch >= 0 && m_in_minibatch < r;
@@ -513,19 +518,27 @@ MOK_TERMINAL_HD logical_coordinate decode_logical_cursor(
     return result;
 }
 
-MOK_TERMINAL_HD int n64_for_cta(
-        const logical_coordinate &coordinate, int cta_rank) {
+MOK_TERMINAL_HD int n128_for_subtask(
+        const logical_coordinate &coordinate, int subtask) {
     if (!coordinate.valid || coordinate.stage == logical_stage::activation
-            || cta_rank < 0 || cta_rank >= CLUSTER_CTAS)
+            || subtask < 0 || subtask >= N128_SUBTASKS_PER_N256)
         return -1;
-    return CLUSTER_CTAS * coordinate.n128 + cta_rank;
+    return N128_SUBTASKS_PER_N256 * coordinate.n256 + subtask;
+}
+
+MOK_TERMINAL_HD int n64_for_subtask_cta(
+        const logical_coordinate &coordinate, int subtask, int cta_rank) {
+    if (cta_rank < 0 || cta_rank >= CLUSTER_CTAS)
+        return -1;
+    const int n128 = n128_for_subtask(coordinate, subtask);
+    return n128 < 0 ? -1 : CLUSTER_CTAS * n128 + cta_rank;
 }
 
 MOK_TERMINAL_HD int counter_entries_touched_per_cluster_task(
         ready_counter counter, logical_stage stage) {
     if (counter == ready_counter::gate_up_tile
             && (stage == logical_stage::gate || stage == logical_stage::up))
-        return 1;
+        return N128_SUBTASKS_PER_N256;
     if (counter == ready_counter::hidden_row_block
             && stage == logical_stage::activation)
         return 1;
@@ -543,7 +556,7 @@ MOK_TERMINAL_HD int counter_arrival_delta_per_entry(
             && stage == logical_stage::activation)
         return 1;
     if (counter == ready_counter::y_routed && stage == logical_stage::w2)
-        return 1;
+        return N128_SUBTASKS_PER_N256;
     return 0;
 }
 
@@ -554,7 +567,7 @@ MOK_TERMINAL_HD int counter_arrivals_per_cluster_task(
 }
 
 MOK_TERMINAL_HD int counter_entries_per_m64(ready_counter counter) {
-    return counter == ready_counter::gate_up_tile ? W13_N_TILES : 1;
+    return counter == ready_counter::gate_up_tile ? W13_N128_COUNTERS : 1;
 }
 
 MOK_TERMINAL_HD int counter_expected_arrivals(ready_counter counter) {
@@ -566,7 +579,7 @@ MOK_TERMINAL_HD int counter_expected_arrivals(ready_counter counter) {
     if (counter == ready_counter::hidden_row_block)
         return 1;
     if (counter == ready_counter::y_routed)
-        return W2_N_TILES;
+        return W2_N128_EQUIVALENTS;
     return 0;
 }
 
@@ -592,9 +605,9 @@ MOK_TERMINAL_HD int64_t counter_index(
             || counter >= ready_counter::count)
         return -1;
     if (counter == ready_counter::gate_up_tile) {
-        if (n128 < 0 || n128 >= W13_N_TILES)
+        if (n128 < 0 || n128 >= W13_N128_COUNTERS)
             return -1;
-        return static_cast<int64_t>(global_m) * W13_N_TILES + n128;
+        return static_cast<int64_t>(global_m) * W13_N128_COUNTERS + n128;
     }
     return global_m;
 }
