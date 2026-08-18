@@ -197,10 +197,10 @@ def main() -> int:
     sglang_reference = None
     if args.require_sglang_reference:
         from sglang.jit_kernel.dsv4 import (
-            silu_and_mul_contig_post_quant_dynamic,
+            silu_and_mul_contig_post_quant,
         )
 
-        sglang_reference = silu_and_mul_contig_post_quant_dynamic
+        sglang_reference = silu_and_mul_contig_post_quant
     attrs = [int(value) for value in module.attributes()]
     worker_cases = sorted({1, attrs[5]})
     print(
@@ -283,14 +283,10 @@ def main() -> int:
             if sglang_reference is not None and active_rows:
                 sglang_hidden = torch.empty_like(hidden_ref)
                 sglang_scale = torch.empty_like(hidden_scale_ref)
-                active_tokens = torch.tensor(
-                    [active_rows], dtype=torch.int32, device="cuda"
-                )
                 sglang_reference(
-                    input=gate_up_ref,
-                    output=sglang_hidden,
-                    output_scale=sglang_scale,
-                    active_tokens=active_tokens,
+                    input=gate_up_ref[:active_rows],
+                    output=sglang_hidden[:active_rows],
+                    output_scale=sglang_scale[:active_rows],
                     quant_group_size=128,
                     scale_ue8m0=False,
                     transposed=False,
