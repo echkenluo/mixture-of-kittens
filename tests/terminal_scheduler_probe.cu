@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace {
 
@@ -291,6 +292,25 @@ int64_t terminal_scheduler_max_active_clusters(int64_t device_index) {
     return static_cast<int64_t>(max_clusters);
 }
 
+std::vector<int64_t> terminal_scheduler_kernel_attributes(
+    int64_t device_index) {
+    c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_index));
+    cudaFuncAttributes attributes = {};
+    const cudaError_t status = cudaFuncGetAttributes(
+        &attributes, terminal_scheduler_kernel);
+    TORCH_CHECK(status == cudaSuccess,
+                "terminal scheduler attribute query failed: ",
+                cudaGetErrorString(status));
+    return {
+        static_cast<int64_t>(attributes.numRegs),
+        static_cast<int64_t>(attributes.sharedSizeBytes),
+        static_cast<int64_t>(attributes.localSizeBytes),
+        static_cast<int64_t>(attributes.maxThreadsPerBlock),
+        static_cast<int64_t>(attributes.binaryVersion),
+        static_cast<int64_t>(attributes.ptxVersion),
+    };
+}
+
 void run_terminal_scheduler_probe(
     const at::Tensor &copy_head, const at::Tensor &terminal_count,
     const at::Tensor &w13_state, const at::Tensor &w13_descriptor,
@@ -393,4 +413,5 @@ void run_terminal_scheduler_probe(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("run", &run_terminal_scheduler_probe);
     module.def("max_active_clusters", &terminal_scheduler_max_active_clusters);
+    module.def("kernel_attributes", &terminal_scheduler_kernel_attributes);
 }

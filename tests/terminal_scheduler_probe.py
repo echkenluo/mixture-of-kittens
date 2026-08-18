@@ -52,6 +52,7 @@ def main() -> int:
     torch.cuda.set_device(0)
     module = build_extension()
     max_active_clusters = int(module.max_active_clusters(0))
+    attributes = [int(value) for value in module.kernel_attributes(0)]
     requested_clusters = csv_ints(args.clusters)
     if max(requested_clusters) > max_active_clusters:
         raise RuntimeError(
@@ -59,7 +60,11 @@ def main() -> int:
             f"requested={max(requested_clusters)} occupancy={max_active_clusters}"
         )
     print(
-        f"TERMINAL_SCHEDULER_OCCUPANCY|max_active_clusters={max_active_clusters}",
+        "TERMINAL_SCHEDULER_RESOURCES"
+        f"|max_active_clusters={max_active_clusters}"
+        f"|registers={attributes[0]}|static_smem={attributes[1]}"
+        f"|local_bytes={attributes[2]}|max_threads={attributes[3]}"
+        f"|binary_version={attributes[4]}|ptx_version={attributes[5]}",
         flush=True,
     )
     w13_per_m = 32
