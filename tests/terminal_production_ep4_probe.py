@@ -20,6 +20,7 @@ import torch.distributed as dist
 from mok.functional import (
     MoKSchedule,
     create_fp8_terminal_workspace,
+    format_trap_record,
     megakernel_fp8_block,
     megakernel_fp8_block_from_topk,
     megakernel_fp8_block_leased,
@@ -40,7 +41,7 @@ ITERATIONS = int(os.environ.get("MOK_TERMINAL_EP4_ITERATIONS", "100"))
 REPORT_PROGRESS = os.environ.get("MOK_TERMINAL_EP4_REPORT_PROGRESS") == "1"
 MINIBATCH_ROWS = 64
 MACROBATCH_ROWS = 64
-SPIN_LIMIT = 1 << 29
+SPIN_LIMIT = int(os.environ.get("MOK_TERMINAL_EP4_SPIN_LIMIT", str(1 << 29)))
 
 
 def gather(tensor: torch.Tensor) -> torch.Tensor:
@@ -353,13 +354,25 @@ def main() -> int:
                 macrobatch_rows=MACROBATCH_ROWS,
                 spin_limit=SPIN_LIMIT,
             )
-            torch.cuda.synchronize(device)
-            if REPORT_PROGRESS and rank == 0:
-                print(f"TERMINAL_EP4_ITERATION|index={iteration}|state=end", flush=True)
+            try:
+                torch.cuda.synchronize(device)
+            except RuntimeError:
+                # A terminal trap poisons the CUDA context.  The host-mapped
+                # record is the only safe diagnostic surface after that point.
+                trap = format_trap_record(workspace)
+                if trap is not None:
+                    print(trap, flush=True)
+                raise
             owner = int(workspace.comm_owner.item())
             if not 0 <= owner <= COMPUTE_CLUSTERS:
                 raise RuntimeError(
                     f"iteration {iteration} elected invalid comm owner {owner}"
+                )
+            if REPORT_PROGRESS and rank == 0:
+                print(
+                    f"TERMINAL_EP4_ITERATION|index={iteration}|state=end"
+                    f"|comm_owner={owner}",
+                    flush=True,
                 )
             owners.append(owner)
             require_exact(
@@ -431,7 +444,8 @@ def main() -> int:
             print(
                 "TERMINAL_PRODUCTION_EP4"
                 "|hidden=4096|intermediate=2048|topk=6|experts=64"
-                "|tokens=8|capacity=64|compute_clusters=77|iterations=100"
+                f"|tokens=8|capacity=64|compute_clusters={COMPUTE_CLUSTERS}"
+                f"|iterations={ITERATIONS}"
                 "|remote_dispatch=1|remote_combine=1|input_skew=1"
                 f"|comm_owners={','.join(map(str, sorted(set(owners))))}"
                 "|boundaries=bitwise_exact|output=bitwise_exact"
