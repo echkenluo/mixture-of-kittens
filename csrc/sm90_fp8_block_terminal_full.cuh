@@ -49,6 +49,14 @@ constexpr unsigned int OVERLAP_COMPUTE_DISPATCH = 1u << 0;
 constexpr unsigned int OVERLAP_REDUCE_COMM = 1u << 1;
 constexpr unsigned int OVERLAP_REDUCE_THEN_COMPUTE = 1u << 2;
 
+// Producer tasks outnumber final tokens by roughly six to one, and every
+// bounded probe performs six system-scope acquire loads even when no incoming
+// route is ready.  Keep opportunistic reduction in the compute loop, but let
+// one CTA sample it once per eight logical tasks.  Cursor exhaustion and the
+// communication-role drain remain exhaustive, so this cadence changes only
+// overlap frequency, never completion or exactly-once ownership.
+constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 8u;
+
 // Production fatal record uses the same two-phase host-mapped protocol as
 // K1: slot 0 is first claimed with ~0ull, slots 1..7 are populated, then the
 // final non-zero code is release-published at system scope.  Only the winner
@@ -1247,12 +1255,16 @@ __device__ void compute_and_reduce_role(
             compute::add_release_gpu(g.producer_done, 1u);
         everyone::tma::cluster::sync();
 
-        // One opportunistic probe at every completed logical task boundary.
-        // A winner completes one token; all other outcomes immediately return
-        // to the cursor without turning reduction into a producer wait.
-        const route::claim_result result = try_reduce_one_ready_token(g);
-        if (result == route::claim_result::claimed)
-            reduced_by_this_cta = true;
+        // Sampling every task from both CTAs produced tens of thousands of
+        // guaranteed-empty system-scope probes before combine publication.
+        // One CTA retains bounded overlap at a coarse cadence; the existing
+        // STOP/communication drain paths still reduce every remaining token.
+        if (cta_rank == 0
+                && ticket % REDUCE_TASK_PROBE_STRIDE == 0u) {
+            const route::claim_result result = try_reduce_one_ready_token(g);
+            if (result == route::claim_result::claimed)
+                reduced_by_this_cta = true;
+        }
     }
 }
 
