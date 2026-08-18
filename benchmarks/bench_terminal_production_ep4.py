@@ -56,6 +56,7 @@ INTERMEDIATE = 2048
 TOPK = 6
 LOCAL_EXPERTS = 64
 M_TILE = 64
+LOGICAL_TASKS_PER_M64 = 33
 DEFAULT_TOKENS = (128, 766, 2048)
 DEFAULT_BASELINES = ("split", "k1k2")
 
@@ -687,7 +688,7 @@ def assert_route_closed(workspace: object, label: str) -> None:
 
 
 def assert_terminal_closed(workspace: object, cell: Cell) -> None:
-    total_tasks = cell.active_rows // M_TILE * 65
+    total_tasks = cell.active_rows // M_TILE * LOGICAL_TASKS_PER_M64
     expected = {
         "in_use": 0,
         "role_cursor": workspace.comm_clusters + workspace.compute_clusters,
@@ -957,7 +958,9 @@ def benchmark_cell(
         # region, while making scheduler overhead (especially bounded reducer
         # probes that found no ready token) directly observable.
         "scheduler_diagnostics": {
-            "logical_tasks": cell.active_rows // M_TILE * 65,
+            "logical_tasks": (
+                cell.active_rows // M_TILE * LOGICAL_TASKS_PER_M64
+            ),
             "reduce_probes": int(
                 terminal_workspace.next_reduce_probe.item()
             ),
