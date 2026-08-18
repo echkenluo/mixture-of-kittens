@@ -21,6 +21,8 @@ from mok.functional import (
     MoKSchedule,
     create_fp8_terminal_workspace,
     megakernel_fp8_block,
+    megakernel_fp8_block_from_topk,
+    megakernel_fp8_block_leased,
 )
 from mok.ops import fp8_block_megakernel_prewarm
 from terminal_full_pipeline_probe import build_extension
@@ -154,19 +156,48 @@ def allocate_reference(device: torch.device) -> dict[str, torch.Tensor]:
 
 
 def check_python_entry_contract() -> None:
-    source = inspect.getsource(megakernel_fp8_block)
-    ordered = (
+    owned_source = inspect.getsource(megakernel_fp8_block)
+    owned_order = (
+        "_validate_terminal_forward(",
         "workspace_lease_acquire(",
+        "megakernel_fp8_block_leased(",
+    )
+    positions = [owned_source.find(needle) for needle in owned_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise RuntimeError(f"terminal owned launch order changed: {positions}")
+    if "workspace_lease_release" in owned_source:
+        raise RuntimeError("terminal owned entry has a forbidden tail release")
+
+    leased_source = inspect.getsource(megakernel_fp8_block_leased)
+    leased_order = (
         "workspace.x_buffer.copy_(x)",
         "workspace.x_scale_buffer.copy_(x_scale)",
         "fp8_block_megakernel_prepare_out(",
         "fp8_block_megakernel_out(",
     )
-    positions = [source.find(needle) for needle in ordered]
+    positions = [leased_source.find(needle) for needle in leased_order]
     if any(position < 0 for position in positions) or positions != sorted(positions):
-        raise RuntimeError(f"terminal Python launch order changed: {positions}")
-    if "workspace_lease_release" in source:
-        raise RuntimeError("terminal Python entry has a forbidden tail release")
+        raise RuntimeError(f"terminal leased launch order changed: {positions}")
+    if "workspace_lease_acquire" in leased_source:
+        raise RuntimeError("terminal leased entry must not reacquire")
+    if "workspace_lease_release" in leased_source:
+        raise RuntimeError("terminal leased entry has a forbidden tail release")
+
+    orchestrator_source = inspect.getsource(megakernel_fp8_block_from_topk)
+    orchestrator_order = (
+        "_validate_terminal_forward(",
+        "_validate_build_schedule_inputs(",
+        "workspace_lease_acquire(",
+        "_build_schedule_validated(",
+        "megakernel_fp8_block_leased(",
+    )
+    positions = [
+        orchestrator_source.find(needle) for needle in orchestrator_order
+    ]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise RuntimeError(
+            f"terminal orchestrator launch order changed: {positions}"
+        )
 
 
 def main() -> int:

@@ -34,6 +34,14 @@ def main() -> int:
             raise RuntimeError("terminal route-ready shape mismatch")
         if tuple(workspace.gate_up_tile_ready.shape) != (6, 16):
             raise RuntimeError("terminal W13 readiness shape mismatch")
+        if tuple(workspace.schedule_peer_rank.shape) != (384,):
+            raise RuntimeError("terminal schedule capacity mismatch")
+        if tuple(workspace.schedule_tokens_per_expert.shape) != (64,):
+            raise RuntimeError("terminal expert-count schedule mismatch")
+        if tuple(workspace.all_gather_top_experts_buffer.shape) != (4, 64, 6):
+            raise RuntimeError("terminal route all-gather shape mismatch")
+        if workspace.all_gather_top_experts_buffer_multicast_ptr <= 0:
+            raise RuntimeError("terminal route all-gather multicast is null")
         if workspace.worker_ticket.numel() != 7:
             raise RuntimeError("terminal worker-ticket shape mismatch")
         if not workspace.trap_record.is_pinned() or workspace.trap_record.is_cuda:

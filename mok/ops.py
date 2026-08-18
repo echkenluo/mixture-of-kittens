@@ -885,6 +885,7 @@ def fp8_block_dispatch_gemm_prewarm(device_index: int) -> int:
 def require_fp8_block_megakernel() -> None:
     """Fail closed unless the complete terminal production API is loaded."""
     required = (
+        "fp8_block_build_schedule_out",
         "fp8_block_megakernel_prewarm",
         "fp8_block_megakernel_prepare_out",
         "fp8_block_megakernel_out",

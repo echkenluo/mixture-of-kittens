@@ -200,6 +200,14 @@ class MoKFP8TerminalWorkspace:
     routed_x: torch.Tensor
     routed_x_scale: torch.Tensor
     m_indices: torch.Tensor
+    schedule_peer_rank: torch.Tensor
+    schedule_peer_token_idx: torch.Tensor
+    schedule_num_tokens: torch.Tensor
+    schedule_tokens_per_expert: torch.Tensor
+    schedule_tokens_per_expert_and_peer: torch.Tensor
+    all_gather_top_experts_buffer: torch.Tensor
+    all_gather_top_experts_buffer_handle: Any
+    all_gather_top_experts_buffer_multicast_ptr: int
     gate_up: torch.Tensor
     down_input: torch.Tensor
     down_input_scale: torch.Tensor
@@ -227,6 +235,9 @@ class MoKFP8TerminalWorkspace:
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
 _FP8_ROUTE_WORKSPACE_CACHE: dict[
     tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
+] = {}
+_FP8_TERMINAL_WORKSPACE_CACHE: dict[
+    tuple[str, int, int, int, int, int], MoKFP8TerminalWorkspace
 ] = {}
 
 
@@ -693,9 +704,12 @@ def create_fp8_terminal_workspace(
     The first terminal specialization is intentionally fixed to EP4,
     H4096/I2048/top-6.  ``schedule_capacity`` is physical routed-row storage,
     not the active device-side token count, and must therefore already include
-    padding to an M64 boundary.  Occupancy is prewarmed here, outside graph
-    capture, to derive or validate ``compute_clusters``.  The factory does not
-    launch a forward or prepare route flags for a particular iteration.
+    padding to an M64 boundary.  The production ``from_topk`` orchestrator
+    additionally requires M256 because the fused schedule builder does; the
+    M64 allocation contract remains available to the independent-schedule EP4
+    probe.  Occupancy is prewarmed here, outside graph capture, to derive or
+    validate ``compute_clusters``.  The factory does not launch a forward or
+    prepare route flags for a particular iteration.
     """
     import os
 
@@ -875,6 +889,35 @@ def create_fp8_terminal_workspace(
     m_indices = torch.empty(
         schedule_capacity, dtype=torch.int32, device=device
     )
+    schedule_peer_rank = torch.empty(
+        schedule_capacity, dtype=torch.int32, device=device
+    )
+    schedule_peer_token_idx = torch.empty_like(schedule_peer_rank)
+    schedule_num_tokens = torch.empty(1, dtype=torch.int32, device=device)
+    schedule_tokens_per_expert = torch.empty(
+        num_local_experts, dtype=torch.int32, device=device
+    )
+    schedule_tokens_per_expert_and_peer = torch.empty(
+        num_local_experts * ep_size, dtype=torch.int32, device=device
+    )
+
+    # The terminal orchestrator owns routing too: keep its all-gather and
+    # schedule outputs in this workspace instead of borrowing a second, large
+    # MoKFP8RouteWorkspace.  The buffers are graph-stable and never allocated
+    # from a forward call.
+    all_gather_top_experts_buffer = symm_mem.empty(
+        ep_size,
+        num_local_tokens,
+        topk,
+        dtype=torch.int32,
+        device=device,
+    )
+    all_gather_top_experts_buffer_handle = symm_mem.rendezvous(
+        all_gather_top_experts_buffer, group_name
+    )
+    all_gather_top_experts_buffer_multicast_ptr = int(
+        all_gather_top_experts_buffer_handle.multicast_ptr
+    )
     gate_up = torch.empty(
         schedule_capacity,
         2 * intermediate_size,
@@ -977,6 +1020,20 @@ def create_fp8_terminal_workspace(
         routed_x=routed_x,
         routed_x_scale=routed_x_scale,
         m_indices=m_indices,
+        schedule_peer_rank=schedule_peer_rank,
+        schedule_peer_token_idx=schedule_peer_token_idx,
+        schedule_num_tokens=schedule_num_tokens,
+        schedule_tokens_per_expert=schedule_tokens_per_expert,
+        schedule_tokens_per_expert_and_peer=(
+            schedule_tokens_per_expert_and_peer
+        ),
+        all_gather_top_experts_buffer=all_gather_top_experts_buffer,
+        all_gather_top_experts_buffer_handle=(
+            all_gather_top_experts_buffer_handle
+        ),
+        all_gather_top_experts_buffer_multicast_ptr=(
+            all_gather_top_experts_buffer_multicast_ptr
+        ),
         gate_up=gate_up,
         down_input=down_input,
         down_input_scale=down_input_scale,
@@ -1000,6 +1057,57 @@ def create_fp8_terminal_workspace(
         trap_record=trap_record,
         trap_record_ptr=trap_record_ptr,
     )
+
+
+def get_fp8_terminal_workspace(
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    num_local_tokens: int,
+    schedule_capacity: int,
+    num_local_experts: int,
+    compute_clusters: int | None = None,
+) -> MoKFP8TerminalWorkspace:
+    """Return a cached graph-stable terminal workspace.
+
+    ``None`` and an explicit compute-cluster count are distinct cache keys:
+    callers that request the occupancy-derived default must keep that choice
+    stable for the lifetime of a graph bucket.
+    """
+    if not isinstance(group, dist.ProcessGroup):
+        raise TypeError("group must be a torch.distributed.ProcessGroup")
+    if not isinstance(device, torch.device) or device.type != "cuda":
+        raise ValueError("device must be a CUDA torch.device")
+    if compute_clusters is not None and (
+        type(compute_clusters) is not int or compute_clusters <= 0
+    ):
+        raise ValueError("compute_clusters must be None or a positive integer")
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    cluster_key = -1 if compute_clusters is None else compute_clusters
+    cache_key = (
+        group.group_name,
+        device_index,
+        num_local_tokens,
+        schedule_capacity,
+        num_local_experts,
+        cluster_key,
+    )
+    cached_workspace = _FP8_TERMINAL_WORKSPACE_CACHE.get(cache_key)
+    if cached_workspace is not None:
+        return cached_workspace
+
+    workspace = create_fp8_terminal_workspace(
+        group,
+        device=torch.device("cuda", device_index),
+        num_local_tokens=num_local_tokens,
+        schedule_capacity=schedule_capacity,
+        num_local_experts=num_local_experts,
+        compute_clusters=compute_clusters,
+    )
+    _FP8_TERMINAL_WORKSPACE_CACHE[cache_key] = workspace
+    return workspace
 
 
 def get_fp8_route_workspace(
@@ -1112,19 +1220,25 @@ def get_workspace(
     return workspace
 
 
-def acquire_workspace_lease(workspace: MoKFP8RouteWorkspace) -> None:
+def acquire_workspace_lease(
+    workspace: MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
+) -> None:
     """Explicit lease acquire for orchestrators that span multiple entries."""
     workspace_lease_acquire(
         workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
     )
 
 
-def release_workspace_lease(workspace: MoKFP8RouteWorkspace) -> None:
+def release_workspace_lease(
+    workspace: MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
+) -> None:
     """Explicit trailing lease release (counterpart of acquire above)."""
     workspace_lease_release(workspace.in_use)
 
 
-def format_trap_record(workspace: MoKFP8RouteWorkspace) -> str | None:
+def format_trap_record(
+    workspace: MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
+) -> str | None:
     """Post-mortem reader: call AFTER a CUDA API returned an error, and do
     not issue further CUDA calls first -- the record lives in host-mapped
     pinned memory precisely so this read needs no working context.  Returns
@@ -1151,8 +1265,10 @@ def clear_workspace_cache() -> None:
     Outputs:
         None
     """
-    workspaces = list(_WORKSPACE_CACHE.values()) + list(
-        _FP8_ROUTE_WORKSPACE_CACHE.values()
+    workspaces = (
+        list(_WORKSPACE_CACHE.values())
+        + list(_FP8_ROUTE_WORKSPACE_CACHE.values())
+        + list(_FP8_TERMINAL_WORKSPACE_CACHE.values())
     )
     for workspace in workspaces:
         barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
@@ -1160,28 +1276,22 @@ def clear_workspace_cache() -> None:
         torch.cuda.synchronize(workspace.device)
     _WORKSPACE_CACHE.clear()
     _FP8_ROUTE_WORKSPACE_CACHE.clear()
+    _FP8_TERMINAL_WORKSPACE_CACHE.clear()
 
 
-def build_schedule(
-    workspace: MoKWorkspace | MoKFP8RouteWorkspace,
+def _validate_build_schedule_inputs(
+    workspace: MoKWorkspace | MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
     config: MoKConfig,
     top_experts: torch.Tensor,
     *,
     num_local_experts: int,
-    expert_padding: int = 256,
-) -> MoKSchedule:
-    """All-gathers routing choices and builds this rank's padded expert schedule.
-
-    Inputs:
-        workspace:         MoKWorkspace
-        config:            MoKConfig
-        top_experts:       int32 or int64 [num_local_tokens, topk]
-        num_local_experts: int
-
-    Outputs:
-        schedule: MoKSchedule
-    """
-    if not isinstance(workspace, (MoKWorkspace, MoKFP8RouteWorkspace)):
+    expert_padding: int,
+) -> torch.Tensor:
+    """Validate every fallible host-side schedule condition before launch."""
+    if not isinstance(
+        workspace,
+        (MoKWorkspace, MoKFP8RouteWorkspace, MoKFP8TerminalWorkspace),
+    ):
         raise TypeError("workspace must be a MoK workspace")
     if not isinstance(config, MoKConfig):
         raise TypeError("config must be a MoKConfig")
@@ -1224,21 +1334,45 @@ def build_schedule(
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
     if (
-        isinstance(workspace, MoKFP8RouteWorkspace)
+        isinstance(workspace, (MoKFP8RouteWorkspace, MoKFP8TerminalWorkspace))
         and num_local_experts != workspace.num_local_experts
     ):
         raise ValueError(
-            "num_local_experts must match the FP8 route workspace"
+            "num_local_experts must match the FP8 workspace"
         )
     if type(expert_padding) is not int or expert_padding not in (64, 128, 256):
         raise ValueError("expert_padding must be one of 64, 128, 256")
+    if (
+        isinstance(workspace, (MoKFP8RouteWorkspace, MoKFP8TerminalWorkspace))
+        and (
+            workspace.schedule_capacity <= 0
+            or workspace.schedule_capacity % 256 != 0
+            or workspace.schedule_capacity
+            < workspace.num_local_tokens * workspace.topk
+        )
+    ):
+        raise ValueError(
+            "FP8 fused schedule capacity must be positive, M256 aligned, "
+            "and hold all local routes"
+        )
 
-    top_experts_int32 = (
+    return (
         top_experts
         if top_experts.dtype == torch.int32
         else top_experts.to(torch.int32)
     )
-    if isinstance(workspace, MoKFP8RouteWorkspace):
+
+
+def _build_schedule_validated(
+    workspace: MoKWorkspace | MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    top_experts_int32: torch.Tensor,
+    *,
+    num_local_experts: int,
+    expert_padding: int,
+) -> MoKSchedule:
+    """Launch schedule construction after host validation has succeeded."""
+    if isinstance(workspace, (MoKFP8RouteWorkspace, MoKFP8TerminalWorkspace)):
         fp8_block_build_schedule_out(
             top_experts_int32,
             workspace.all_gather_top_experts_buffer,
@@ -1278,6 +1412,40 @@ def build_schedule(
     return MoKSchedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
+        expert_padding=expert_padding,
+    )
+
+
+def build_schedule(
+    workspace: MoKWorkspace | MoKFP8RouteWorkspace | MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    top_experts: torch.Tensor,
+    *,
+    num_local_experts: int,
+    expert_padding: int = 256,
+) -> MoKSchedule:
+    """All-gather routes and build a graph-stable padded expert schedule.
+
+    FP8 route and terminal workspaces both own the all-gather and schedule
+    outputs they mutate.  The terminal top-level orchestrator calls the same
+    validated implementation only after acquiring its workspace lease.  A
+    direct terminal call is therefore a leased sub-operation; callers must
+    already own the terminal lease and must follow it with
+    ``megakernel_fp8_block_leased``.  Production callers should use
+    ``megakernel_fp8_block_from_topk`` instead.
+    """
+    top_experts_int32 = _validate_build_schedule_inputs(
+        workspace,
+        config,
+        top_experts,
+        num_local_experts=num_local_experts,
+        expert_padding=expert_padding,
+    )
+    return _build_schedule_validated(
+        workspace,
+        config,
+        top_experts_int32,
+        num_local_experts=num_local_experts,
         expert_padding=expert_padding,
     )
 
@@ -1498,6 +1666,49 @@ def _validate_terminal_forward(
     )
     tensor("workspace.m_indices", workspace.m_indices, torch.int32, (capacity,))
     tensor(
+        "workspace.schedule_peer_rank",
+        workspace.schedule_peer_rank,
+        torch.int32,
+        (capacity,),
+    )
+    tensor(
+        "workspace.schedule_peer_token_idx",
+        workspace.schedule_peer_token_idx,
+        torch.int32,
+        (capacity,),
+    )
+    tensor(
+        "workspace.schedule_num_tokens",
+        workspace.schedule_num_tokens,
+        torch.int32,
+        (1,),
+    )
+    tensor(
+        "workspace.schedule_tokens_per_expert",
+        workspace.schedule_tokens_per_expert,
+        torch.int32,
+        (experts,),
+    )
+    tensor(
+        "workspace.schedule_tokens_per_expert_and_peer",
+        workspace.schedule_tokens_per_expert_and_peer,
+        torch.int32,
+        (experts * 4,),
+    )
+    tensor(
+        "workspace.all_gather_top_experts_buffer",
+        workspace.all_gather_top_experts_buffer,
+        torch.int32,
+        (4, local_tokens, 6),
+    )
+    if (
+        type(workspace.all_gather_top_experts_buffer_multicast_ptr) is not int
+        or workspace.all_gather_top_experts_buffer_multicast_ptr <= 0
+    ):
+        raise ValueError(
+            "terminal all-gather multicast pointer must be positive"
+        )
+    tensor(
         "workspace.gate_up",
         workspace.gate_up,
         torch.bfloat16,
@@ -1535,6 +1746,7 @@ def _validate_terminal_forward(
     )
     peer_ptrs("workspace.combine_buffer_ptrs", workspace.combine_buffer_ptrs)
     peer_ptrs("workspace.route_ready_ptrs", workspace.route_ready_ptrs)
+    peer_ptrs("workspace.barrier_buffer_ptrs", workspace.barrier_buffer_ptrs)
     if (
         workspace.combine_buffer_ptrs[workspace.ep_rank]
         != workspace.combine_buffer.data_ptr()
@@ -1628,6 +1840,8 @@ def _validate_terminal_forward(
         torch.int32,
         (experts,),
     )
+    if schedule.expert_padding != 64:
+        raise ValueError("terminal schedules must use expert_padding=64")
     tensor(
         "w13", w13, torch.float8_e4m3fn, (experts, 4096, 4096)
     )
@@ -1709,7 +1923,7 @@ def _validate_terminal_forward(
         )
 
 
-def megakernel_fp8_block(
+def megakernel_fp8_block_leased(
     workspace: MoKFP8TerminalWorkspace,
     schedule: MoKSchedule,
     x: torch.Tensor,
@@ -1727,36 +1941,13 @@ def megakernel_fp8_block(
     swiglu_limit: float = 10.0,
     spin_limit: int = 1 << 27,
 ) -> torch.Tensor:
-    """Run the strict terminal dispatch/W13/activation/W2/combine kernel.
+    """Launch a prevalidated terminal forward while its lease is held.
 
-    This entry has no split fallback and no Python release tail.  After all
-    host-only validation, lease acquire is its first device operation; the
-    caller-owned rank-local ``x``/``x_scale`` are then copied into symmetric
-    storage before prepare and the single megakernel launch.  The final
-    physical cluster releases the lease only after the caller-owned output has
-    been materialized.
+    This is the only leased sub-entry.  It deliberately performs no host-side
+    validation and no lease transition: the owning wrapper must validate every
+    argument before acquire.  The terminal kernel itself releases the lease
+    after materializing ``output``; there is no Python release tail.
     """
-    require_fp8_block_megakernel()
-    _validate_terminal_forward(
-        workspace,
-        schedule,
-        x,
-        x_scale,
-        w13,
-        w13_scale,
-        w2,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        output,
-        minibatch_rows,
-        macrobatch_rows,
-        swiglu_limit,
-        spin_limit,
-    )
-    workspace_lease_acquire(
-        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
-    )
     workspace.x_buffer.copy_(x)
     workspace.x_scale_buffer.copy_(x_scale)
     fp8_block_megakernel_prepare_out(
@@ -1835,6 +2026,190 @@ def megakernel_fp8_block(
         spin_limit,
     )
     return output
+
+
+def megakernel_fp8_block(
+    workspace: MoKFP8TerminalWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    minibatch_rows: int = 4096,
+    macrobatch_rows: int = 131072,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+) -> torch.Tensor:
+    """Owned manual-schedule terminal entry retained for EP4 probes.
+
+    The supplied schedule must already exist independently of this terminal
+    workspace.  This wrapper validates first, acquires exactly once, and then
+    delegates to :func:`megakernel_fp8_block_leased`.  Production integration
+    should use :func:`megakernel_fp8_block_from_topk`, which builds the
+    workspace-owned schedule only after acquiring the same lease.
+    """
+    require_fp8_block_megakernel()
+    if not isinstance(workspace, MoKFP8TerminalWorkspace):
+        raise TypeError("workspace must be a MoKFP8TerminalWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    terminal_schedule_storages = {
+        workspace.schedule_peer_rank.untyped_storage().data_ptr(),
+        workspace.schedule_peer_token_idx.untyped_storage().data_ptr(),
+        workspace.schedule_num_tokens.untyped_storage().data_ptr(),
+        workspace.schedule_tokens_per_expert.untyped_storage().data_ptr(),
+    }
+    if any(
+        value.untyped_storage().data_ptr() in terminal_schedule_storages
+        for value in (
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+        )
+    ):
+        raise ValueError(
+            "workspace-owned schedules require megakernel_fp8_block_from_topk; "
+            "the manual owned entry accepts only an independent schedule"
+        )
+    _validate_terminal_forward(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        minibatch_rows,
+        macrobatch_rows,
+        swiglu_limit,
+        spin_limit,
+    )
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
+    return megakernel_fp8_block_leased(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        minibatch_rows=minibatch_rows,
+        macrobatch_rows=macrobatch_rows,
+        swiglu_limit=swiglu_limit,
+        spin_limit=spin_limit,
+    )
+
+
+def megakernel_fp8_block_from_topk(
+    workspace: MoKFP8TerminalWorkspace,
+    config: MoKConfig,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+) -> torch.Tensor:
+    """Own one strict route-to-output terminal transaction.
+
+    All host validation completes before lease acquisition.  Device work is
+    then stream ordered as acquire -> build schedule -> copy inputs -> prepare
+    -> one terminal compute kernel.  The leased sub-entry cannot reacquire,
+    and the terminal kernel releases after writing caller-owned ``output``.
+    No fallback, dynamic allocation, host read, or Python release occurs in
+    this forward path.
+    """
+    if not isinstance(workspace, MoKFP8TerminalWorkspace):
+        raise TypeError("workspace must be a MoKFP8TerminalWorkspace")
+    if not isinstance(config, MoKConfig):
+        raise TypeError("config must be a MoKConfig")
+    schedule = MoKSchedule(
+        peer_rank=workspace.schedule_peer_rank,
+        peer_token_idx=workspace.schedule_peer_token_idx,
+        num_tokens=workspace.schedule_num_tokens,
+        tokens_per_expert=workspace.schedule_tokens_per_expert,
+        expert_padding=64,
+    )
+    require_fp8_block_megakernel()
+    _validate_terminal_forward(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        config.minibatch_size,
+        config.macrobatch_size,
+        swiglu_limit,
+        spin_limit,
+    )
+    topk_ids_int32 = _validate_build_schedule_inputs(
+        workspace,
+        config,
+        topk_ids,
+        num_local_experts=workspace.num_local_experts,
+        expert_padding=64,
+    )
+    # The terminal forward contract already requires int32, so validation
+    # above must not materialize a conversion before the lease boundary.
+    if topk_ids_int32 is not topk_ids:
+        raise RuntimeError("terminal schedule validation unexpectedly copied routes")
+
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
+    schedule = _build_schedule_validated(
+        workspace,
+        config,
+        topk_ids_int32,
+        num_local_experts=workspace.num_local_experts,
+        expert_padding=64,
+    )
+    return megakernel_fp8_block_leased(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        minibatch_rows=config.minibatch_size,
+        macrobatch_rows=config.macrobatch_size,
+        swiglu_limit=swiglu_limit,
+        spin_limit=spin_limit,
+    )
 
 
 def dispatch_gemm_fused_fp8_block(
