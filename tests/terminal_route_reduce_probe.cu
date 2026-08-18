@@ -310,6 +310,20 @@ __global__ void reference_kernel(
     }
 }
 
+// Resource-only candidate kernel.  The full route probe deliberately carries
+// producer/reducer orchestration and bounded-wait instrumentation, so its
+// stack frame is not a valid proxy for the inlined terminal reducer.  Keep a
+// minimal candidate entry point to make local-memory regressions in the
+// production arithmetic helper directly observable through cudaFuncAttributes.
+__global__ void terminal_reduce_resource_kernel(
+    const __nv_bfloat16 *combine, const float *weights,
+    const int *topk_ids, __nv_bfloat16 *output, int hidden) {
+    const int token = static_cast<int>(blockIdx.x);
+    terminal::reduce_claimed_token(
+        combine, weights, topk_ids, output, token, hidden,
+        threadIdx.x, blockDim.x);
+}
+
 void run_claim_race(
     const at::Tensor &route_ready, const at::Tensor &round_claim,
     const at::Tensor &round_arrivals, const at::Tensor &claimed_count,
@@ -351,15 +365,20 @@ void run_claim_race(
 
 std::vector<int64_t> kernel_attributes() {
     cudaFuncAttributes route{};
+    cudaFuncAttributes reduce{};
     cudaFuncAttributes race{};
     TORCH_CHECK(cudaFuncGetAttributes(&route, terminal_route_probe_kernel)
                     == cudaSuccess,
                 "failed to read route kernel attributes");
+    TORCH_CHECK(cudaFuncGetAttributes(
+                    &reduce, terminal_reduce_resource_kernel) == cudaSuccess,
+                "failed to read reducer resource kernel attributes");
     TORCH_CHECK(cudaFuncGetAttributes(&race, terminal_claim_race_kernel)
                     == cudaSuccess,
                 "failed to read race kernel attributes");
     return {
         route.numRegs, static_cast<int64_t>(route.localSizeBytes),
+        reduce.numRegs, static_cast<int64_t>(reduce.localSizeBytes),
         race.numRegs, static_cast<int64_t>(race.localSizeBytes),
     };
 }

@@ -334,21 +334,22 @@ def run_device(
     module = build_extension(True)
 
     attrs = [int(value) for value in module.kernel_attributes()]
-    if attrs[1] != 0:
-        raise RuntimeError(
-            "terminal route candidate must have localSizeBytes==0; "
-            f"observed {attrs[1]} bytes"
-        )
     if attrs[3] != 0:
         raise RuntimeError(
-            "terminal claim-race kernel must have localSizeBytes==0; "
+            "terminal reducer candidate must have localSizeBytes==0; "
             f"observed {attrs[3]} bytes"
+        )
+    if attrs[5] != 0:
+        raise RuntimeError(
+            "terminal claim-race kernel must have localSizeBytes==0; "
+            f"observed {attrs[5]} bytes"
         )
     print(
         "TERMINAL_ROUTE_PTXAS"
         f"|route_registers={attrs[0]}|route_local_bytes={attrs[1]}"
-        f"|race_registers={attrs[2]}|race_local_bytes={attrs[3]}"
-        "|local_bytes_gate=zero"
+        f"|reduce_registers={attrs[2]}|reduce_local_bytes={attrs[3]}"
+        f"|race_registers={attrs[4]}|race_local_bytes={attrs[5]}"
+        "|reduce_local_bytes_gate=zero|race_local_bytes_gate=zero"
         "|spill_evidence=ptxas_verbose_build_log|result=PASS",
         flush=True,
     )
