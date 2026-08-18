@@ -223,8 +223,10 @@ class MoKFP8TerminalWorkspace:
     next_reduce_probe: torch.Tensor
     role_cursor: torch.Tensor
     cluster_role: torch.Tensor
+    # Legacy name: dense native communication D/C ticket cursor.
     dispatch_tile_cursor: torch.Tensor
     dispatch_tiles_done: torch.Tensor
+    # Completed combine-ticket receipt; it is not an ownership cursor.
     push_tile_cursor: torch.Tensor
     worker_ticket: torch.Tensor  # (compute_clusters,) compute-role publish slot
     comm_owner: torch.Tensor  # (1,) physical cluster holding role 0 or -1

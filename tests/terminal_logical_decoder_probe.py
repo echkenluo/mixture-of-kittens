@@ -62,7 +62,23 @@ def check_source_contract() -> None:
         raise RuntimeError(f"forbidden legacy scaffold in target header: {matches}")
     if "__global__" in text:
         raise RuntimeError("logical-decoder milestone must not define a kernel body")
-    print("TERMINAL_LOGICAL_DECODER_STATIC|legacy_scaffold=0|kernel_body=0|result=PASS")
+    communication_required = (
+        "COMM_ROWS_PER_CTA_TASK = 4",
+        "communication_total_tickets",
+        "decode_communication_cursor",
+        "decode_communication_cta_task",
+        "communication_stage::combine",
+        "communication_stage::dispatch",
+    )
+    missing = [item for item in communication_required if item not in text]
+    if missing:
+        raise RuntimeError(
+            f"native communication decoder contract missing: {missing}"
+        )
+    print(
+        "TERMINAL_LOGICAL_DECODER_STATIC"
+        "|legacy_scaffold=0|kernel_body=0|native_comm_decoder=1|result=PASS"
+    )
 
 
 def cuda_is_available() -> bool:

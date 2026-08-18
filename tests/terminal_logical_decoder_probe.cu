@@ -293,6 +293,138 @@ void check_counter_contract(const probe_case &test,
             std::string(test.name) + ": counter entry/delta contract");
 }
 
+void check_communication_decode(
+        const probe_case &test, const terminal::logical_shape &shape) {
+    using stage = terminal::communication_stage;
+    struct expected_coordinate {
+        stage kind;
+        int macrobatch;
+        int round;
+    };
+    std::vector<expected_coordinate> expected;
+    auto append = [&](stage kind, int q, int round) {
+        expected.push_back({kind, q, round});
+    };
+    if (shape.num_macrobatches > 0) {
+        const int last = shape.num_macrobatches - 1;
+        for (int round = 0;
+             round < terminal::communication_rounds(shape, last); ++round)
+            append(stage::dispatch, last, round);
+        for (int q = last; q >= 0; --q) {
+            const int combine_rounds =
+                terminal::communication_rounds(shape, q);
+            const int dispatch_rounds = q > 0
+                ? terminal::communication_rounds(shape, q - 1) : 0;
+            for (int round = 0;
+                 round < std::max(combine_rounds, dispatch_rounds);
+                 ++round) {
+                if (round < combine_rounds)
+                    append(stage::combine, q, round);
+                if (round < dispatch_rounds)
+                    append(stage::dispatch, q - 1, round);
+            }
+        }
+    }
+
+    require(terminal::communication_total_tickets(shape)
+                == static_cast<int64_t>(expected.size()),
+            std::string(test.name) + ": communication ticket cardinality");
+    require(!terminal::decode_communication_cursor(shape, -1).valid
+                && !terminal::decode_communication_cursor(
+                    shape, static_cast<int64_t>(expected.size())).valid,
+            std::string(test.name) + ": communication cursor bounds");
+
+    std::vector<int> dispatch_rows(static_cast<size_t>(test.num_tokens), 0);
+    std::vector<int> combine_rows(static_cast<size_t>(test.num_tokens), 0);
+    for (size_t ticket = 0; ticket < expected.size(); ++ticket) {
+        const auto coordinate = terminal::decode_communication_cursor(
+            shape, static_cast<int64_t>(ticket));
+        const auto &golden = expected[ticket];
+        require(coordinate.valid && coordinate.stage == golden.kind
+                    && coordinate.macrobatch == golden.macrobatch
+                    && coordinate.round == golden.round,
+                std::string(test.name)
+                    + ": communication order mismatch at ticket "
+                    + std::to_string(ticket));
+        for (int rank = 0; rank < terminal::CLUSTER_CTAS; ++rank) {
+            const auto task = terminal::decode_communication_cta_task(
+                shape, coordinate, rank);
+            if (!task.valid)
+                continue;
+            require(task.active_rows > 0
+                        && task.active_rows
+                            <= terminal::COMM_ROWS_PER_CTA_TASK,
+                    std::string(test.name)
+                        + ": invalid communication CTA task extent");
+            for (int local = 0; local < task.active_rows; ++local) {
+                const int row = task.first_row + local;
+                require(row >= 0 && row < test.num_tokens,
+                        std::string(test.name)
+                            + ": communication row out of range");
+                auto &visits = coordinate.stage == stage::dispatch
+                    ? dispatch_rows : combine_rows;
+                ++visits[static_cast<size_t>(row)];
+            }
+        }
+    }
+    require(std::all_of(dispatch_rows.begin(), dispatch_rows.end(),
+                        [](int count) { return count == 1; })
+                && std::all_of(combine_rows.begin(), combine_rows.end(),
+                               [](int count) { return count == 1; }),
+            std::string(test.name)
+                + ": communication row coverage is not exactly once");
+
+    if (shape.num_macrobatches == 1 && !expected.empty()) {
+        bool saw_combine = false;
+        for (const auto &coordinate : expected) {
+            if (coordinate.kind == stage::combine)
+                saw_combine = true;
+            else
+                require(!saw_combine,
+                        std::string(test.name)
+                            + ": Q1 dispatch appears after combine");
+        }
+    }
+    if (shape.num_macrobatches >= 2) {
+        const int last = shape.num_macrobatches - 1;
+        const int first_after_initial =
+            terminal::communication_rounds(shape, last);
+        require(first_after_initial + 1 < static_cast<int>(expected.size())
+                    && expected[first_after_initial].kind == stage::combine
+                    && expected[first_after_initial].macrobatch == last
+                    && expected[first_after_initial + 1].kind
+                        == stage::dispatch
+                    && expected[first_after_initial + 1].macrobatch
+                        == last - 1,
+                std::string(test.name)
+                    + ": Q2+ first C(q)/D(q-1) pair is not interleaved");
+    }
+
+    // Pin the two simplest timelines independently of the generic coverage.
+    if (std::string(test.name) == "balanced-q1") {
+        require(expected.size() == 64
+                    && expected[0].kind == stage::dispatch
+                    && expected[31].kind == stage::dispatch
+                    && expected[32].kind == stage::combine
+                    && expected[63].kind == stage::combine,
+                "balanced-q1 native D0/C0 golden mismatch");
+    } else if (std::string(test.name) == "balanced-q2") {
+        require(expected.size() == 64
+                    && expected[0].kind == stage::dispatch
+                    && expected[0].macrobatch == 1
+                    && expected[15].kind == stage::dispatch
+                    && expected[16].kind == stage::combine
+                    && expected[16].macrobatch == 1
+                    && expected[17].kind == stage::dispatch
+                    && expected[17].macrobatch == 0
+                    && expected[46].kind == stage::combine
+                    && expected[47].kind == stage::dispatch
+                    && expected[48].kind == stage::combine
+                    && expected[48].macrobatch == 0,
+                "balanced-q2 native D1/C1-D0/C0 golden mismatch");
+    }
+}
+
 void check_host_case(const probe_case &test) {
     const terminal::logical_shape shape = terminal::make_logical_shape(
         test.num_tokens, test.schedule_capacity, test.minibatch_rows,
@@ -302,6 +434,7 @@ void check_host_case(const probe_case &test) {
             std::string(test.name) + ": Q mismatch");
     check_counter_contract(test, shape);
     check_case_goldens(test, shape);
+    check_communication_decode(test, shape);
 
     int64_t next_ordinal = 0;
     std::vector<int> m_tile_ranges(test.num_tokens / terminal::M_TILE, 0);

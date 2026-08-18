@@ -398,9 +398,9 @@ def main() -> int:
             iteration_state = {
                 "in_use": 0,
                 "role_cursor": 1 + COMPUTE_CLUSTERS,
-                "dispatch_tile_cursor": 1,
+                "dispatch_tile_cursor": 16,
                 "dispatch_tiles_done": 1,
-                "push_tile_cursor": 1,
+                "push_tile_cursor": 8,
                 "next_logical_cluster": 65,
                 "comm_worker_ticket": -2,
                 "producer_done": 65,

@@ -26,6 +26,10 @@ constexpr int TASKS_PER_M64 =
     2 * W13_CLUSTER_TASKS + 1 + W2_CLUSTER_TASKS;
 constexpr int N64_SUBTILES_PER_M64 =
     2 * W13_N64_SUBTILES + W2_N64_SUBTILES;
+constexpr int COMM_ROWS_PER_CTA_TASK = 4;
+constexpr int COMM_CTAS_PER_TICKET = CLUSTER_CTAS;
+constexpr int COMM_ROWS_PER_TICKET =
+    COMM_ROWS_PER_CTA_TASK * COMM_CTAS_PER_TICKET;
 
 static_assert(HIDDEN_SIZE == 4096, "terminal specialization freezes H4096");
 static_assert(INTERMEDIATE_SIZE == 2048,
@@ -47,6 +51,11 @@ static_assert(TASKS_PER_M64 == 65,
               "terminal specialization must expose 65 cluster tasks/M64");
 static_assert(N64_SUBTILES_PER_M64 == 128,
               "expanded CTA N64 subtile cardinality changed");
+static_assert(COMM_ROWS_PER_CTA_TASK == 4
+                  && COMM_ROWS_PER_TICKET == 8,
+              "native communication task geometry changed");
+static_assert((M_TILE % COMM_ROWS_PER_TICKET) == 0,
+              "one communication ticket must not straddle M64 tiles");
 
 #if defined(__CUDACC__)
 #define MOK_TERMINAL_HD __host__ __device__ constexpr
@@ -69,6 +78,11 @@ enum class ready_counter : int {
     y_routed = 3,
     y_routed_done = 4,
     count = 5,
+};
+
+enum class communication_stage : int {
+    dispatch = 0,
+    combine = 1,
 };
 
 struct logical_shape {
@@ -114,6 +128,25 @@ struct logical_coordinate {
     int global_m;
     int n128;
     logical_stage stage;
+};
+
+// One dense communication ticket represents the lockstep pair of native
+// four-row CTA tasks.  The two CTAs execute the same stage and adjacent task
+// indices, preserving the original per-CTA D/C loop without assigning work to
+// a physical role that may be admitted late.
+struct communication_coordinate {
+    bool valid;
+    int64_t cursor_ordinal;
+    communication_stage stage;
+    int macrobatch;
+    int round;
+};
+
+struct communication_cta_task {
+    bool valid;
+    int task_index;
+    int first_row;
+    int active_rows;
 };
 
 MOK_TERMINAL_HD int ceil_div_nonnegative(int value, int divisor) {
@@ -242,6 +275,131 @@ MOK_TERMINAL_HD int decode_ordered_m_tile(
         remaining -= range.active_m_tiles;
     }
     return -1;
+}
+
+MOK_TERMINAL_HD int communication_rows(
+        const logical_shape &shape, int macrobatch) {
+    if (!shape.valid || macrobatch < 0
+            || macrobatch >= shape.num_macrobatches)
+        return 0;
+    int rows = shape.num_tokens - macrobatch * shape.macrobatch_rows;
+    if (rows > shape.macrobatch_rows)
+        rows = shape.macrobatch_rows;
+    return rows > 0 ? rows : 0;
+}
+
+MOK_TERMINAL_HD int communication_rounds(
+        const logical_shape &shape, int macrobatch) {
+    return ceil_div_nonnegative(
+        communication_rows(shape, macrobatch), COMM_ROWS_PER_TICKET);
+}
+
+// Native communication order, flattened into a dense cluster-ticket stream:
+//
+//   D(Q-1)
+//   for q = Q-1 .. 0:
+//     for each native task round: C(q), then D(q-1) when it exists
+//
+// Q=1 therefore remains exactly D(0)->C(0); only Q>=2 contains the
+// combine(q)/dispatch(q-1) task-level interleave.
+MOK_TERMINAL_HD int64_t communication_total_tickets(
+        const logical_shape &shape) {
+    if (!shape.valid || shape.num_macrobatches == 0)
+        return 0;
+    int64_t total = communication_rounds(
+        shape, shape.num_macrobatches - 1);
+    for (int q = shape.num_macrobatches - 1; q >= 0; --q) {
+        total += communication_rounds(shape, q);
+        if (q > 0)
+            total += communication_rounds(shape, q - 1);
+    }
+    return total;
+}
+
+MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
+        const logical_shape &shape, int64_t cursor_ordinal) {
+    communication_coordinate result{};
+    result.cursor_ordinal = cursor_ordinal;
+    const int64_t total = communication_total_tickets(shape);
+    if (!shape.valid || cursor_ordinal < 0 || cursor_ordinal >= total)
+        return result;
+
+    int64_t remaining = cursor_ordinal;
+    const int last = shape.num_macrobatches - 1;
+    const int initial_dispatch = communication_rounds(shape, last);
+    if (remaining < initial_dispatch) {
+        result.valid = true;
+        result.stage = communication_stage::dispatch;
+        result.macrobatch = last;
+        result.round = static_cast<int>(remaining);
+        return result;
+    }
+    remaining -= initial_dispatch;
+
+    for (int q = last; q >= 0; --q) {
+        const int combine_rounds = communication_rounds(shape, q);
+        const int dispatch_rounds = q > 0
+            ? communication_rounds(shape, q - 1) : 0;
+        const int64_t segment = static_cast<int64_t>(combine_rounds)
+            + dispatch_rounds;
+        if (remaining >= segment) {
+            remaining -= segment;
+            continue;
+        }
+
+        const int paired = combine_rounds < dispatch_rounds
+            ? combine_rounds : dispatch_rounds;
+        const int64_t paired_tickets = static_cast<int64_t>(2) * paired;
+        if (remaining < paired_tickets) {
+            result.valid = true;
+            result.round = static_cast<int>(remaining / 2);
+            if ((remaining & 1) == 0) {
+                result.stage = communication_stage::combine;
+                result.macrobatch = q;
+            } else {
+                result.stage = communication_stage::dispatch;
+                result.macrobatch = q - 1;
+            }
+            return result;
+        }
+
+        remaining -= paired_tickets;
+        result.valid = true;
+        result.round = paired + static_cast<int>(remaining);
+        if (combine_rounds > paired) {
+            result.stage = communication_stage::combine;
+            result.macrobatch = q;
+        } else {
+            result.stage = communication_stage::dispatch;
+            result.macrobatch = q - 1;
+        }
+        return result;
+    }
+    return result;
+}
+
+MOK_TERMINAL_HD communication_cta_task decode_communication_cta_task(
+        const logical_shape &shape,
+        const communication_coordinate &coordinate,
+        int cta_rank) {
+    communication_cta_task result{};
+    if (!shape.valid || !coordinate.valid || cta_rank < 0
+            || cta_rank >= COMM_CTAS_PER_TICKET)
+        return result;
+    const int rows = communication_rows(shape, coordinate.macrobatch);
+    const int task_index = coordinate.round * COMM_CTAS_PER_TICKET + cta_rank;
+    const int row_in_macrobatch = task_index * COMM_ROWS_PER_CTA_TASK;
+    if (row_in_macrobatch >= rows)
+        return result;
+    int active = rows - row_in_macrobatch;
+    if (active > COMM_ROWS_PER_CTA_TASK)
+        active = COMM_ROWS_PER_CTA_TASK;
+    result.valid = true;
+    result.task_index = task_index;
+    result.first_row = coordinate.macrobatch * shape.macrobatch_rows
+        + row_in_macrobatch;
+    result.active_rows = active;
+    return result;
 }
 
 MOK_TERMINAL_HD ordinal_range stage_range(
