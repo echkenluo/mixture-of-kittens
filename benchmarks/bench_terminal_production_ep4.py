@@ -823,18 +823,32 @@ def benchmark_cell(
     device: torch.device,
     weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> dict:
+    def stage(name: str) -> None:
+        if rank == 0:
+            print(
+                f"TERMINAL_PRODUCTION_BENCH_STAGE|tokens="
+                f"{cell.effective_tokens}|stage={name}",
+                flush=True,
+            )
+
     runners, terminal_workspace, route_workspace, tensors = make_runners(
         args, cell, rank, device, weights
     )
     dist.barrier()
+    stage("correctness_split_begin")
     split_output = runners.split()
     torch.cuda.synchronize(device)
+    stage("correctness_split_end")
     assert_route_closed(route_workspace, "split")
+    stage("correctness_terminal_begin")
     terminal_output = runners.terminal()
     torch.cuda.synchronize(device)
+    stage("correctness_terminal_end")
     assert_terminal_closed(terminal_workspace, cell)
+    stage("correctness_k1k2_begin")
     k1k2_output = runners.k1k2()
     torch.cuda.synchronize(device)
+    stage("correctness_k1k2_end")
     assert_route_closed(route_workspace, "k1k2")
     # Graph-bucket padding has no caller-visible output: its route IDs are -1
     # and its weights are zero, so backing combine rows may remain unspecified.
@@ -849,9 +863,11 @@ def benchmark_cell(
 
     comparisons = {}
     for baseline in args.baselines:
+        stage(f"measure_{baseline}_begin")
         comparisons[baseline] = measure_aba(
             args, cell, runners, baseline, device
         )
+        stage(f"measure_{baseline}_end")
         assert_terminal_closed(terminal_workspace, cell)
         assert_route_closed(route_workspace, baseline)
     result = {
