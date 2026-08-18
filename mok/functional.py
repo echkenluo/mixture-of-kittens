@@ -1710,6 +1710,16 @@ def _validate_terminal_forward(
         torch.float32,
         (capacity, 32),
     )
+    if (
+        workspace.x_buffer.untyped_storage().data_ptr()
+        == workspace.routed_x.untyped_storage().data_ptr()
+        or workspace.x_scale_buffer.untyped_storage().data_ptr()
+        == workspace.routed_x_scale.untyped_storage().data_ptr()
+    ):
+        raise ValueError(
+            "terminal dispatch source and routed destination storage must be "
+            "disjoint"
+        )
     tensor("workspace.m_indices", workspace.m_indices, torch.int32, (capacity,))
     tensor(
         "workspace.schedule_peer_rank",

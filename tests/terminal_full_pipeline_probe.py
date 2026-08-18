@@ -41,7 +41,8 @@ def check_source_contract() -> None:
         "sm90_fp8_block_terminal_comm_primitives.cuh",
         "sm90_fp8_block_terminal_compute.cuh",
         "sm90_fp8_block_terminal_route_flags.cuh",
-        "dispatch_copy_row",
+        "sm90_fp8_block_terminal_tma_comm.cuh",
+        "dispatch_tma::dispatch_ticket",
         "push_routed_row_and_publish",
         "try_claim_ready_token",
         "try_reduce_one_ready_token",
@@ -297,6 +298,7 @@ def check_source_contract() -> None:
         "communication_stage::dispatch",
         "communication_stage::combine",
         "claim_bounded(\n                    g.dispatch_tile_cursor, total_comm_tickets)",
+        "dispatch_tma::dispatch_ticket(",
         "compute::add_release_gpu(g.push_tile_cursor, 1u)",
     )
     missing_native_comm = [
@@ -306,6 +308,11 @@ def check_source_contract() -> None:
         raise RuntimeError(
             f"native communication timeline missing: {missing_native_comm}"
         )
+    if (
+        "dispatch_tma::combine" in communication
+        or "combine_ticket(" in communication
+    ):
+        raise RuntimeError("dispatch candidate must retain generic combine payload")
     old_phase_boundary = (
         "claim_bounded(\n                    g.dispatch_tile_cursor, "
         "static_cast<unsigned int>(m_tiles))"
@@ -394,6 +401,7 @@ def check_source_contract() -> None:
         "|reduction=ep_rank_local"
         "|reduce_probe=bounded_one_shot|not_ready_wait=0"
         "|comm_timeline=native_dense_dcd"
+        "|dispatch_payload=raw_bulk_tma|combine_payload=generic"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
         "|logical_ticket=M64xN256|n128_subtasks=2|tasks_per_m64=33"
         "|control_broadcast=cta_shared|w2_dependency=hidden_ready"

@@ -54,6 +54,11 @@ constexpr int DYNAMIC_SMEM =
     + sizeof(compute::d_st) + 1024;
 static_assert(DYNAMIC_SMEM == 41984,
               "sequential N256 must retain the legacy shared-memory budget");
+static_assert(
+    DYNAMIC_SMEM
+        >= fp8_block_terminal_tma_comm::REQUIRED_SMEM_BYTES
+            + fp8_block_terminal_tma_comm::REQUIRED_SMEM_ALIGNMENT - 1,
+    "terminal dynamic smem cannot hold aligned dispatch TMA staging");
 constexpr int PREPARE_THREADS = 256;
 
 struct prepare_globals {
@@ -416,6 +421,8 @@ inline void entry_out(
     TORCH_CHECK(x_buffer.dim() == 2 && x_buffer.size(0) > 0
                     && x_buffer.size(1) == terminal::HIDDEN_SIZE,
                 "x_buffer must be FP8 [local_tokens,4096]");
+    TORCH_CHECK(!x_buffer.is_alias_of(routed_x),
+                "x_buffer and routed_x must use disjoint storage");
     const int64_t local_tokens = x_buffer.size(0);
     TORCH_CHECK(local_tokens <= std::numeric_limits<int>::max(),
                 "local token count does not fit int");
@@ -431,6 +438,8 @@ inline void entry_out(
                     == at::IntArrayRef({capacity,
                                        terminal::HIDDEN_SIZE / 128}),
                 "routed_x_scale must be float32 [capacity,32]");
+    TORCH_CHECK(!x_scale_buffer.is_alias_of(routed_x_scale),
+                "x_scale_buffer and routed_x_scale must use disjoint storage");
     check_i32_state(m_indices, device, capacity, "m_indices");
 
     fp8_block_routed::check_pointer_list(x_ptrs, "x_ptrs");

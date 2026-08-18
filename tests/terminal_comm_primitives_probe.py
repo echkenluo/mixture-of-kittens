@@ -12,6 +12,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(__file__).with_suffix(".cu")
 HEADER = REPO_ROOT / "csrc" / "sm90_fp8_block_terminal_comm_primitives.cuh"
+ENTRY = REPO_ROOT / "csrc" / "sm90_fp8_block_terminal_entry.cuh"
+FUNCTIONAL = REPO_ROOT / "mok" / "functional.py"
 K1 = REPO_ROOT / "csrc" / "sm90_fp8_block_dispatch_gemm.cuh"
 K2 = REPO_ROOT / "csrc" / "sm90_fp8_block_gemm_combine.cuh"
 
@@ -40,6 +42,13 @@ def check_static_contract() -> None:
     matches = [pattern for pattern in forbidden if re.search(pattern, header)]
     if matches:
         raise RuntimeError(f"scheduling/publication leaked into helper header: {matches}")
+    if "!x_buffer.is_alias_of(routed_x)" not in ENTRY.read_text(encoding="utf-8"):
+        raise RuntimeError("native entry must reject dispatch storage aliasing")
+    if (
+        "terminal dispatch source and routed destination storage must be"
+        not in FUNCTIONAL.read_text(encoding="utf-8")
+    ):
+        raise RuntimeError("Python entry must reject dispatch storage aliasing")
     k1 = K1.read_text(encoding="utf-8")
     k2 = K2.read_text(encoding="utf-8")
     required = (

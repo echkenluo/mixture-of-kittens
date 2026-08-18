@@ -20,6 +20,7 @@
 #include "sm90_fp8_block_terminal_comm_primitives.cuh"
 #include "sm90_fp8_block_terminal_compute.cuh"
 #include "sm90_fp8_block_terminal_route_flags.cuh"
+#include "sm90_fp8_block_terminal_tma_comm.cuh"
 
 namespace mok_sm90::fp8_block_terminal_full {
 
@@ -27,6 +28,7 @@ namespace terminal = fp8_block_terminal;
 namespace comm = fp8_block_terminal_comm;
 namespace compute = fp8_block_terminal_compute;
 namespace route = fp8_block_terminal_route_flags;
+namespace dispatch_tma = fp8_block_terminal_tma_comm;
 
 // Probe/default compatibility value.  Production supplies g.comm_clusters at
 // runtime and keeps the total resident grid fixed while trading compute roles
@@ -694,6 +696,8 @@ __device__ void communication_role(
         semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
     __shared__ int expert_row_end[MAX_EXPERTS];
     __shared__ int wait_ok;
+    __shared__ semaphore
+        dispatch_tma_inputs_arrived[dispatch_tma::PIPE_DEPTH];
     // logical_shape carries four int64 fields and otherwise immutable schedule
     // metadata.  Construct it once per CTA and retain only its shared address
     // across the resident loop instead of one materialized copy per thread.
@@ -714,11 +718,27 @@ __device__ void communication_role(
             active_rows, g.schedule_capacity,
             g.minibatch_rows, g.macrobatch_rows);
     }
+    if (threadIdx.x < dispatch_tma::PIPE_DEPTH) {
+        init_semaphore(
+            dispatch_tma_inputs_arrived[threadIdx.x], 0, 1);
+        // mbarrier.init uses the generic proxy; raw bulk TMA consumes these
+        // barriers through the async proxy on every later dispatch ticket.
+        asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory");
+    }
     __syncthreads();
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     constexpr int WARPS_PER_CTA = terminal::THREADS_PER_CTA / 32;
+    static_assert(
+        WARPS_PER_CTA == dispatch_tma::CTA_ROWS,
+        "one terminal CTA warp must own each dispatch TMA stage");
+    static_assert(
+        terminal::COMM_ROWS_PER_CTA_TASK == dispatch_tma::CTA_ROWS,
+        "dispatch TMA stages must cover exactly one cluster-ticket CTA half");
+    uint32_t dispatch_tma_phasebits = 0xFFFF0000u;
+    const uint64_t dispatch_tma_smem_base =
+        reinterpret_cast<uint64_t>(&a_smem[0]);
     if (!shape.valid) {
         if (cta_rank == 0 && threadIdx.x == 0) {
             if (g.trap_record != nullptr)
@@ -803,34 +823,33 @@ __device__ void communication_role(
             comm_control & COMM_CONTROL_STAGE_MASK;
         if (comm_stage == static_cast<unsigned int>(
                 terminal::communication_stage::dispatch)) {
-            for (int local = warp;
-                 local < terminal::COMM_ROWS_PER_CTA_TASK;
-                 local += WARPS_PER_CTA) {
-                const int row = first_row + local;
-                comm::dispatch_copy_row(g, expert_row_end, row, lane);
-                // Every lane wrote a stripe of the row.  The elected lane may
-                // publish row readiness only after every writer has released
-                // and converged.
-                __threadfence();
-                __syncwarp(0xffffffffu);
-                if (lane == 0) {
-                    const int m = row / terminal::M_TILE;
-                    const unsigned int old = add_acq_rel_gpu(
-                        g.x_ready + m, 1u);
-                    if (old >= terminal::M_TILE) {
-                        if (g.trap_record != nullptr)
-                            trap_commit(
-                                g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
-                                m, terminal::M_TILE, old, ticket, 0);
-                        if (g.errors != nullptr)
-                            atomicAdd(g.errors, 1u);
-                    } else if (old + 1u == terminal::M_TILE
-                            && g.dispatch_tiles_done != nullptr) {
-                        compute::add_release_gpu(g.dispatch_tiles_done, 1u);
-                    }
-                    if (g.dispatch_visits != nullptr)
-                        atomicAdd(g.dispatch_visits + row, 1u);
+            dispatch_tma::dispatch_ticket(
+                g, expert_row_end, first_row,
+                dispatch_tma_inputs_arrived, dispatch_tma_phasebits,
+                dispatch_tma_smem_base);
+            // Each warp's lane zero issued and fully drained one complete row.
+            // Its following device-release arrival publishes FP8, scale, and
+            // m_indices together without changing the existing x_ready count.
+            const int row = first_row + warp;
+            __threadfence();
+            __syncwarp(0xffffffffu);
+            if (lane == 0) {
+                const int m = row / terminal::M_TILE;
+                const unsigned int old = add_acq_rel_gpu(
+                    g.x_ready + m, 1u);
+                if (old >= terminal::M_TILE) {
+                    if (g.trap_record != nullptr)
+                        trap_commit(
+                            g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
+                            m, terminal::M_TILE, old, ticket, 0);
+                    if (g.errors != nullptr)
+                        atomicAdd(g.errors, 1u);
+                } else if (old + 1u == terminal::M_TILE
+                        && g.dispatch_tiles_done != nullptr) {
+                    compute::add_release_gpu(g.dispatch_tiles_done, 1u);
                 }
+                if (g.dispatch_visits != nullptr)
+                    atomicAdd(g.dispatch_visits + row, 1u);
             }
             __syncthreads();
             everyone::tma::cluster::sync();
@@ -1416,8 +1435,8 @@ __device__ void compute_and_reduce_role(
                 __syncthreads();
             }
 
-            // dispatch_copy_row uses generic stores while run_w13_task's
-            // rank-0 TMA consumes through the async proxy.
+            // Dispatch-TMA bridges its drained stores into the generic x_ready
+            // publication, while rank-0 W13 consumes through the async proxy.
             if (cta_rank == 0 && threadIdx.x == 0
                     && (coordinate.stage == terminal::logical_stage::gate
                         || coordinate.stage == terminal::logical_stage::up))
