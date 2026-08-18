@@ -1390,7 +1390,7 @@ __device__ void compute_and_reduce_role(
 
 template <typename GemmProblem>
 __cluster_dims__(2, 1, 1)
-__launch_bounds__(terminal::THREADS_PER_CTA, 1)
+__launch_bounds__(terminal::THREADS_PER_CTA, 3)
 __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
     const int cta_rank = cluster_ctarank();
     const int cluster = clusterIdx().x;
