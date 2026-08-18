@@ -30,6 +30,7 @@ constexpr int COMM_ROWS_PER_CTA_TASK = 4;
 constexpr int COMM_CTAS_PER_TICKET = CLUSTER_CTAS;
 constexpr int COMM_ROWS_PER_TICKET =
     COMM_ROWS_PER_CTA_TASK * COMM_CTAS_PER_TICKET;
+constexpr int COMM_TICKETS_PER_M_TILE = M_TILE / COMM_ROWS_PER_TICKET;
 
 static_assert(HIDDEN_SIZE == 4096, "terminal specialization freezes H4096");
 static_assert(INTERMEDIATE_SIZE == 2048,
@@ -56,6 +57,8 @@ static_assert(COMM_ROWS_PER_CTA_TASK == 4
               "native communication task geometry changed");
 static_assert((M_TILE % COMM_ROWS_PER_TICKET) == 0,
               "one communication ticket must not straddle M64 tiles");
+static_assert(COMM_TICKETS_PER_M_TILE == 8,
+              "terminal communication closure cadence changed");
 
 #if defined(__CUDACC__)
 #define MOK_TERMINAL_HD __host__ __device__ constexpr

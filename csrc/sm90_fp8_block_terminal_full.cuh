@@ -615,10 +615,10 @@ __device__ void communication_role(
     const bool owner_help_enabled = production_control_enabled(g);
     uint32_t owner_phasebits = 0xFFFF0000u;
     uint32_t owner_ready_phase = 0u;
-    const int64_t total_comm_tickets_i64 =
-        terminal::communication_total_tickets(shape);
+    // The validated M64 contract makes the D+C cardinality exactly rows/4;
+    // keep the resident hot path entirely 32-bit.
     const unsigned int total_comm_tickets =
-        static_cast<unsigned int>(total_comm_tickets_i64);
+        static_cast<unsigned int>(active_rows / 4);
     unsigned int probe_comm_ticket = 0u;
     while (true) {
         if (cta_rank == 0 && threadIdx.x == 0) {
@@ -639,25 +639,26 @@ __device__ void communication_role(
 
         const terminal::communication_coordinate coordinate =
             terminal::decode_communication_cursor(shape, ticket);
-        const terminal::communication_cta_task cta_task =
-            terminal::decode_communication_cta_task(
-                shape, coordinate, cta_rank);
-        if (!coordinate.valid || !cta_task.valid
-                || total_comm_tickets_i64 < 0
-                || total_comm_tickets_i64 > 0xffffffffll) {
+        const int first_row = coordinate.macrobatch * shape.macrobatch_rows
+            + coordinate.round * terminal::COMM_ROWS_PER_TICKET
+            + cta_rank * terminal::COMM_ROWS_PER_CTA_TASK;
+        const int macro_end = coordinate.macrobatch * shape.macrobatch_rows
+            + terminal::communication_rows(shape, coordinate.macrobatch);
+        if (!coordinate.valid || first_row < 0
+                || first_row + terminal::COMM_ROWS_PER_CTA_TASK > macro_end) {
             if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
                 trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
                             comm_role, total_comm_tickets,
-                            static_cast<unsigned long long>(
-                                total_comm_tickets_i64),
+                            static_cast<unsigned long long>(first_row),
                             ticket, 0);
             park_forever();
         }
 
         if (coordinate.stage == terminal::communication_stage::dispatch) {
-            for (int local = warp; local < cta_task.active_rows;
+            for (int local = warp;
+                 local < terminal::COMM_ROWS_PER_CTA_TASK;
                  local += WARPS_PER_CTA) {
-                const int row = cta_task.first_row + local;
+                const int row = first_row + local;
                 comm::dispatch_copy_row(g, expert_row_end, row, lane);
                 // Every lane wrote a stripe of the row.  The elected lane may
                 // publish row readiness only after every writer has released
@@ -723,13 +724,13 @@ __device__ void communication_role(
         // COMM_ROWS_PER_TICKET divides M64 and every macrobatch starts on an
         // M64 boundary, so both CTA tasks in a combine ticket wait on exactly
         // one y_ready tile.
-        const int m = cta_task.first_row / terminal::M_TILE;
-        if (cta_task.first_row + cta_task.active_rows - 1
+        const int m = first_row / terminal::M_TILE;
+        if (first_row + terminal::COMM_ROWS_PER_CTA_TASK - 1
                     >= (m + 1) * terminal::M_TILE) {
             if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
                 trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
                             comm_role, terminal::M_TILE,
-                            cta_task.first_row, ticket, 0);
+                            first_row, ticket, 0);
             park_forever();
         }
         if (owner_help_enabled) {
@@ -829,9 +830,10 @@ __device__ void communication_role(
                 return;
         }
 
-        for (int local = warp; local < cta_task.active_rows;
+        for (int local = warp;
+             local < terminal::COMM_ROWS_PER_CTA_TASK;
              local += WARPS_PER_CTA) {
-            const int position = cta_task.first_row + local;
+            const int position = first_row + local;
             const int first = m * terminal::M_TILE;
             const int row = g.push_order != nullptr
                 ? g.push_order[position]
@@ -858,8 +860,8 @@ __device__ void communication_role(
             compute::add_release_gpu(g.push_tile_cursor, 1u);
         everyone::tma::cluster::sync();
         const bool closes_m64 =
-            ((coordinate.round + 1) * terminal::COMM_ROWS_PER_TICKET
-                % terminal::M_TILE) == 0;
+            coordinate.round % terminal::COMM_TICKETS_PER_M_TILE
+                == terminal::COMM_TICKETS_PER_M_TILE - 1;
         if (owner_help_enabled && closes_m64) {
             // Preserve the old once-per-M64 reducer cadence while the comm
             // cursor itself operates at native four-row CTA granularity.
