@@ -76,6 +76,7 @@ struct prepare_globals {
     unsigned int *next_reduce_probe;
     unsigned int *worker_ticket;
     int64_t worker_ticket_count;
+    unsigned int *comm_owner;
     unsigned int *producer_done;
     unsigned int *comm_closed;
     unsigned int *push_done;
@@ -122,6 +123,7 @@ __global__ void prepare_kernel(prepare_globals g) {
         if (index == 0) {
             *g.next_logical_cluster = 0u;
             *g.next_reduce_probe = 0u;
+            *g.comm_owner = full::UNCLAIMED_COMM;
             *g.producer_done = 0u;
             *g.comm_closed = 0u;
             *g.push_done = 0u;
@@ -166,6 +168,7 @@ inline void entry_prepare_out(
     const at::Tensor &next_logical_cluster,
     const at::Tensor &next_reduce_probe,
     const at::Tensor &worker_ticket,
+    const at::Tensor &comm_owner,
     const at::Tensor &producer_done, const at::Tensor &comm_closed,
     const at::Tensor &push_done, const at::Tensor &reduce_done,
     const at::Tensor &terminate, const at::Tensor &epilogue_done,
@@ -203,7 +206,8 @@ inline void entry_prepare_out(
     TORCH_CHECK(worker_ticket.dim() == 1 && worker_ticket.numel() > 0,
                 "worker_ticket must be nonempty int32 [compute_clusters]");
     for (const auto &[tensor, name] :
-         std::array<std::pair<const at::Tensor *, const char *>, 8>{{
+         std::array<std::pair<const at::Tensor *, const char *>, 9>{{
+             {&comm_owner, "comm_owner"},
              {&producer_done, "producer_done"},
              {&comm_closed, "comm_closed"},
              {&push_done, "push_done"},
@@ -226,8 +230,9 @@ inline void entry_prepare_out(
         u32_ptr(epilogue_claim), epilogue_claim.numel(),
         u32_ptr(next_logical_cluster), u32_ptr(next_reduce_probe),
         u32_ptr(worker_ticket), worker_ticket.numel(),
-        u32_ptr(producer_done), u32_ptr(comm_closed), u32_ptr(push_done),
-        u32_ptr(reduce_done), u32_ptr(terminate), u32_ptr(epilogue_done),
+        u32_ptr(comm_owner), u32_ptr(producer_done),
+        u32_ptr(comm_closed), u32_ptr(push_done), u32_ptr(reduce_done),
+        u32_ptr(terminate), u32_ptr(epilogue_done),
         u32_ptr(input_expected_scratch), 0,
     };
     g.max_count = std::max({
@@ -325,6 +330,7 @@ inline void entry_out(
     const at::Tensor &next_logical_cluster,
     const at::Tensor &next_reduce_probe,
     const at::Tensor &worker_ticket,
+    const at::Tensor &comm_owner,
     const at::Tensor &producer_done, const at::Tensor &comm_closed,
     const at::Tensor &push_done, const at::Tensor &reduce_done,
     const at::Tensor &terminate, const at::Tensor &epilogue_done,
@@ -499,6 +505,7 @@ inline void entry_out(
                     && compute_clusters <= std::numeric_limits<int>::max(),
                 "compute_clusters must be a positive int");
     check_i32_state(worker_ticket, device, compute_clusters, "worker_ticket");
+    check_i32_state(comm_owner, device, 1, "comm_owner");
     TORCH_CHECK(minibatch_rows > 0 && minibatch_rows % terminal::M_TILE == 0
                     && minibatch_rows <= std::numeric_limits<int>::max(),
                 "minibatch_rows must be a positive M64-aligned int");
@@ -598,6 +605,7 @@ inline void entry_out(
     g.x_ready = u32_ptr(x_routed_ready);
     g.cursor = u32_ptr(next_logical_cluster);
     g.worker_ticket = u32_ptr(worker_ticket);
+    g.comm_owner = u32_ptr(comm_owner);
     g.worker_failed = nullptr;
     g.next_reduce_probe = u32_ptr(next_reduce_probe);
     g.reduce_done = u32_ptr(reduce_done);

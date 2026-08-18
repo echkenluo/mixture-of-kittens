@@ -3,10 +3,10 @@
 // Rank-local reduction milestone for the terminal SM90 FP8 forward.  The
 // probe still supplies emulated peer pointers for remote pushes, but each
 // invocation owns exactly one EP rank's combine/ready/claim/output domain.
-// M1 launches one permanently resident communication cluster plus N compute
-// clusters, with 1 + N bounded by the measured active-cluster limit.  Every
-// compute CTA performs only one nonblocking ready-token probe at a task or
-// wait boundary; NOT_READY work remains unclaimed, while a winning CTA
+// M1 launches one dynamically elected resident communication cluster plus N
+// compute clusters, with 1 + N bounded by the measured active-cluster limit.
+// Every compute CTA performs only one nonblocking ready-token probe at a task
+// or wait boundary; NOT_READY work remains unclaimed, while a winning CTA
 // reduces one local token and then resumes compute claims.  There is no
 // grid/rank barrier, split path, or fallback in this kernel.
 
@@ -30,6 +30,7 @@ namespace route = fp8_block_terminal_route_flags;
 
 constexpr int COMM_CLUSTERS = 1;
 constexpr int COMM_CLUSTER = 0;
+constexpr unsigned int UNCLAIMED_COMM = ~0u;
 // DeepSeek-V4 has 256 routed experts globally.  Production currently targets
 // EP4, so the common case is 64 local experts, but keeping the full model
 // bound here preserves the workspace/entry contract and costs only 1 KiB of
@@ -55,6 +56,7 @@ constexpr unsigned long long TRAP_CLAIMED = ~0ull;
 constexpr unsigned long long SITE_TERMINAL_CONTRACT = 20ull;
 constexpr unsigned long long SITE_TERMINAL_INPUT_EXPECTED = 21ull;
 constexpr unsigned long long SITE_TERMINAL_INPUT_BARRIER = 22ull;
+constexpr unsigned long long SITE_TERMINAL_COMM_OWNER = 23ull;
 
 #if defined(KITTENS_SM90)
 
@@ -132,6 +134,7 @@ struct globals {
     unsigned int *input_expected_scratch = nullptr;
     unsigned int *in_use = nullptr;
     unsigned int *epilogue_done = nullptr;
+    unsigned int *comm_owner = nullptr;
     unsigned int *producer_done = nullptr;
     unsigned int *push_done = nullptr;
     unsigned int *terminate = nullptr;
@@ -194,6 +197,47 @@ __device__ __forceinline__ bool bounded_wait_gpu(
     return false;
 }
 
+// A fixed physical cluster id is not a residency guarantee: under a
+// concurrent context, a later grid cluster can be admitted before cluster 0.
+// The first actually resident cluster therefore claims the communication
+// role.  The owner is immutable for the iteration; all remaining physical
+// clusters map densely around it onto worker_ticket[0..compute_clusters).
+template <typename GemmProblem>
+__device__ int elect_comm_cluster(
+        const globals<GemmProblem> &g, int cluster, int cta_rank) {
+    if (g.comm_owner == nullptr)
+        return COMM_CLUSTER;  // probe-only compatibility path
+
+    if (cta_rank == 0 && threadIdx.x == 0) {
+        unsigned int prior;
+        const unsigned int compare = UNCLAIMED_COMM;
+        const unsigned int candidate = static_cast<unsigned int>(cluster);
+        asm volatile("{atom.cas.acq_rel.gpu.global.b32 %0, [%1], %2, %3;}"
+                     : "=r"(prior)
+                     : "l"(g.comm_owner), "r"(compare), "r"(candidate)
+                     : "memory");
+    }
+    everyone::tma::cluster::sync();
+
+    __shared__ unsigned int observed_owner;
+    if (threadIdx.x == 0) {
+        asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
+                     : "=r"(observed_owner)
+                     : "l"(g.comm_owner) : "memory");
+    }
+    __syncthreads();
+    const unsigned int physical = static_cast<unsigned int>(
+        COMM_CLUSTERS + g.compute_clusters);
+    if (observed_owner >= physical) {
+        if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
+            trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_COMM_OWNER,
+                        cluster, physical, observed_owner, 0, 0);
+        park_forever();
+    }
+    everyone::tma::cluster::sync();
+    return static_cast<int>(observed_owner);
+}
+
 template <typename GemmProblem>
 __device__ __forceinline__ bool production_control_enabled(
         const globals<GemmProblem> &g) {
@@ -227,16 +271,17 @@ __device__ __forceinline__ void try_publish_terminate(
                  : "memory");
 }
 
-// One arrive per rank, performed by the first physical cluster before that
-// same cluster can enter a wait.  All other resident clusters first wait for
-// the rank-local expected value and then join the same bounded system-scope
-// wait.  This absorbs the former standalone input barrier launch.
+// One arrive per rank, performed by the elected resident communication owner
+// before that same cluster can enter a wait.  All other resident clusters
+// first wait for the rank-local expected value and then join the same bounded
+// system-scope wait.  This absorbs the former standalone input barrier launch.
 template <typename GemmProblem>
 __device__ void production_input_barrier(
-        const globals<GemmProblem> &g, int cluster, int cta_rank) {
+        const globals<GemmProblem> &g, int cluster, int cta_rank,
+        int comm_cluster) {
     if (g.barrier_flag == nullptr)
         return;
-    if (cluster == 0 && cta_rank == 0 && threadIdx.x == 0) {
+    if (cluster == comm_cluster && cta_rank == 0 && threadIdx.x == 0) {
         const unsigned int expected =
             atomicAdd(g.barrier_target, static_cast<unsigned int>(g.ep_size))
             + static_cast<unsigned int>(g.ep_size);
@@ -504,7 +549,7 @@ __device__ void communication_role(
         }
     }
 
-    // The fixed communication cluster never changes roles or leaves early.
+    // The elected communication cluster never changes roles or leaves early.
     // Once every producer push is closed it remains resident until the
     // opportunistic compute CTAs have reduced every token.  This wait cannot
     // exclude a producer: all dispatch and push work is already complete.
@@ -920,8 +965,16 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
             park_forever();
         }
     }
+    if (g.trap_record != nullptr && production_control_enabled(g)
+            && g.comm_owner == nullptr) {
+        if (threadIdx.x == 0)
+            trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_COMM_OWNER,
+                        cluster, 1, 0, 0, 0);
+        park_forever();
+    }
 
-    production_input_barrier(g, cluster, cta_rank);
+    const int comm_cluster = elect_comm_cluster(g, cluster, cta_rank);
+    production_input_barrier(g, cluster, cta_rank, comm_cluster);
 
     extern __shared__ int __shm[];
     shared_allocator allocator((int *)&__shm[0]);
@@ -940,11 +993,14 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
     }
     everyone::tma::cluster::sync();
 
-    if (cluster == COMM_CLUSTER) {
+    if (cluster == comm_cluster) {
         communication_role(g, cta_rank);
     } else {
+        const int worker_cluster = cluster < comm_cluster
+            ? cluster
+            : cluster - COMM_CLUSTERS;
         compute_and_reduce_role(
-            g, cta_rank, cluster - COMM_CLUSTERS,
+            g, cta_rank, worker_cluster,
             a_smem, b_smem, d_smem,
             inputs_arrived, inputs_finished, inputs_ready);
     }

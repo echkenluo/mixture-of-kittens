@@ -35,7 +35,8 @@ TOPK = 6
 LOCAL_TOKENS = 8
 LOCAL_EXPERTS = 64
 CAPACITY = 64
-COMPUTE_CLUSTERS = 7
+COMPUTE_CLUSTERS = 77
+ITERATIONS = 100
 MINIBATCH_ROWS = 64
 MACROBATCH_ROWS = 64
 SPIN_LIMIT = 1 << 29
@@ -182,6 +183,10 @@ def check_python_entry_contract() -> None:
         raise RuntimeError("terminal leased entry must not reacquire")
     if "workspace_lease_release" in leased_source:
         raise RuntimeError("terminal leased entry has a forbidden tail release")
+    if leased_source.count("workspace.comm_owner") != 2:
+        raise RuntimeError(
+            "terminal leased entry must pass comm_owner to prepare and full"
+        )
 
     orchestrator_source = inspect.getsource(megakernel_fp8_block_from_topk)
     orchestrator_order = (
@@ -322,27 +327,63 @@ def main() -> int:
             float("nan"), dtype=torch.bfloat16, device=device,
         )
         dist.barrier()
-        # Rank skew proves that resident clusters wait at the in-kernel EP4
-        # input barrier instead of consuming a peer's prior input bucket.
-        if rank == EP_SIZE - 1:
-            time.sleep(0.05)
-        megakernel_fp8_block(
-            workspace,
-            schedule,
-            x,
-            x_scale,
-            w13,
-            w13_scale,
-            w2,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            output,
-            minibatch_rows=MINIBATCH_ROWS,
-            macrobatch_rows=MACROBATCH_ROWS,
-            spin_limit=SPIN_LIMIT,
-        )
-        torch.cuda.synchronize(device)
+        owners: list[int] = []
+        for iteration in range(ITERATIONS):
+            # Rank skew on the first iteration proves that elected resident
+            # owners wait at the in-kernel EP4 input barrier instead of
+            # consuming a peer's prior input bucket.
+            if iteration == 0 and rank == EP_SIZE - 1:
+                time.sleep(0.05)
+            megakernel_fp8_block(
+                workspace,
+                schedule,
+                x,
+                x_scale,
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                output,
+                minibatch_rows=MINIBATCH_ROWS,
+                macrobatch_rows=MACROBATCH_ROWS,
+                spin_limit=SPIN_LIMIT,
+            )
+            torch.cuda.synchronize(device)
+            owner = int(workspace.comm_owner.item())
+            if not 0 <= owner <= COMPUTE_CLUSTERS:
+                raise RuntimeError(
+                    f"iteration {iteration} elected invalid comm owner {owner}"
+                )
+            owners.append(owner)
+            require_exact(
+                f"output_iteration_{iteration}",
+                expected_outputs[previous],
+                output,
+            )
+            iteration_state = {
+                "in_use": 0,
+                "next_logical_cluster": 65,
+                "producer_done": 65,
+                "comm_closed": 2,
+                "push_done": CAPACITY,
+                "reduce_done": LOCAL_TOKENS,
+                "terminate": 1,
+                "epilogue_done": 1 + COMPUTE_CLUSTERS,
+                "barrier_target": EP_SIZE * (iteration + 1),
+                "input_expected_scratch": EP_SIZE * (iteration + 1),
+            }
+            observed_iteration_state = {
+                name: int(getattr(workspace, name).item())
+                for name in iteration_state
+            }
+            if observed_iteration_state != iteration_state:
+                raise RuntimeError(
+                    f"iteration {iteration} closure mismatch: "
+                    f"expected={iteration_state}, "
+                    f"observed={observed_iteration_state}"
+                )
 
         require_exact("routed_x", reference["routed_x"], workspace.routed_x)
         require_exact(
@@ -366,28 +407,6 @@ def main() -> int:
             workspace.combine_buffer[: LOCAL_TOKENS * TOPK],
         )
         require_exact("output", expected_outputs[previous], output)
-
-        expected_state = {
-            "in_use": 0,
-            "next_logical_cluster": 65,
-            "producer_done": 65,
-            "comm_closed": 2,
-            "push_done": CAPACITY,
-            "reduce_done": LOCAL_TOKENS,
-            "terminate": 1,
-            "epilogue_done": 1 + COMPUTE_CLUSTERS,
-            "barrier_target": EP_SIZE,
-            "input_expected_scratch": EP_SIZE,
-        }
-        observed_state = {
-            name: int(getattr(workspace, name).item())
-            for name in expected_state
-        }
-        if observed_state != expected_state:
-            raise RuntimeError(
-                f"terminal closure mismatch: expected={expected_state}, "
-                f"observed={observed_state}"
-            )
         if not bool(torch.all(workspace.route_ready == 1).item()):
             raise RuntimeError("terminal route-ready closure is incomplete")
         if not bool(
@@ -407,8 +426,9 @@ def main() -> int:
             print(
                 "TERMINAL_PRODUCTION_EP4"
                 "|hidden=4096|intermediate=2048|topk=6|experts=64"
-                "|tokens=8|capacity=64|compute_clusters=7"
+                "|tokens=8|capacity=64|compute_clusters=77|iterations=100"
                 "|remote_dispatch=1|remote_combine=1|input_skew=1"
+                f"|comm_owners={','.join(map(str, sorted(set(owners))))}"
                 "|boundaries=bitwise_exact|output=bitwise_exact"
                 "|closure=producer,comm,push,reduce,terminate"
                 "|lease_release=kernel|candidate_launches=1|result=PASS",

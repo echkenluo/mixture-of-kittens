@@ -88,7 +88,8 @@ def check_source_contract() -> None:
         raise RuntimeError("full header must expose exactly one kernel")
     production_required = (
         "constexpr int MAX_EXPERTS = 256",
-        "production_input_barrier(g, cluster, cta_rank)",
+        "elect_comm_cluster(g, cluster, cta_rank)",
+        "production_input_barrier(g, cluster, cta_rank, comm_cluster)",
         "production_completion_epilogue(g, cta_rank)",
         "multimem.red.release.sys.global.add.u32",
         "atom.add.acq_rel.gpu.global.u32",
@@ -108,7 +109,8 @@ def check_source_contract() -> None:
     nullable_fields = (
         "barrier_flag", "barrier_target", "barrier_multicast_ptr",
         "input_expected_scratch", "in_use", "epilogue_done",
-        "producer_done", "push_done", "terminate", "trap_record",
+        "comm_owner", "producer_done", "push_done", "terminate",
+        "trap_record",
     )
     missing_null_defaults = [
         field for field in nullable_fields
@@ -121,11 +123,23 @@ def check_source_contract() -> None:
         )
     kernel_body = header[header.find("__global__ void kernel") :]
     comm_branch = kernel_body[
-        kernel_body.find("if (cluster == COMM_CLUSTER)") :
+        kernel_body.find("if (cluster == comm_cluster)") :
         kernel_body.find("production_completion_epilogue")
     ]
     if "communication_role(g, cta_rank);\n        return;" in comm_branch:
         raise RuntimeError("communication role bypasses common lease epilogue")
+    election_required = (
+        "UNCLAIMED_COMM = ~0u",
+        "atom.cas.acq_rel.gpu.global.b32",
+        "cluster < comm_cluster",
+        "cluster - COMM_CLUSTERS",
+        "SITE_TERMINAL_COMM_OWNER",
+    )
+    missing_election = [item for item in election_required if item not in header]
+    if missing_election:
+        raise RuntimeError(
+            f"dynamic resident comm election missing: {missing_election}"
+        )
     closure_required = (
         "g.producer_done) >= total_tasks",
         "g.comm_closed) >= 1u",

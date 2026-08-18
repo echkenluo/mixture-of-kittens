@@ -44,6 +44,10 @@ def main() -> int:
             raise RuntimeError("terminal route all-gather multicast is null")
         if workspace.worker_ticket.numel() != 7:
             raise RuntimeError("terminal worker-ticket shape mismatch")
+        if tuple(workspace.comm_owner.shape) != (1,):
+            raise RuntimeError("terminal comm-owner shape mismatch")
+        if int(workspace.comm_owner.item()) != -1:
+            raise RuntimeError("terminal comm owner must start unclaimed")
         if not workspace.trap_record.is_pinned() or workspace.trap_record.is_cuda:
             raise RuntimeError("terminal trap record is not host-mapped pinned memory")
 

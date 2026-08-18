@@ -221,6 +221,7 @@ class MoKFP8TerminalWorkspace:
     next_logical_cluster: torch.Tensor
     next_reduce_probe: torch.Tensor
     worker_ticket: torch.Tensor  # (compute_clusters,) compute-role publish slot
+    comm_owner: torch.Tensor  # (1,) elected physical comm cluster or -1
     producer_done: torch.Tensor
     comm_closed: torch.Tensor
     push_done: torch.Tensor
@@ -961,6 +962,7 @@ def create_fp8_terminal_workspace(
     worker_ticket = torch.zeros(
         compute_clusters, dtype=torch.int32, device=device
     )
+    comm_owner = torch.full((1,), -1, dtype=torch.int32, device=device)
     producer_done = torch.zeros(1, dtype=torch.int32, device=device)
     comm_closed = torch.zeros(1, dtype=torch.int32, device=device)
     push_done = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1047,6 +1049,7 @@ def create_fp8_terminal_workspace(
         next_logical_cluster=next_logical_cluster,
         next_reduce_probe=next_reduce_probe,
         worker_ticket=worker_ticket,
+        comm_owner=comm_owner,
         producer_done=producer_done,
         comm_closed=comm_closed,
         push_done=push_done,
@@ -1789,6 +1792,7 @@ def _validate_terminal_forward(
     for name, value in (
         ("next_logical_cluster", workspace.next_logical_cluster),
         ("next_reduce_probe", workspace.next_reduce_probe),
+        ("comm_owner", workspace.comm_owner),
         ("producer_done", workspace.producer_done),
         ("comm_closed", workspace.comm_closed),
         ("push_done", workspace.push_done),
@@ -1962,6 +1966,7 @@ def megakernel_fp8_block_leased(
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
         workspace.worker_ticket,
+        workspace.comm_owner,
         workspace.producer_done,
         workspace.comm_closed,
         workspace.push_done,
@@ -2006,6 +2011,7 @@ def megakernel_fp8_block_leased(
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
         workspace.worker_ticket,
+        workspace.comm_owner,
         workspace.producer_done,
         workspace.comm_closed,
         workspace.push_done,

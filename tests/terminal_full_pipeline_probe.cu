@@ -191,7 +191,7 @@ int resident_clusters() {
     CUDACHECK(cudaOccupancyMaxActiveClusters(
         &clusters, full::kernel<gemm_problem>, &config));
     TORCH_CHECK(clusters >= full::COMM_CLUSTERS + 1,
-                "full terminal kernel cannot co-reside fixed comm+compute");
+                "full terminal kernel cannot co-reside comm+compute");
     return clusters;
 }
 
