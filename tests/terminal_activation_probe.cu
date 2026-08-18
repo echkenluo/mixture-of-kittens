@@ -168,9 +168,13 @@ std::vector<int64_t> attributes() {
                     &occupancy, cluster_kernel, &config) == cudaSuccess,
                 "cluster occupancy query failed");
     return {
-        reference.numRegs, reference.sharedSizeBytes, reference.localSizeBytes,
-        clustered.numRegs, clustered.sharedSizeBytes, clustered.localSizeBytes,
-        occupancy,
+        static_cast<int64_t>(reference.numRegs),
+        static_cast<int64_t>(reference.sharedSizeBytes),
+        static_cast<int64_t>(reference.localSizeBytes),
+        static_cast<int64_t>(clustered.numRegs),
+        static_cast<int64_t>(clustered.sharedSizeBytes),
+        static_cast<int64_t>(clustered.localSizeBytes),
+        static_cast<int64_t>(occupancy),
     };
 }
 
