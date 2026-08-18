@@ -388,10 +388,13 @@ def run_device(args: argparse.Namespace) -> None:
                 make_route_contract(rows, local_tokens)
             )
             num_tokens = torch.tensor([rows], dtype=torch.int32, device="cuda")
-            tokens_per_expert = torch.full(
-                (local_experts,), rows // local_experts,
-                dtype=torch.int32, device="cuda"
+            # The production scheduler pads each expert segment to M64, so a
+            # compute tile never spans experts.  Keep the real E_local=64
+            # weight shape while activating one homogeneous expert per tile.
+            tokens_per_expert = torch.zeros(
+                local_experts, dtype=torch.int32, device="cuda"
             )
+            tokens_per_expert[: rows // 64] = 64
             topk_ids = torch.full(
                 (4, local_tokens, 6), -1, dtype=torch.int32, device="cuda"
             )
