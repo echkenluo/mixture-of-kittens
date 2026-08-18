@@ -843,10 +843,19 @@ def run_device(args: argparse.Namespace) -> None:
                             f"ep_rank={ep_rank} N={compute_clusters}"
                         )
                     probes = int(state["next_reduce_probe"].item())
-                    if probes < 2 * total_tasks:
+                    # Resident compute samples tickets 0,4,8,...; owner and
+                    # drain paths can add more probes, but their exact count is
+                    # schedule-dependent.  Require the deterministic producer
+                    # cadence and enough round-robin probes to cover the local
+                    # token domain instead of the obsolete 2x-ticket heuristic.
+                    minimum_probes = max(
+                        local_tokens, (total_tasks + 3) // 4
+                    )
+                    if probes < minimum_probes:
                         raise RuntimeError(
                             f"missing task-boundary probes rows={rows} "
-                            f"ep_rank={ep_rank} N={compute_clusters}: {probes}"
+                            f"ep_rank={ep_rank} N={compute_clusters}: "
+                            f"{probes} < {minimum_probes}"
                         )
                     witness = int(state["overlap_witness"].item())
                     required_witness = 0
