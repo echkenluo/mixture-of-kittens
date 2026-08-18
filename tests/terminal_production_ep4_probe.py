@@ -35,8 +35,9 @@ TOPK = 6
 LOCAL_TOKENS = 8
 LOCAL_EXPERTS = 64
 CAPACITY = 64
-COMPUTE_CLUSTERS = 77
-ITERATIONS = 100
+COMPUTE_CLUSTERS = int(os.environ.get("MOK_TERMINAL_EP4_COMPUTE_CLUSTERS", "77"))
+ITERATIONS = int(os.environ.get("MOK_TERMINAL_EP4_ITERATIONS", "100"))
+REPORT_PROGRESS = os.environ.get("MOK_TERMINAL_EP4_REPORT_PROGRESS") == "1"
 MINIBATCH_ROWS = 64
 MACROBATCH_ROWS = 64
 SPIN_LIMIT = 1 << 29
@@ -329,6 +330,8 @@ def main() -> int:
         dist.barrier()
         owners: list[int] = []
         for iteration in range(ITERATIONS):
+            if REPORT_PROGRESS and rank == 0:
+                print(f"TERMINAL_EP4_ITERATION|index={iteration}|state=start", flush=True)
             # Rank skew on the first iteration proves that elected resident
             # owners wait at the in-kernel EP4 input barrier instead of
             # consuming a peer's prior input bucket.
@@ -351,6 +354,8 @@ def main() -> int:
                 spin_limit=SPIN_LIMIT,
             )
             torch.cuda.synchronize(device)
+            if REPORT_PROGRESS and rank == 0:
+                print(f"TERMINAL_EP4_ITERATION|index={iteration}|state=end", flush=True)
             owner = int(workspace.comm_owner.item())
             if not 0 <= owner <= COMPUTE_CLUSTERS:
                 raise RuntimeError(
