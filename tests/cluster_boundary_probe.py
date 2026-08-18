@@ -54,7 +54,9 @@ def main() -> int:
     module = build_extension()
     rows = []
     for clusters in csv_ints(args.clusters):
-        descriptor = torch.zeros(clusters, dtype=torch.int32, device="cuda")
+        # Two phase slots avoid rank 0 overwriting the descriptor while its
+        # paired CTA is still loading the current task after the boundary.
+        descriptor = torch.zeros(clusters * 2, dtype=torch.int32, device="cuda")
         output = torch.empty(clusters * 2 * 128, dtype=torch.int32, device="cuda")
         for tasks in csv_ints(args.tasks):
             for work in csv_ints(args.work):

@@ -30,15 +30,16 @@ __global__ void double_barrier_kernel(unsigned int *descriptor,
                                       int work_iterations) {
     const int cluster = blockIdx.x / 2;
     const int cta_rank = blockIdx.x & 1;
+    unsigned int *cluster_descriptor = descriptor + cluster * 2;
     const int output_index = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t accumulator = static_cast<uint32_t>(output_index + 1);
     cg::cluster_group cluster_group = cg::this_cluster();
 
     for (int task = 0; task < tasks; ++task) {
         if (cta_rank == 0 && threadIdx.x == 0)
-            descriptor[cluster] = static_cast<unsigned int>(task);
+            cluster_descriptor[task & 1] = static_cast<unsigned int>(task);
         cluster_group.sync();
-        const uint32_t current = descriptor[cluster];
+        const uint32_t current = cluster_descriptor[task & 1];
         accumulator = do_work(accumulator, current, work_iterations);
         cluster_group.sync();
     }
@@ -54,17 +55,23 @@ __global__ void single_boundary_kernel(unsigned int *descriptor,
                                        int work_iterations) {
     const int cluster = blockIdx.x / 2;
     const int cta_rank = blockIdx.x & 1;
+    unsigned int *cluster_descriptor = descriptor + cluster * 2;
     const int output_index = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t accumulator = static_cast<uint32_t>(output_index + 1);
     cg::cluster_group cluster_group = cg::this_cluster();
 
-    if (cta_rank == 0 && threadIdx.x == 0) descriptor[cluster] = 0u;
+    if (cta_rank == 0 && threadIdx.x == 0) cluster_descriptor[0] = 0u;
     cluster_group.sync();
     for (int task = 0; task < tasks; ++task) {
-        const uint32_t current = descriptor[cluster];
+        // Ping-pong slots are required: rank 0 may finish the current work
+        // before the peer CTA has loaded its descriptor.  Publishing into
+        // the other phase slot avoids a read-after-write race without a
+        // second cluster barrier.
+        const uint32_t current = cluster_descriptor[task & 1];
         accumulator = do_work(accumulator, current, work_iterations);
         if (cta_rank == 0 && threadIdx.x == 0)
-            descriptor[cluster] = static_cast<unsigned int>(task + 1);
+            cluster_descriptor[(task + 1) & 1] =
+                static_cast<unsigned int>(task + 1);
         // This closes the current task and publishes the next descriptor.
         cluster_group.sync();
     }
@@ -85,9 +92,12 @@ void run_cluster_boundary_probe(const at::Tensor &descriptor,
                 "tasks must be in [1, 2^20]");
     TORCH_CHECK(work_iterations >= 0 && work_iterations <= (1 << 20),
                 "work_iterations must be in [0, 2^20]");
-    const int clusters = static_cast<int>(descriptor.numel());
+    TORCH_CHECK(descriptor.numel() % 2 == 0,
+                "descriptor must contain two phase slots per cluster");
+    const int clusters = static_cast<int>(descriptor.numel() / 2);
     TORCH_CHECK(clusters > 0 && output.numel() == clusters * 2 * THREADS,
-                "output must contain clusters * 2 * 128 int32 values");
+                "output must contain (descriptor.numel()/2) * 2 * 128 "
+                "int32 values");
     TORCH_CHECK(descriptor.device() == output.device(),
                 "descriptor and output must share one device");
 
