@@ -352,9 +352,7 @@ void run_full(
         terminal::HIDDEN_SIZE / 64,
     };
 
-    full::globals<gemm_problem> g{};
-    g.w13 = w13_problem;
-    g.w2 = w2_problem;
+    full::globals<gemm_problem> g(w13_problem, w2_problem);
     g.activation = {
         reinterpret_cast<const __nv_bfloat16 *>(gate_up.data_ptr()),
         reinterpret_cast<uint8_t *>(hidden.data_ptr()),

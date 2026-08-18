@@ -42,6 +42,12 @@ template <typename GemmProblem>
 struct globals {
     GemmProblem w13;
     GemmProblem w2;
+
+    __host__ globals(
+            const GemmProblem &w13_problem,
+            const GemmProblem &w2_problem)
+        : w13(w13_problem), w2(w2_problem) {}
+
     compute::activation_problem activation;
     compute::readiness ready;
 
