@@ -30,6 +30,23 @@ __device__ __forceinline__ void reduce_element(
         __float2bfloat16_rn(accumulator);
 }
 
+__device__ __forceinline__ void reduce_element_fma(
+    const __nv_bfloat16 *combine, const float *weights,
+    __nv_bfloat16 *output, int token, int column, int topk, int hidden) {
+    const size_t route_base = static_cast<size_t>(token) * topk;
+    float accumulator = __fmul_rn(
+        __bfloat162float(combine[route_base * hidden + column]),
+        weights[route_base]);
+    for (int route = 1; route < topk; ++route) {
+        accumulator = __fmaf_rn(
+            __bfloat162float(
+                combine[(route_base + route) * hidden + column]),
+            weights[route_base + route], accumulator);
+    }
+    output[static_cast<size_t>(token) * hidden + column] =
+        __float2bfloat16_rn(accumulator);
+}
+
 __global__ __launch_bounds__(2 * kThreads, 1)
 void reference_kernel(const __nv_bfloat16 *combine, const float *weights,
                       __nv_bfloat16 *output, int tokens, int topk,
@@ -59,8 +76,22 @@ __global__ void reduce_kernel(const __nv_bfloat16 *combine,
             combine, weights, output, token, column, topk, hidden);
 }
 
+__cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
+__global__ void reduce_fma_kernel(const __nv_bfloat16 *combine,
+                                  const float *weights,
+                                  __nv_bfloat16 *output, int tokens,
+                                  int topk, int hidden) {
+    const int token = blockIdx.x / 2;
+    const int cta_rank = blockIdx.x & 1;
+    const int worker = cta_rank * kThreads + threadIdx.x;
+    if (token >= tokens) return;
+    for (int column = worker; column < hidden; column += 2 * kThreads)
+        reduce_element_fma(
+            combine, weights, output, token, column, topk, hidden);
+}
+
 void run(const at::Tensor &combine, const at::Tensor &weights,
-         const at::Tensor &output, bool clustered) {
+         const at::Tensor &output, int64_t mode) {
     TORCH_CHECK(combine.is_cuda()
                     && combine.scalar_type() == at::kBFloat16
                     && combine.is_contiguous() && combine.dim() == 2,
@@ -91,8 +122,14 @@ void run(const at::Tensor &combine, const at::Tensor &weights,
     const auto *combine_ptr =
         reinterpret_cast<const __nv_bfloat16 *>(combine.data_ptr());
     auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.data_ptr());
-    if (clustered) {
+    TORCH_CHECK(mode >= 0 && mode <= 2, "mode must be 0, 1, or 2");
+    if (mode == 1) {
         reduce_kernel<<<static_cast<int>(tokens) * 2, kThreads, 0, stream>>>(
+            combine_ptr, weights.data_ptr<float>(), output_ptr,
+            static_cast<int>(tokens), static_cast<int>(topk),
+            static_cast<int>(hidden));
+    } else if (mode == 2) {
+        reduce_fma_kernel<<<static_cast<int>(tokens) * 2, kThreads, 0, stream>>>(
             combine_ptr, weights.data_ptr<float>(), output_ptr,
             static_cast<int>(tokens), static_cast<int>(topk),
             static_cast<int>(hidden));

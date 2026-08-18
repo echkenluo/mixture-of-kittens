@@ -137,6 +137,54 @@ def main() -> int:
                     candidate_scale.view(torch.int32),
                 )
                 if not sglang_fp8_exact or not sglang_scale_exact:
+                    fp8_diff = (
+                        sglang_output.view(torch.uint8)
+                        != candidate.view(torch.uint8)
+                    )
+                    scale_diff = (
+                        sglang_scale.view(torch.int32)
+                        != candidate_scale.view(torch.int32)
+                    )
+                    fp8_mismatch = int(fp8_diff.sum().item())
+                    scale_mismatch = int(scale_diff.sum().item())
+                    scale_delta = (
+                        sglang_scale.float() - candidate_scale.float()
+                    ).abs()
+                    first_scale = torch.nonzero(scale_diff, as_tuple=False)[:8]
+                    scale_samples = []
+                    for row_index, group_index in first_scale.tolist():
+                        scale_samples.append(
+                            {
+                                "row": row_index,
+                                "group": group_index,
+                                "sglang": float(
+                                    sglang_scale[row_index, group_index].item()
+                                ),
+                                "candidate": float(
+                                    candidate_scale[row_index, group_index].item()
+                                ),
+                                "sglang_bits": int(
+                                    sglang_scale.view(torch.int32)[
+                                        row_index, group_index
+                                    ].item()
+                                ),
+                                "candidate_bits": int(
+                                    candidate_scale.view(torch.int32)[
+                                        row_index, group_index
+                                    ].item()
+                                ),
+                            }
+                        )
+                    print(
+                        "TERMINAL_ACTIVATION_SGLANG_DIFF"
+                        f"|rows={rows}|seed={seed}"
+                        f"|fp8_mismatch={fp8_mismatch}"
+                        f"|scale_mismatch={scale_mismatch}"
+                        f"|scale_max_abs={float(scale_delta.max().item()):.9g}"
+                        "|scale_samples="
+                        + json.dumps(scale_samples, sort_keys=True),
+                        flush=True,
+                    )
                     raise RuntimeError(
                         f"SGLang activation mismatch rows={rows} seed={seed} "
                         f"fp8_exact={sglang_fp8_exact} "

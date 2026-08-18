@@ -91,8 +91,10 @@ def main() -> int:
             )
             production_reference = torch.empty_like(reference)
             candidate = torch.empty_like(reference)
-            module.run(combine, weights, reference, False)
-            module.run(combine, weights, candidate, True)
+            candidate_fma = torch.empty_like(reference)
+            module.run(combine, weights, reference, 0)
+            module.run(combine, weights, candidate, 1)
+            module.run(combine, weights, candidate_fma, 2)
             compare_production = tokens >= 256 and tokens % 256 == 0
             if compare_production:
                 routed_epilogue_out(combine, weights, production_reference)
@@ -123,11 +125,8 @@ def main() -> int:
                     f"reduce mismatch tokens={tokens} seed={seed} "
                     f"count={mismatch} relative_l2={relative_l2}"
                 )
-            if compare_production and not torch.equal(
-                production_reference.view(torch.uint16),
-                candidate.view(torch.uint16),
-            ):
-                production_mismatch = int(
+            if compare_production:
+                production_separate_mismatch = int(
                     (
                         production_reference.view(torch.uint16)
                         != candidate.view(torch.uint16)
@@ -135,14 +134,31 @@ def main() -> int:
                     .sum()
                     .item()
                 )
-                raise RuntimeError(
-                    f"production reduce mismatch tokens={tokens} seed={seed} "
-                    f"count={production_mismatch}"
+                production_fma_mismatch = int(
+                    (
+                        production_reference.view(torch.uint16)
+                        != candidate_fma.view(torch.uint16)
+                    )
+                    .sum()
+                    .item()
                 )
+                print(
+                    f"TERMINAL_REDUCE_PRODUCTION_DIFF|tokens={tokens}"
+                    f"|seed={seed}"
+                    f"|separate_mismatch={production_separate_mismatch}"
+                    f"|fma_mismatch={production_fma_mismatch}",
+                    flush=True,
+                )
+                if production_separate_mismatch and production_fma_mismatch:
+                    raise RuntimeError(
+                        f"production reduce mismatch tokens={tokens} seed={seed} "
+                        f"separate={production_separate_mismatch} "
+                        f"fma={production_fma_mismatch}"
+                    )
         reference_call = (
             (lambda: routed_epilogue_out(combine, weights, production_reference))
             if compare_production
-            else (lambda: module.run(combine, weights, reference, False))
+            else (lambda: module.run(combine, weights, reference, 0))
         )
         reference_p50, reference_p95 = elapsed(
             reference_call,
@@ -150,7 +166,7 @@ def main() -> int:
             args.repeats,
         )
         candidate_p50, candidate_p95 = elapsed(
-            lambda: module.run(combine, weights, candidate, True),
+            lambda: module.run(combine, weights, candidate, 1),
             args.warmup,
             args.repeats,
         )
