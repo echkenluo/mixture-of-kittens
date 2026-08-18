@@ -21,6 +21,7 @@
 
 #include "sm90_fp8_block_gemm_core.cuh"
 #include "sm90_fp8_block_routed.cuh"
+#include "sm90_fp8_block_terminal_comm_primitives.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 
 namespace mok_sm90::fp8_block_gemm_combine {
@@ -86,33 +87,17 @@ __device__ __forceinline__ void fused_arrive(const globals &g) {
 // version's dedicated push clusters occupied SM slots for the whole kernel
 // and taxed the GEMM ~11%.
 __device__ __forceinline__ void push_block(const globals &g, int m_tile) {
-    const int device_rows = g.num_tokens[0];
-    const int valid_rows = device_rows < g.schedule_capacity
-                               ? device_rows
-                               : g.schedule_capacity;
+    const int valid_rows = fp8_block_terminal_comm::bounded_valid_rows(g);
     const int block_base = m_tile * 64;
     const int block_rows =
         valid_rows - block_base < 64 ? valid_rows - block_base : 64;
-    const int row_vectors =
-        g.hidden_size * 2 / static_cast<int>(sizeof(uint4));  // BF16 rows
 
     constexpr int WARPS = THREADS / 32;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     for (int r = warp; r < block_rows; r += WARPS) {
         const int row = block_base + r;
-        const int peer_rank = g.schedule_peer_rank[row];
-        const int peer_token_idx = g.schedule_peer_token_idx[row];
-        if (peer_rank < 0 || peer_rank >= g.ep_size || peer_token_idx < 0
-            || peer_token_idx >= g.num_local_tokens * g.topk)
-            continue;
-        const auto *src = reinterpret_cast<const uint4 *>(g.routed_y)
-                          + static_cast<size_t>(row) * row_vectors;
-        auto *dst = reinterpret_cast<uint4 *>(g.combine_peer[peer_rank])
-                    + static_cast<size_t>(peer_token_idx) * row_vectors;
-        #pragma unroll 4
-        for (int i = lane; i < row_vectors; i += 32)
-            dst[i] = src[i];
+        fp8_block_terminal_comm::push_routed_row(g, row, lane);
     }
     __syncthreads();
     if (threadIdx.x == 0) {

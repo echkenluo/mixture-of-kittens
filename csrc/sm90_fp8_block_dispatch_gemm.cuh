@@ -28,6 +28,7 @@
 
 #include "sm90_fp8_block_gemm_core.cuh"
 #include "sm90_fp8_block_routed.cuh"
+#include "sm90_fp8_block_terminal_comm_primitives.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 
 namespace mok_sm90::fp8_block_dispatch_gemm {
@@ -191,21 +192,11 @@ __device__ __forceinline__ void copy_task(const globals &g, unsigned int ticket,
     // __syncthreads above also orders any previous task's readers before
     // this rebuild.
     __shared__ int expert_row_end[MAX_LOCAL_EXPERTS];
-    if (threadIdx.x == 0) {
-        int offset = 0;
-        for (int e = 0; e < g.num_local_experts; ++e) {
-            offset += g.tokens_per_expert[e];
-            expert_row_end[e] = offset;
-        }
-    }
+    if (threadIdx.x == 0)
+        fp8_block_terminal_comm::build_expert_row_ends(g, expert_row_end);
     __syncthreads();
 
-    const int device_rows = g.num_tokens[0];
-    const int valid_rows = device_rows < g.schedule_capacity
-                               ? device_rows
-                               : g.schedule_capacity;
-    const int fp8_vectors = g.hidden_size / static_cast<int>(sizeof(uint4));
-    const uint4 zero{0, 0, 0, 0};
+    const int valid_rows = fp8_block_terminal_comm::bounded_valid_rows(g);
 
     // One row per warp: rows fly concurrently with no block-wide barrier in
     // the loop.  __syncwarp orders the lanes' row stores before lane 0's
@@ -216,56 +207,8 @@ __device__ __forceinline__ void copy_task(const globals &g, unsigned int ticket,
     const int lane = threadIdx.x & 31;
     for (int row = copy_cta_idx * WARPS + warp; row < valid_rows;
          row += copy_cta_count * WARPS) {
-        const int peer_rank = g.schedule_peer_rank[row];
-        const int peer_token_idx = g.schedule_peer_token_idx[row];
-        const bool valid = peer_rank >= 0 && peer_rank < g.ep_size
-                           && peer_token_idx >= 0
-                           && peer_token_idx < g.num_local_tokens * g.topk;
-        auto *dst_vectors = reinterpret_cast<uint4 *>(g.routed_x)
-                            + static_cast<size_t>(row) * fp8_vectors;
-        float *dst_scale = g.routed_x_scale
-                           + static_cast<size_t>(row) * g.scale_columns;
-        if (valid) {
-            const int source_row = peer_token_idx / g.topk;
-            const auto *src_vectors =
-                reinterpret_cast<const uint4 *>(g.x_peer[peer_rank])
-                + static_cast<size_t>(source_row) * fp8_vectors;
-            const float *src_scale =
-                g.x_scale_peer[peer_rank]
-                + static_cast<size_t>(source_row) * g.scale_columns;
-            // Stage through registers: all of a chunk's remote loads issue
-            // before any store, so their latencies overlap.  The interleaved
-            // load/store form serialized on the possible dst/src alias.
-            constexpr int VEC_CHUNK = 8;  // 32 lanes x 8 x 16B = 4KB per pass
-            uint4 buffer[VEC_CHUNK];
-            for (int base = 0; base < fp8_vectors; base += 32 * VEC_CHUNK) {
-                #pragma unroll
-                for (int j = 0; j < VEC_CHUNK; ++j) {
-                    const int i = base + lane + j * 32;
-                    if (i < fp8_vectors) buffer[j] = src_vectors[i];
-                }
-                #pragma unroll
-                for (int j = 0; j < VEC_CHUNK; ++j) {
-                    const int i = base + lane + j * 32;
-                    if (i < fp8_vectors) dst_vectors[i] = buffer[j];
-                }
-            }
-            for (int i = lane; i < g.scale_columns; i += 32)
-                dst_scale[i] = src_scale[i];
-        } else {
-            #pragma unroll 4
-            for (int i = lane; i < fp8_vectors; i += 32)
-                dst_vectors[i] = zero;
-            for (int i = lane; i < g.scale_columns; i += 32)
-                dst_scale[i] = 0.0f;
-        }
-        if (lane == 0) {
-            int expert = 0;
-            while (expert < g.num_local_experts - 1
-                   && row >= expert_row_end[expert])
-                ++expert;
-            g.m_indices[row] = expert;
-        }
+        fp8_block_terminal_comm::dispatch_copy_row(
+            g, expert_row_end, row, lane);
         __syncwarp();
         if (lane == 0) {
             asm volatile("{red.release.gpu.global.add.u32 [%0], 1;}" ::
