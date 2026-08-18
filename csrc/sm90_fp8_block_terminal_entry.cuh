@@ -2,9 +2,9 @@
 
 #if defined(KITTENS_SM90)
 
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <torch/extension.h>
 
 #include <algorithm>
 #include <array>
