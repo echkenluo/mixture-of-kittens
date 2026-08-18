@@ -10,11 +10,15 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "csrc" / "sm90_fp8_block_terminal_tma_comm.cuh"
 FULL = ROOT / "csrc" / "sm90_fp8_block_terminal_full.cuh"
 ENTRY = ROOT / "csrc" / "sm90_fp8_block_terminal_entry.cuh"
+BINDINGS = ROOT / "csrc" / "bindings.cu"
 DECODER = ROOT / "csrc" / "sm90_fp8_block_megakernel.cuh"
 COMPUTE = ROOT / "csrc" / "sm90_fp8_block_terminal_compute.cuh"
 COMM = ROOT / "csrc" / "sm90_fp8_block_terminal_comm_primitives.cuh"
 ORIGINAL = ROOT / "csrc" / "mok_megakernel.cuh"
 FUNCTIONAL = ROOT / "mok" / "functional.py"
+OPS = ROOT / "mok" / "ops.py"
+PY_CONTRACT = ROOT / "mok" / "_terminal_tma_contract.py"
+CPP_CONTRACT = ROOT / "csrc" / "sm90_fp8_block_terminal_tma_contract.cuh"
 
 
 def require(text: str, needle: str, label: str) -> None:
@@ -39,11 +43,15 @@ def main() -> None:
     header = HEADER.read_text(encoding="utf-8")
     full = FULL.read_text(encoding="utf-8")
     entry = ENTRY.read_text(encoding="utf-8")
+    bindings = BINDINGS.read_text(encoding="utf-8")
     decoder = DECODER.read_text(encoding="utf-8")
     compute = COMPUTE.read_text(encoding="utf-8")
     comm = COMM.read_text(encoding="utf-8")
     original = ORIGINAL.read_text(encoding="utf-8")
     functional = FUNCTIONAL.read_text(encoding="utf-8")
+    ops = OPS.read_text(encoding="utf-8")
+    py_contract = PY_CONTRACT.read_text(encoding="utf-8")
+    cpp_contract = CPP_CONTRACT.read_text(encoding="utf-8")
 
     for invariant in (
         "CTA_ROWS == 4",
@@ -217,13 +225,83 @@ def main() -> None:
         "terminal::EP_SIZE",
         "terminal::TOP_K",
         "!x_buffer.is_alias_of(routed_x)",
+        "!x_buffer.is_alias_of(routed_x_scale)",
+        "!x_scale_buffer.is_alias_of(routed_x)",
         "!x_scale_buffer.is_alias_of(routed_x_scale)",
+        "x_bytes_per_rank",
+        "x_scale_bytes_per_rank",
+        "routed_x_storage_bytes",
+        "routed_x_scale_storage_bytes",
+        "tma_contract::is_raw_bulk_aligned",
+        "tma_contract::valid_byte_interval",
+        "tma_contract::byte_intervals_overlap",
+        "for (int peer = 0; peer < terminal::EP_SIZE; ++peer)",
     ):
         require(entry, needle, "host launch/shape gate")
-    require(
-        functional,
-        "terminal dispatch source and routed destination storage must be",
-        "Python disjoint-storage gate",
+    compact_entry = " ".join(entry.split())
+    for source, source_name in (
+        ("x_interval", "x_ptrs"),
+        ("x_scale_interval", "x_scale_ptrs"),
+    ):
+        for destination, destination_name in (
+            ("routed_x_interval", "routed_x"),
+            ("routed_x_scale_interval", "routed_x_scale"),
+        ):
+            require(
+                compact_entry,
+                (
+                    "check_disjoint_raw_bulk_intervals( "
+                    f'{source}, "{source_name}", peer, {destination}, '
+                    f'"{destination_name}");'
+                ),
+                f"native {source} versus {destination}",
+            )
+    for needle in (
+        "x_buffer_bytes_per_rank",
+        "x_scale_buffer_bytes_per_rank",
+        "untyped_storage().nbytes()",
+        "validate_terminal_tma_dispatch_layout(",
+    ):
+        require(functional, needle, "functional full-storage gate")
+    for needle in (
+        "x_bytes_per_rank",
+        "x_scale_bytes_per_rank",
+        "untyped_storage().nbytes()",
+        "validate_terminal_tma_dispatch_layout(",
+    ):
+        require(ops, needle, "ops full-storage gate")
+    for needle in (
+        "RAW_BULK_ALIGNMENT = 16",
+        "pointer + size",
+        "_overlaps(source, destination)",
+        "for destination_name, destination in destinations",
+    ):
+        require(py_contract, needle, "Python interval contract")
+    for needle in (
+        "RAW_BULK_ALIGNMENT = 16u",
+        "valid_byte_interval",
+        "byte_intervals_overlap",
+    ):
+        require(cpp_contract, needle, "native interval contract")
+    terminal_binding = bindings[
+        bindings.index('m.def("fp8_block_megakernel_out"') :
+        bindings.index('m.def("fp8_block_megakernel_prewarm"')
+    ]
+    require_order(
+        terminal_binding,
+        (
+            'pybind11::arg("x_buffer")',
+            'pybind11::arg("x_ptrs")',
+            'pybind11::arg("x_bytes_per_rank")',
+            'pybind11::arg("x_scale_buffer")',
+            'pybind11::arg("x_scale_ptrs")',
+            'pybind11::arg("x_scale_bytes_per_rank")',
+            'pybind11::arg("routed_x")',
+            'pybind11::arg("routed_x_storage_bytes")',
+            'pybind11::arg("routed_x_scale")',
+            'pybind11::arg("routed_x_scale_storage_bytes")',
+        ),
+        "pybind terminal TMA metadata ABI",
     )
 
     print(
@@ -232,6 +310,7 @@ def main() -> None:
         "|staging_bytes=16896|workspace=wgmma_shared"
         "|store_drain=issuer_wait0|x_ready=device_release"
         "|comm_cursor=dense_dcd|owner_help=preserved"
+        "|alignment_gate=16|source_destination_pairs=16"
         "|combine_tma=0|runtime_fallback=0|result=PASS"
     )
 

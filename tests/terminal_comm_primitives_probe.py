@@ -14,6 +14,8 @@ SOURCE = Path(__file__).with_suffix(".cu")
 HEADER = REPO_ROOT / "csrc" / "sm90_fp8_block_terminal_comm_primitives.cuh"
 ENTRY = REPO_ROOT / "csrc" / "sm90_fp8_block_terminal_entry.cuh"
 FUNCTIONAL = REPO_ROOT / "mok" / "functional.py"
+OPS = REPO_ROOT / "mok" / "ops.py"
+PY_CONTRACT = REPO_ROOT / "mok" / "_terminal_tma_contract.py"
 K1 = REPO_ROOT / "csrc" / "sm90_fp8_block_dispatch_gemm.cuh"
 K2 = REPO_ROOT / "csrc" / "sm90_fp8_block_gemm_combine.cuh"
 
@@ -42,13 +44,33 @@ def check_static_contract() -> None:
     matches = [pattern for pattern in forbidden if re.search(pattern, header)]
     if matches:
         raise RuntimeError(f"scheduling/publication leaked into helper header: {matches}")
-    if "!x_buffer.is_alias_of(routed_x)" not in ENTRY.read_text(encoding="utf-8"):
-        raise RuntimeError("native entry must reject dispatch storage aliasing")
+    entry = ENTRY.read_text(encoding="utf-8")
+    native_gates = (
+        "!x_buffer.is_alias_of(routed_x)",
+        "!x_buffer.is_alias_of(routed_x_scale)",
+        "!x_scale_buffer.is_alias_of(routed_x)",
+        "!x_scale_buffer.is_alias_of(routed_x_scale)",
+        "tma_contract::is_raw_bulk_aligned",
+        "tma_contract::byte_intervals_overlap",
+        "x_bytes_per_rank",
+        "x_scale_bytes_per_rank",
+    )
+    missing_native = [needle for needle in native_gates if needle not in entry]
+    if missing_native:
+        raise RuntimeError(
+            f"native entry lacks raw bulk-TMA storage gates: {missing_native}"
+        )
+    python_entry = (
+        FUNCTIONAL.read_text(encoding="utf-8")
+        + OPS.read_text(encoding="utf-8")
+    )
     if (
-        "terminal dispatch source and routed destination storage must be"
-        not in FUNCTIONAL.read_text(encoding="utf-8")
+        "validate_terminal_tma_dispatch_layout(" not in python_entry
+        or "untyped_storage().nbytes()" not in python_entry
+        or "RAW_BULK_ALIGNMENT = 16"
+        not in PY_CONTRACT.read_text(encoding="utf-8")
     ):
-        raise RuntimeError("Python entry must reject dispatch storage aliasing")
+        raise RuntimeError("Python entry lacks raw bulk-TMA storage gates")
     k1 = K1.read_text(encoding="utf-8")
     k2 = K2.read_text(encoding="utf-8")
     required = (

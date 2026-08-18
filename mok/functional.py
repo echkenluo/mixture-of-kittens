@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from ._terminal_tma_contract import validate_terminal_tma_dispatch_layout
 from .ops import (
     all_gather_top_experts,
     barrier_all,
@@ -183,9 +184,11 @@ class MoKFP8TerminalWorkspace:
     x_buffer: torch.Tensor
     x_buffer_handle: Any
     x_buffer_ptrs: list[int]
+    x_buffer_bytes_per_rank: list[int]
     x_scale_buffer: torch.Tensor
     x_scale_buffer_handle: Any
     x_scale_buffer_ptrs: list[int]
+    x_scale_buffer_bytes_per_rank: list[int]
     combine_buffer: torch.Tensor
     combine_buffer_handle: Any
     combine_buffer_ptrs: list[int]
@@ -838,6 +841,10 @@ def create_fp8_terminal_workspace(
         int(x_buffer_handle.buffer_ptrs[peer_rank])
         for peer_rank in range(ep_size)
     ]
+    x_buffer_bytes_per_rank = [
+        int(x_buffer.untyped_storage().nbytes())
+        for _ in range(ep_size)
+    ]
 
     x_scale_buffer = symm_mem.empty(
         num_local_tokens,
@@ -849,6 +856,10 @@ def create_fp8_terminal_workspace(
     x_scale_buffer_ptrs = [
         int(x_scale_buffer_handle.buffer_ptrs[peer_rank])
         for peer_rank in range(ep_size)
+    ]
+    x_scale_buffer_bytes_per_rank = [
+        int(x_scale_buffer.untyped_storage().nbytes())
+        for _ in range(ep_size)
     ]
 
     combine_buffer = symm_mem.empty(
@@ -1035,9 +1046,11 @@ def create_fp8_terminal_workspace(
         x_buffer=x_buffer,
         x_buffer_handle=x_buffer_handle,
         x_buffer_ptrs=x_buffer_ptrs,
+        x_buffer_bytes_per_rank=x_buffer_bytes_per_rank,
         x_scale_buffer=x_scale_buffer,
         x_scale_buffer_handle=x_scale_buffer_handle,
         x_scale_buffer_ptrs=x_scale_buffer_ptrs,
+        x_scale_buffer_bytes_per_rank=x_scale_buffer_bytes_per_rank,
         combine_buffer=combine_buffer,
         combine_buffer_handle=combine_buffer_handle,
         combine_buffer_ptrs=combine_buffer_ptrs,
@@ -1688,6 +1701,20 @@ def _validate_terminal_forward(
     )
     peer_ptrs("workspace.x_buffer_ptrs", workspace.x_buffer_ptrs)
     peer_ptrs("workspace.x_scale_buffer_ptrs", workspace.x_scale_buffer_ptrs)
+    x_storage_bytes = int(workspace.x_buffer.untyped_storage().nbytes())
+    x_scale_storage_bytes = int(
+        workspace.x_scale_buffer.untyped_storage().nbytes()
+    )
+    if (
+        not isinstance(workspace.x_buffer_bytes_per_rank, list)
+        or workspace.x_buffer_bytes_per_rank != [x_storage_bytes] * 4
+        or not isinstance(workspace.x_scale_buffer_bytes_per_rank, list)
+        or workspace.x_scale_buffer_bytes_per_rank
+        != [x_scale_storage_bytes] * 4
+    ):
+        raise ValueError(
+            "terminal symmetric source byte capacities must match on all ranks"
+        )
     if (
         workspace.x_buffer_ptrs[workspace.ep_rank] != workspace.x_buffer.data_ptr()
         or workspace.x_scale_buffer_ptrs[workspace.ep_rank]
@@ -1710,16 +1737,38 @@ def _validate_terminal_forward(
         torch.float32,
         (capacity, 32),
     )
-    if (
-        workspace.x_buffer.untyped_storage().data_ptr()
-        == workspace.routed_x.untyped_storage().data_ptr()
-        or workspace.x_scale_buffer.untyped_storage().data_ptr()
-        == workspace.routed_x_scale.untyped_storage().data_ptr()
+    raw_bulk_tensors = (
+        ("workspace.x_buffer", workspace.x_buffer),
+        ("workspace.x_scale_buffer", workspace.x_scale_buffer),
+        ("workspace.routed_x", workspace.routed_x),
+        ("workspace.routed_x_scale", workspace.routed_x_scale),
+    )
+    if any(
+        tensor.data_ptr() != tensor.untyped_storage().data_ptr()
+        for _, tensor in raw_bulk_tensors
     ):
         raise ValueError(
-            "terminal dispatch source and routed destination storage must be "
-            "disjoint"
+            "terminal raw bulk-TMA tensors must begin at their storage base"
         )
+    validate_terminal_tma_dispatch_layout(
+        workspace.x_buffer_ptrs,
+        workspace.x_buffer_bytes_per_rank,
+        workspace.x_scale_buffer_ptrs,
+        workspace.x_scale_buffer_bytes_per_rank,
+        required_x_bytes=(
+            workspace.x_buffer.numel() * workspace.x_buffer.element_size()
+        ),
+        required_x_scale_bytes=(
+            workspace.x_scale_buffer.numel()
+            * workspace.x_scale_buffer.element_size()
+        ),
+        routed_x_pointer=workspace.routed_x.data_ptr(),
+        routed_x_bytes=int(workspace.routed_x.untyped_storage().nbytes()),
+        routed_x_scale_pointer=workspace.routed_x_scale.data_ptr(),
+        routed_x_scale_bytes=int(
+            workspace.routed_x_scale.untyped_storage().nbytes()
+        ),
+    )
     tensor("workspace.m_indices", workspace.m_indices, torch.int32, (capacity,))
     tensor(
         "workspace.schedule_peer_rank",
@@ -2053,8 +2102,10 @@ def megakernel_fp8_block_leased(
     fp8_block_megakernel_out(
         workspace.x_buffer,
         workspace.x_buffer_ptrs,
+        workspace.x_buffer_bytes_per_rank,
         workspace.x_scale_buffer,
         workspace.x_scale_buffer_ptrs,
+        workspace.x_scale_buffer_bytes_per_rank,
         workspace.routed_x,
         workspace.routed_x_scale,
         workspace.m_indices,

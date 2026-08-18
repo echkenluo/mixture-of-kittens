@@ -18,6 +18,7 @@
 #include "pyutils/torchutils.cuh"
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_terminal_full.cuh"
+#include "sm90_fp8_block_terminal_tma_contract.cuh"
 #include "utils.cuh"
 
 namespace mok_sm90::fp8_block_terminal_entry {
@@ -25,6 +26,7 @@ namespace mok_sm90::fp8_block_terminal_entry {
 namespace terminal = fp8_block_terminal;
 namespace full = fp8_block_terminal_full;
 namespace compute = fp8_block_terminal_compute;
+namespace tma_contract = fp8_block_terminal_tma_contract;
 
 using namespace kittens;
 
@@ -179,6 +181,50 @@ inline void check_i32_state(
 
 inline unsigned int *u32_ptr(const at::Tensor &tensor) {
     return reinterpret_cast<unsigned int *>(tensor.data_ptr<int>());
+}
+
+inline tma_contract::byte_interval checked_raw_bulk_interval(
+        int64_t pointer, int64_t bytes, const char *name, int peer_rank = -1) {
+    if (peer_rank >= 0) {
+        TORCH_CHECK(pointer > 0, name, " peer rank ", peer_rank,
+                    " pointer must be a positive uintptr");
+    } else {
+        TORCH_CHECK(pointer > 0, name,
+                    " pointer must be a positive uintptr");
+    }
+    const auto address = static_cast<std::uintptr_t>(pointer);
+    if (peer_rank >= 0) {
+        TORCH_CHECK(tma_contract::is_raw_bulk_aligned(address), name,
+                    " peer rank ", peer_rank,
+                    " pointer must be 16-byte aligned");
+        TORCH_CHECK(bytes > 0, name, " peer rank ", peer_rank,
+                    " storage byte count must be positive");
+    } else {
+        TORCH_CHECK(tma_contract::is_raw_bulk_aligned(address), name,
+                    " pointer must be 16-byte aligned");
+        TORCH_CHECK(bytes > 0, name,
+                    " storage byte count must be positive");
+    }
+    const auto byte_count = static_cast<std::uint64_t>(bytes);
+    if (peer_rank >= 0) {
+        TORCH_CHECK(tma_contract::valid_byte_interval(address, byte_count),
+                    name, " peer rank ", peer_rank,
+                    " byte interval overflows uintptr");
+    } else {
+        TORCH_CHECK(tma_contract::valid_byte_interval(address, byte_count),
+                    name, " byte interval overflows uintptr");
+    }
+    return tma_contract::make_byte_interval(address, byte_count);
+}
+
+inline void check_disjoint_raw_bulk_intervals(
+        tma_contract::byte_interval source, const char *source_name,
+        int peer_rank, tma_contract::byte_interval destination,
+        const char *destination_name) {
+    TORCH_CHECK(!tma_contract::byte_intervals_overlap(source, destination),
+                "terminal TMA source and destination intervals overlap: ",
+                source_name, " peer rank ", peer_rank, " vs ",
+                destination_name);
 }
 
 inline void entry_prepare_out(
@@ -363,9 +409,13 @@ inline int64_t entry_prewarm(
 
 inline void entry_out(
     const at::Tensor &x_buffer, const std::vector<int64_t> &x_ptrs,
+    const std::vector<int64_t> &x_bytes_per_rank,
     const at::Tensor &x_scale_buffer,
     const std::vector<int64_t> &x_scale_ptrs,
-    const at::Tensor &routed_x, const at::Tensor &routed_x_scale,
+    const std::vector<int64_t> &x_scale_bytes_per_rank,
+    const at::Tensor &routed_x, int64_t routed_x_storage_bytes,
+    const at::Tensor &routed_x_scale,
+    int64_t routed_x_scale_storage_bytes,
     const at::Tensor &m_indices, const at::Tensor &schedule_peer_rank,
     const at::Tensor &schedule_peer_token_idx, const at::Tensor &num_tokens,
     const at::Tensor &tokens_per_expert,
@@ -421,8 +471,6 @@ inline void entry_out(
     TORCH_CHECK(x_buffer.dim() == 2 && x_buffer.size(0) > 0
                     && x_buffer.size(1) == terminal::HIDDEN_SIZE,
                 "x_buffer must be FP8 [local_tokens,4096]");
-    TORCH_CHECK(!x_buffer.is_alias_of(routed_x),
-                "x_buffer and routed_x must use disjoint storage");
     const int64_t local_tokens = x_buffer.size(0);
     TORCH_CHECK(local_tokens <= std::numeric_limits<int>::max(),
                 "local token count does not fit int");
@@ -438,6 +486,17 @@ inline void entry_out(
                     == at::IntArrayRef({capacity,
                                        terminal::HIDDEN_SIZE / 128}),
                 "routed_x_scale must be float32 [capacity,32]");
+    TORCH_CHECK(x_buffer.storage_offset() == 0
+                    && x_scale_buffer.storage_offset() == 0
+                    && routed_x.storage_offset() == 0
+                    && routed_x_scale.storage_offset() == 0,
+                "terminal raw bulk-TMA tensors must begin at storage offset zero");
+    TORCH_CHECK(!x_buffer.is_alias_of(routed_x),
+                "x_buffer and routed_x must use disjoint storage");
+    TORCH_CHECK(!x_buffer.is_alias_of(routed_x_scale),
+                "x_buffer and routed_x_scale must use disjoint storage");
+    TORCH_CHECK(!x_scale_buffer.is_alias_of(routed_x),
+                "x_scale_buffer and routed_x must use disjoint storage");
     TORCH_CHECK(!x_scale_buffer.is_alias_of(routed_x_scale),
                 "x_scale_buffer and routed_x_scale must use disjoint storage");
     check_i32_state(m_indices, device, capacity, "m_indices");
@@ -450,9 +509,12 @@ inline void entry_out(
         route_ready_ptrs, "route_ready_ptrs");
     TORCH_CHECK(x_ptrs.size() == terminal::EP_SIZE
                     && x_scale_ptrs.size() == terminal::EP_SIZE
+                    && x_bytes_per_rank.size() == terminal::EP_SIZE
+                    && x_scale_bytes_per_rank.size() == terminal::EP_SIZE
                     && combine_buffer_ptrs.size() == terminal::EP_SIZE
                     && route_ready_ptrs.size() == terminal::EP_SIZE,
-                "terminal peer pointer lists must all have EP4 entries");
+                "terminal peer pointer and source-size lists must all have "
+                "EP4 entries");
     TORCH_CHECK(ep_rank >= 0 && ep_rank < terminal::EP_SIZE,
                 "ep_rank must be in [0,4)");
     const size_t rank = static_cast<size_t>(ep_rank);
@@ -462,6 +524,60 @@ inline void entry_out(
     TORCH_CHECK(x_scale_ptrs[rank] ==
                     reinterpret_cast<int64_t>(x_scale_buffer.data_ptr()),
                 "x_scale_ptrs[ep_rank] must alias x_scale_buffer");
+
+    constexpr int64_t scale_columns = terminal::HIDDEN_SIZE / 128;
+    const int64_t required_x_bytes =
+        local_tokens * static_cast<int64_t>(terminal::HIDDEN_SIZE);
+    const int64_t required_x_scale_bytes =
+        local_tokens * scale_columns * static_cast<int64_t>(sizeof(float));
+    const int64_t required_routed_x_bytes =
+        capacity * static_cast<int64_t>(terminal::HIDDEN_SIZE);
+    const int64_t required_routed_x_scale_bytes =
+        capacity * scale_columns * static_cast<int64_t>(sizeof(float));
+    TORCH_CHECK(routed_x_storage_bytes >= required_routed_x_bytes,
+                "routed_x storage does not cover its tensor extent");
+    TORCH_CHECK(routed_x_scale_storage_bytes >= required_routed_x_scale_bytes,
+                "routed_x_scale storage does not cover its tensor extent");
+    const auto routed_x_interval = checked_raw_bulk_interval(
+        reinterpret_cast<int64_t>(routed_x.data_ptr()),
+        routed_x_storage_bytes, "routed_x");
+    const auto routed_x_scale_interval = checked_raw_bulk_interval(
+        reinterpret_cast<int64_t>(routed_x_scale.data_ptr()),
+        routed_x_scale_storage_bytes, "routed_x_scale");
+    for (int peer = 0; peer < terminal::EP_SIZE; ++peer) {
+        const size_t peer_index = static_cast<size_t>(peer);
+        TORCH_CHECK(x_bytes_per_rank[peer_index] >= required_x_bytes,
+                    "x source storage at peer rank ", peer,
+                    " does not cover its tensor extent");
+        TORCH_CHECK(
+            x_scale_bytes_per_rank[peer_index] >= required_x_scale_bytes,
+            "x_scale source storage at peer rank ", peer,
+            " does not cover its tensor extent");
+        TORCH_CHECK(x_bytes_per_rank[peer_index] == x_bytes_per_rank[rank],
+                    "x source storage capacities must be symmetric across "
+                    "EP ranks");
+        TORCH_CHECK(
+            x_scale_bytes_per_rank[peer_index]
+                == x_scale_bytes_per_rank[rank],
+            "x_scale source storage capacities must be symmetric across "
+            "EP ranks");
+        const auto x_interval = checked_raw_bulk_interval(
+            x_ptrs[peer_index], x_bytes_per_rank[peer_index], "x_ptrs", peer);
+        const auto x_scale_interval = checked_raw_bulk_interval(
+            x_scale_ptrs[peer_index], x_scale_bytes_per_rank[peer_index],
+            "x_scale_ptrs", peer);
+        check_disjoint_raw_bulk_intervals(
+            x_interval, "x_ptrs", peer, routed_x_interval, "routed_x");
+        check_disjoint_raw_bulk_intervals(
+            x_interval, "x_ptrs", peer, routed_x_scale_interval,
+            "routed_x_scale");
+        check_disjoint_raw_bulk_intervals(
+            x_scale_interval, "x_scale_ptrs", peer, routed_x_interval,
+            "routed_x");
+        check_disjoint_raw_bulk_intervals(
+            x_scale_interval, "x_scale_ptrs", peer, routed_x_scale_interval,
+            "routed_x_scale");
+    }
 
     fp8_block_routed::check_schedule(
         schedule_peer_rank, schedule_peer_token_idx, num_tokens,

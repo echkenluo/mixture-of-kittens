@@ -3,6 +3,7 @@ import math
 import torch
 
 from . import _C
+from ._terminal_tma_contract import validate_terminal_tma_dispatch_layout
 
 
 def _sm90_reject(op_name: str) -> None:
@@ -1207,8 +1208,10 @@ def fp8_block_megakernel_prepare_out(
 def fp8_block_megakernel_out(
     x_buffer: torch.Tensor,
     x_ptrs: list[int],
+    x_bytes_per_rank: list[int],
     x_scale_buffer: torch.Tensor,
     x_scale_ptrs: list[int],
+    x_scale_bytes_per_rank: list[int],
     routed_x: torch.Tensor,
     routed_x_scale: torch.Tensor,
     m_indices: torch.Tensor,
@@ -1315,6 +1318,46 @@ def fp8_block_megakernel_out(
         device=device,
         dtype=torch.float32,
         shape=(schedule_capacity, 32),
+    )
+    raw_bulk_tensors = (
+        ("x_buffer", x_buffer),
+        ("x_scale_buffer", x_scale_buffer),
+        ("routed_x", routed_x),
+        ("routed_x_scale", routed_x_scale),
+    )
+    if any(
+        tensor.data_ptr() != tensor.untyped_storage().data_ptr()
+        for _, tensor in raw_bulk_tensors
+    ):
+        raise ValueError(
+            "terminal raw bulk-TMA tensors must begin at their storage base"
+        )
+    x_storage_bytes = int(x_buffer.untyped_storage().nbytes())
+    x_scale_storage_bytes = int(x_scale_buffer.untyped_storage().nbytes())
+    if (
+        x_bytes_per_rank != [x_storage_bytes] * 4
+        or x_scale_bytes_per_rank != [x_scale_storage_bytes] * 4
+    ):
+        raise ValueError(
+            "terminal symmetric source byte capacities must match on all ranks"
+        )
+    routed_x_storage_bytes = int(routed_x.untyped_storage().nbytes())
+    routed_x_scale_storage_bytes = int(
+        routed_x_scale.untyped_storage().nbytes()
+    )
+    validate_terminal_tma_dispatch_layout(
+        x_ptrs,
+        x_bytes_per_rank,
+        x_scale_ptrs,
+        x_scale_bytes_per_rank,
+        required_x_bytes=x_buffer.numel() * x_buffer.element_size(),
+        required_x_scale_bytes=(
+            x_scale_buffer.numel() * x_scale_buffer.element_size()
+        ),
+        routed_x_pointer=routed_x.data_ptr(),
+        routed_x_bytes=routed_x_storage_bytes,
+        routed_x_scale_pointer=routed_x_scale.data_ptr(),
+        routed_x_scale_bytes=routed_x_scale_storage_bytes,
     )
     for name, tensor in (
         ("m_indices", m_indices),
@@ -1559,10 +1602,14 @@ def fp8_block_megakernel_out(
     _C.fp8_block_megakernel_out(
         x_buffer,
         x_ptrs,
+        x_bytes_per_rank,
         x_scale_buffer,
         x_scale_ptrs,
+        x_scale_bytes_per_rank,
         routed_x,
+        routed_x_storage_bytes,
         routed_x_scale,
+        routed_x_scale_storage_bytes,
         m_indices,
         schedule_peer_rank,
         schedule_peer_token_idx,
