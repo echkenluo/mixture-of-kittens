@@ -300,7 +300,6 @@ void run_full(
         const at::Tensor &output, const at::Tensor &gate_up_ready,
         const at::Tensor &hidden_ready, const at::Tensor &y_ready,
         const at::Tensor &x_ready, const at::Tensor &cursor,
-        const at::Tensor &dispatch_tile_cursor,
         const at::Tensor &worker_ticket,
         const at::Tensor &worker_failed,
         const at::Tensor &next_reduce_probe,
@@ -361,8 +360,7 @@ void run_full(
                     && progress_timeouts.numel() == 1,
                 "progress_timeouts must be CUDA int32 [1]");
     for (const auto &[tensor, name] :
-         std::array<std::pair<const at::Tensor *, const char *>, 6>{{
-             {&dispatch_tile_cursor, "dispatch_tile_cursor"},
+         std::array<std::pair<const at::Tensor *, const char *>, 5>{{
              {&comm_owner, "comm_owner"},
              {&comm_worker_ticket, "comm_worker_ticket"},
              {&producer_done, "producer_done"},
@@ -477,7 +475,6 @@ void run_full(
     MOK_STATE_PTR(epilogue_claim, epilogue_claim);
     MOK_STATE_PTR(x_ready, x_ready);
     MOK_STATE_PTR(cursor, cursor);
-    MOK_STATE_PTR(dispatch_tile_cursor, dispatch_tile_cursor);
     MOK_STATE_PTR(worker_ticket, worker_ticket);
     MOK_STATE_PTR(comm_worker_ticket, comm_worker_ticket);
     MOK_STATE_PTR(worker_failed, worker_failed);
