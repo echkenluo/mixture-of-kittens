@@ -50,6 +50,14 @@ constexpr unsigned int OVERLAP_REDUCE_COMM = 1u << 1;
 constexpr unsigned int OVERLAP_REDUCE_THEN_COMPUTE = 1u << 2;
 constexpr unsigned int OVERLAP_DELAY_CLAIMED = 1u << 31;
 
+// The communication decoder broadcasts only the state consumed after its
+// warp-leader scope.  Keeping validity/closure beside the two-valued stage in
+// one 32-bit word prevents the full coordinate from remaining live across row
+// transport or owner-help compute.
+constexpr unsigned int COMM_CONTROL_STAGE_MASK = 0xffu;
+constexpr unsigned int COMM_CONTROL_VALID = 1u << 30;
+constexpr unsigned int COMM_CONTROL_CLOSES_M64 = 1u << 31;
+
 // Producer tasks outnumber final tokens by roughly six to one, and every
 // bounded probe performs six system-scope acquire loads even when no incoming
 // route is ready.  Keep opportunistic reduction in the compute loop, but let
@@ -584,18 +592,30 @@ __device__ void communication_role(
         semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
     __shared__ int expert_row_end[MAX_EXPERTS];
     __shared__ int wait_ok;
-    if (threadIdx.x == 0)
+    // logical_shape carries four int64 fields and otherwise immutable schedule
+    // metadata.  Construct it once per CTA and retain only its shared address
+    // across the resident loop instead of one materialized copy per thread.
+    __shared__ terminal::logical_shape shape;
+    // Only CTA-rank-0/thread-0 observes progress history.  Volatile shared
+    // storage deliberately breaks these values' live ranges across the
+    // owner-help WGMMA call; no other thread consumes them.
+    __shared__ volatile unsigned long long leader_idle_windows;
+    __shared__ volatile unsigned int leader_last_producer;
+    __shared__ volatile unsigned int leader_last_push;
+    __shared__ volatile unsigned int leader_last_reduce;
+    __shared__ volatile unsigned int leader_last_dispatch;
+    if (threadIdx.x == 0) {
+        const int active_rows = comm::bounded_valid_rows(g);
         comm::build_expert_row_ends(g, expert_row_end);
+        shape = terminal::make_logical_shape(
+            active_rows, g.schedule_capacity,
+            g.minibatch_rows, g.macrobatch_rows);
+    }
     __syncthreads();
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     constexpr int WARPS_PER_CTA = terminal::THREADS_PER_CTA / 32;
-    const int active_rows = comm::bounded_valid_rows(g);
-    const int m_tiles = active_rows / terminal::M_TILE;
-    const terminal::logical_shape shape = terminal::make_logical_shape(
-        active_rows, g.schedule_capacity,
-        g.minibatch_rows, g.macrobatch_rows);
     if (!shape.valid) {
         if (cta_rank == 0 && threadIdx.x == 0) {
             if (g.trap_record != nullptr)
@@ -618,7 +638,7 @@ __device__ void communication_role(
     // The validated M64 contract makes the D+C cardinality exactly rows/4;
     // keep the resident hot path entirely 32-bit.
     const unsigned int total_comm_tickets =
-        static_cast<unsigned int>(active_rows / 4);
+        static_cast<unsigned int>(shape.num_tokens / 4);
     unsigned int probe_comm_ticket = 0u;
     while (true) {
         if (cta_rank == 0 && threadIdx.x == 0) {
@@ -637,15 +657,37 @@ __device__ void communication_role(
         if (ticket == STOP_TICKET)
             break;
 
-        const terminal::communication_coordinate coordinate =
-            terminal::decode_communication_cursor(shape, ticket);
-        const int first_row = coordinate.macrobatch * shape.macrobatch_rows
-            + coordinate.round * terminal::COMM_ROWS_PER_TICKET
-            + cta_rank * terminal::COMM_ROWS_PER_CTA_TASK;
-        const int macro_end = coordinate.macrobatch * shape.macrobatch_rows
-            + terminal::communication_rows(shape, coordinate.macrobatch);
-        if (!coordinate.valid || first_row < 0
-                || first_row + terminal::COMM_ROWS_PER_CTA_TASK > macro_end) {
+        // The decoder is pure and warp-uniform.  One lane computes it, checks
+        // the CTA extent, and broadcasts only two 32-bit scalars.  This removes
+        // communication_coordinate from the transport and owner-help live
+        // ranges without adding a CTA or cluster barrier.
+        int first_row = -1;
+        unsigned int comm_control = 0u;
+        if (lane == 0) {
+            const terminal::communication_coordinate coordinate =
+                terminal::decode_communication_cursor(shape, ticket);
+            const int macro_base =
+                coordinate.macrobatch * shape.macrobatch_rows;
+            const int decoded_first_row = macro_base
+                + coordinate.round * terminal::COMM_ROWS_PER_TICKET
+                + cta_rank * terminal::COMM_ROWS_PER_CTA_TASK;
+            const int macro_end = macro_base
+                + terminal::communication_rows(shape, coordinate.macrobatch);
+            first_row = decoded_first_row;
+            if (coordinate.valid && decoded_first_row >= 0
+                    && decoded_first_row
+                            + terminal::COMM_ROWS_PER_CTA_TASK <= macro_end) {
+                comm_control = COMM_CONTROL_VALID
+                    | static_cast<unsigned int>(coordinate.stage);
+                if (coordinate.round
+                            % terminal::COMM_TICKETS_PER_M_TILE
+                        == terminal::COMM_TICKETS_PER_M_TILE - 1)
+                    comm_control |= COMM_CONTROL_CLOSES_M64;
+            }
+        }
+        first_row = __shfl_sync(0xffffffffu, first_row, 0);
+        comm_control = __shfl_sync(0xffffffffu, comm_control, 0);
+        if ((comm_control & COMM_CONTROL_VALID) == 0u) {
             if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
                 trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
                             comm_role, total_comm_tickets,
@@ -654,7 +696,10 @@ __device__ void communication_role(
             park_forever();
         }
 
-        if (coordinate.stage == terminal::communication_stage::dispatch) {
+        const unsigned int comm_stage =
+            comm_control & COMM_CONTROL_STAGE_MASK;
+        if (comm_stage == static_cast<unsigned int>(
+                terminal::communication_stage::dispatch)) {
             for (int local = warp;
                  local < terminal::COMM_ROWS_PER_CTA_TASK;
                  local += WARPS_PER_CTA) {
@@ -689,7 +734,8 @@ __device__ void communication_role(
 
             // Test-only delay starts after at least one complete M64 has been
             // published, never after a partial row chunk.  Production is zero.
-            if (cta_rank == 0 && threadIdx.x == 0 && m_tiles > 1
+            if (cta_rank == 0 && threadIdx.x == 0
+                    && shape.num_tokens > terminal::M_TILE
                     && g.dispatch_tiles_done != nullptr
                     && compute::load_acquire_gpu(g.dispatch_tiles_done) == 1u
                     && g.overlap_delay_after_first_dispatch_cycles != 0u) {
@@ -710,13 +756,14 @@ __device__ void communication_role(
             everyone::tma::cluster::sync();
             continue;
         }
-        if (coordinate.stage != terminal::communication_stage::combine) {
+        if (comm_stage != static_cast<unsigned int>(
+                terminal::communication_stage::combine)) {
             if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
                 trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
                             comm_role,
                             static_cast<unsigned long long>(
                                 terminal::communication_stage::combine),
-                            static_cast<unsigned long long>(coordinate.stage),
+                            static_cast<unsigned long long>(comm_stage),
                             ticket, 0);
             park_forever();
         }
@@ -734,9 +781,11 @@ __device__ void communication_role(
             park_forever();
         }
         if (owner_help_enabled) {
-            unsigned long long idle_windows = 0;
-            unsigned int last_producer = compute::load_acquire_gpu(
-                g.producer_done);
+            if (cta_rank == 0 && threadIdx.x == 0) {
+                leader_idle_windows = 0;
+                leader_last_producer = compute::load_acquire_gpu(
+                    g.producer_done);
+            }
             while (true) {
                 if (cta_rank == 0 && threadIdx.x == 0) {
                     const unsigned int ready = compute::load_acquire_gpu(
@@ -778,18 +827,18 @@ __device__ void communication_role(
                     if (ready >= terminal::W2_N_TILES) {
                         next = DONE_TICKET;
                     } else {
-                        if (produced != last_producer) {
-                            last_producer = produced;
-                            idle_windows = 0;
+                        if (produced != leader_last_producer) {
+                            leader_last_producer = produced;
+                            leader_idle_windows = 0;
                         } else {
-                            ++idle_windows;
+                            ++leader_idle_windows;
                         }
-                        if (idle_windows >= g.spin_limit)
+                        if (leader_idle_windows >= g.spin_limit)
                             trap_commit(
                                 g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
                                 m, terminal::W2_N_TILES, ready,
                                 compute::load_acquire_gpu(g.cursor),
-                                idle_windows);
+                                leader_idle_windows);
                     }
                     asm volatile(
                         "{st.release.cluster.global.u32 [%0], %1;}" ::
@@ -860,8 +909,7 @@ __device__ void communication_role(
             compute::add_release_gpu(g.push_tile_cursor, 1u);
         everyone::tma::cluster::sync();
         const bool closes_m64 =
-            coordinate.round % terminal::COMM_TICKETS_PER_M_TILE
-                == terminal::COMM_TICKETS_PER_M_TILE - 1;
+            (comm_control & COMM_CONTROL_CLOSES_M64) != 0u;
         if (owner_help_enabled && closes_m64) {
             // Preserve the old once-per-M64 reducer cadence while the comm
             // cursor itself operates at native four-row CTA granularity.
@@ -878,14 +926,16 @@ __device__ void communication_role(
         const unsigned int total_tasks = static_cast<unsigned int>(
             shape.total_tasks);
         const unsigned int active_row_count = static_cast<unsigned int>(
-            active_rows);
+            shape.num_tokens);
         const unsigned int total_tokens = static_cast<unsigned int>(
             g.num_local_tokens);
-        unsigned long long idle_windows = 0;
-        unsigned int last_producer = 0u;
-        unsigned int last_push = 0u;
-        unsigned int last_reduce = 0u;
-        unsigned int last_dispatch = 0u;
+        if (cta_rank == 0 && threadIdx.x == 0) {
+            leader_idle_windows = 0;
+            leader_last_producer = 0u;
+            leader_last_push = 0u;
+            leader_last_reduce = 0u;
+            leader_last_dispatch = 0u;
+        }
         while (true) {
             // A role that exhausted the communication queues remains a useful
             // resident worker.  This is the progress edge for C-only residency.
@@ -909,21 +959,23 @@ __device__ void communication_role(
                     ? compute::load_acquire_gpu(g.dispatch_tiles_done) : 0u;
                 unsigned int decision = WAIT_SIGNAL;
                 if (compute::load_acquire_gpu(g.terminate) == 0u) {
-                    if (producer != last_producer || pushed != last_push
-                            || reduced != last_reduce
-                            || dispatched != last_dispatch) {
-                        last_producer = producer;
-                        last_push = pushed;
-                        last_reduce = reduced;
-                        last_dispatch = dispatched;
-                        idle_windows = 0;
+                    if (producer != leader_last_producer
+                            || pushed != leader_last_push
+                            || reduced != leader_last_reduce
+                            || dispatched != leader_last_dispatch) {
+                        leader_last_producer = producer;
+                        leader_last_push = pushed;
+                        leader_last_reduce = reduced;
+                        leader_last_dispatch = dispatched;
+                        leader_idle_windows = 0;
                     } else {
-                        ++idle_windows;
+                        ++leader_idle_windows;
                     }
-                    if (idle_windows >= g.spin_limit)
+                    if (leader_idle_windows >= g.spin_limit)
                         trap_commit(
                             g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
-                                0, total_tasks, producer, 0, idle_windows);
+                            0, total_tasks, producer, 0,
+                            leader_idle_windows);
                 } else
                     decision = DONE_TICKET;
                 asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::

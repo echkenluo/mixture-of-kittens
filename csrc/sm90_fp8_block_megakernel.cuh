@@ -139,11 +139,13 @@ struct logical_coordinate {
 // a physical role that may be admitted late.
 struct communication_coordinate {
     bool valid;
-    int64_t cursor_ordinal;
     communication_stage stage;
     int macrobatch;
     int round;
 };
+
+static_assert(sizeof(communication_coordinate) == 16,
+              "communication coordinate unexpectedly regained hot state");
 
 struct communication_cta_task {
     bool valid;
@@ -319,7 +321,6 @@ MOK_TERMINAL_HD int64_t communication_total_tickets(
 MOK_TERMINAL_HD communication_coordinate decode_communication_cursor(
         const logical_shape &shape, int64_t cursor_ordinal) {
     communication_coordinate result{};
-    result.cursor_ordinal = cursor_ordinal;
     const int64_t total = communication_total_tickets(shape);
     if (!shape.valid || cursor_ordinal < 0 || cursor_ordinal >= total)
         return result;

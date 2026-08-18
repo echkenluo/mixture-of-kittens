@@ -75,6 +75,14 @@ def check_source_contract() -> None:
         raise RuntimeError(
             f"native communication decoder contract missing: {missing}"
         )
+    communication_coordinate = text[
+        text.find("struct communication_coordinate") :
+        text.find("struct communication_cta_task")
+    ]
+    if "cursor_ordinal" in communication_coordinate:
+        raise RuntimeError(
+            "communication coordinate retains redundant int64 cursor state"
+        )
     print(
         "TERMINAL_LOGICAL_DECODER_STATIC"
         "|legacy_scaffold=0|kernel_body=0|native_comm_decoder=1|result=PASS"

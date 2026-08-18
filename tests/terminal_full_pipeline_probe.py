@@ -42,7 +42,7 @@ def check_source_contract() -> None:
         "reduce_claimed_token",
         "decode_logical_cursor",
         "decode_communication_cursor",
-        "active_rows / 4",
+        "shape.num_tokens / 4",
         "fence.proxy.async.global",
         "fence.proxy.async.shared::cta",
         "worker_failed",
@@ -178,7 +178,9 @@ def check_source_contract() -> None:
         header.find("// One CTA probes exactly one")
     ]
     native_comm_required = (
-        "static_cast<unsigned int>(active_rows / 4)",
+        "static_cast<unsigned int>(shape.num_tokens / 4)",
+        "__shared__ terminal::logical_shape shape",
+        "__shfl_sync(0xffffffffu, comm_control, 0)",
         "decode_communication_cursor(shape, ticket)",
         "communication_stage::dispatch",
         "communication_stage::combine",
