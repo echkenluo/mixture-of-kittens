@@ -76,6 +76,7 @@ def build_extension(verbose: bool):
             "-Xptxas=-v",
             "-Xptxas=--warn-on-spills",
         ],
+        extra_ldflags=["-lcuda"],
         verbose=verbose,
     )
 
