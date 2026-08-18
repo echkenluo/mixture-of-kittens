@@ -781,7 +781,6 @@ def create_fp8_terminal_workspace(
             "terminal workspaces require identical graph buckets on all EP ranks"
         )
 
-    symm_mem.enable_symm_mem_for_group(group_name)
     x_buffer = symm_mem.empty(
         num_local_tokens,
         hidden_size,
