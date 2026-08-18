@@ -87,7 +87,7 @@ def check_source_contract() -> None:
         raise RuntimeError("ready probe has an early return before all six acquires")
 
     claim = function_body(
-        header, "try_claim_ready_token", "weighted_reduce_valid_element"
+        header, "try_claim_ready_token", "weighted_reduce_masked_value"
     )
     claim_order = (
         claim.find("all_routes_ready_once"),
@@ -103,19 +103,26 @@ def check_source_contract() -> None:
     if "atomicCAS" not in claim_step:
         raise RuntimeError("factored ready-token claim is not an atomic CAS")
 
-    reduce = function_body(
-        header, "weighted_reduce_valid_element", "reduce_claimed_token"
+    masked_reduce = function_body(
+        header, "weighted_reduce_masked_value", "weighted_reduce_valid_element"
     )
-    if "topk_ids[route_index] >= 0" not in reduce:
+    if "topk_ids[route_index] < 0" not in masked_reduce:
         raise RuntimeError("invalid route skip is missing")
-    if reduce.find("topk_ids[route_index] >= 0") >= reduce.find(
+    if masked_reduce.find("topk_ids[route_index] < 0") >= masked_reduce.find(
         "combine[route_index * hidden + column]"
     ):
         raise RuntimeError("invalid combine storage may be read before validity is known")
-    if "pipeline::weighted_reduce_element" not in reduce:
-        raise RuntimeError("terminal reducer is not using the shared arithmetic core")
-    if "__float2bfloat16_rn(0.0f)" not in reduce:
+    if "__fmul_rn" not in masked_reduce or "__fmaf_rn" not in masked_reduce:
+        raise RuntimeError("masked reducer lost the required mul-then-FMA sequence")
+    if "__float2bfloat16_rn(0.0f)" not in masked_reduce:
         raise RuntimeError("all-invalid token does not explicitly write BF16 +0")
+    if "[TOPK]" in masked_reduce or "compact_" in masked_reduce:
+        raise RuntimeError("masked reducer reintroduced dynamic local arrays")
+    reduce = function_body(
+        header, "weighted_reduce_valid_element", "reduce_claimed_token"
+    )
+    if "weighted_reduce_masked_value" not in reduce:
+        raise RuntimeError("terminal reducer bypasses the shared masked arithmetic core")
     if "Do not canonicalize signed zero" not in reduce:
         raise RuntimeError("valid-route signed-zero preservation contract is missing")
 
@@ -135,7 +142,8 @@ def check_source_contract() -> None:
 
     cross_file_required = (
         ("comm row store", "push_routed_row", comm),
-        ("shared weighted reduce", "weighted_reduce_element", pipeline),
+        ("shared unmasked reduce", "weighted_reduce_element", pipeline),
+        ("shared masked reduce", "weighted_reduce_masked_value", header),
         ("probe publication", "push_routed_row_and_publish", source),
         ("probe one-shot claim", "try_claim_ready_token", source),
         ("probe overlap witness", "overlap_count", source),
@@ -326,11 +334,22 @@ def run_device(
     module = build_extension(True)
 
     attrs = [int(value) for value in module.kernel_attributes()]
+    if attrs[1] != 0:
+        raise RuntimeError(
+            "terminal route candidate must have localSizeBytes==0; "
+            f"observed {attrs[1]} bytes"
+        )
+    if attrs[3] != 0:
+        raise RuntimeError(
+            "terminal claim-race kernel must have localSizeBytes==0; "
+            f"observed {attrs[3]} bytes"
+        )
     print(
         "TERMINAL_ROUTE_PTXAS"
         f"|route_registers={attrs[0]}|route_local_bytes={attrs[1]}"
         f"|race_registers={attrs[2]}|race_local_bytes={attrs[3]}"
-        "|spill_evidence=ptxas_verbose_build_log|result=INFO",
+        "|local_bytes_gate=zero"
+        "|spill_evidence=ptxas_verbose_build_log|result=PASS",
         flush=True,
     )
 

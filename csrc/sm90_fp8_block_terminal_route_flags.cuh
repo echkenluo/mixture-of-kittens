@@ -129,42 +129,49 @@ __device__ __forceinline__ claim_result try_claim_ready_token(
     return claim_token_after_ready(epilogue_claim, token);
 }
 
-// Reduce one output element after the caller has won the token claim.  Valid
-// route values are compacted in slot order, so invalid storage is never read
-// and the surviving routes retain the production mul-then-FMA order.  The
-// shared weighted_reduce_element owns the arithmetic and final BF16 rounding.
+// Shared masked arithmetic core for the terminal reducer.  It deliberately
+// carries only one FP32 accumulator and one initialization predicate: no
+// compact temporary arrays, dynamic-indexed local storage, or second arithmetic
+// implementation is permitted.  Invalid storage is tested before it is read;
+// surviving slots retain their original order.  The first valid slot uses an
+// explicitly rounded multiply and later slots use explicitly rounded FMAs.
+__device__ __forceinline__ __nv_bfloat16 weighted_reduce_masked_value(
+    const __nv_bfloat16 *combine, const float *weights,
+    const int *topk_ids, int token, int column, int hidden) {
+    const size_t route_base = static_cast<size_t>(token) * TOPK;
+    float accumulator = 0.0f;
+    bool initialized = false;
+#pragma unroll
+    for (int route = 0; route < TOPK; ++route) {
+        const size_t route_index = route_base + route;
+        if (topk_ids[route_index] < 0)
+            continue;
+        const float value = __bfloat162float(
+            combine[route_index * hidden + column]);
+        if (!initialized) {
+            accumulator = __fmul_rn(value, weights[route_index]);
+            initialized = true;
+        } else {
+            accumulator = __fmaf_rn(
+                value, weights[route_index], accumulator);
+        }
+    }
+    return initialized
+        ? __float2bfloat16_rn(accumulator)
+        : __float2bfloat16_rn(0.0f);
+}
+
+// Reduce one output element after the caller has won the token claim.
 __device__ __forceinline__ void weighted_reduce_valid_element(
     const __nv_bfloat16 *combine, const float *weights,
     const int *topk_ids, __nv_bfloat16 *output,
     int token, int column, int hidden) {
-    const size_t route_base = static_cast<size_t>(token) * TOPK;
-    __nv_bfloat16 compact_combine[TOPK];
-    float compact_weights[TOPK];
-    int valid_routes = 0;
-#pragma unroll
-    for (int route = 0; route < TOPK; ++route) {
-        const size_t route_index = route_base + route;
-        if (topk_ids[route_index] >= 0) {
-            compact_combine[valid_routes] =
-                combine[route_index * hidden + column];
-            compact_weights[valid_routes] = weights[route_index];
-            ++valid_routes;
-        }
-    }
-    if (valid_routes == 0) {
-        output[static_cast<size_t>(token) * hidden + column] =
-            __float2bfloat16_rn(0.0f);
-        return;
-    }
-
-    __nv_bfloat16 reduced;
-    pipeline::weighted_reduce_element(
-        compact_combine, compact_weights, &reduced,
-        0, 0, valid_routes, 1);
     // Do not canonicalize signed zero here.  Valid routes must retain the
     // production mul/FMA bit pattern (including -0); only the all-invalid
-    // padded-token branch above has an explicit BF16 +0 contract.
-    output[static_cast<size_t>(token) * hidden + column] = reduced;
+    // return from the shared masked core has an explicit BF16 +0 contract.
+    output[static_cast<size_t>(token) * hidden + column] =
+        weighted_reduce_masked_value(
+            combine, weights, topk_ids, token, column, hidden);
 }
 
 // Column-parallel convenience core.  Synchronization and ownership broadcast
