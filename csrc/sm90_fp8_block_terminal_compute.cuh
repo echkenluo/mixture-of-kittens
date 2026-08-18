@@ -205,6 +205,13 @@ __device__ __forceinline__ void run_w2_task(
         wait_until_at_least(ready.hidden_ready + hidden_index, 1u);
     __syncthreads();
 
+    // hidden was produced through the generic proxy while run_tile consumes
+    // it through a rank-0 multicast TMA load.  The ready counter orders the
+    // generic writes, but the TMA initiator must still bridge those writes
+    // into the async proxy after its acquire and before issuing the load.
+    if (cta_rank == 0 && threadIdx.x == 0)
+        asm volatile("{fence.proxy.async.global;}" ::: "memory");
+
     const int n64 = logical_n64(coordinate, cta_rank);
     const pipeline::tile tile{
         n64,
