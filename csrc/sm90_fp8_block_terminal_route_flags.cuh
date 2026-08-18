@@ -41,6 +41,18 @@ enum class claim_result : int {
     already_claimed = 2,
 };
 
+// Claim ownership after the caller has completed the fixed six-route acquire
+// probe.  Keeping this operation separate makes the ownership race directly
+// stressable without weakening the combined production helper's contract.
+__device__ __forceinline__ claim_result claim_token_after_ready(
+    unsigned int *epilogue_claim, int token) {
+    const unsigned int prior =
+        atomicCAS(epilogue_claim + token, CLAIM_FREE, CLAIM_OWNED);
+    return prior == CLAIM_FREE
+        ? claim_result::claimed
+        : claim_result::already_claimed;
+}
+
 // These instructions are intentionally spelled out.  Peer payload visibility
 // is a system-scope contract, not a device-only ordering accident.
 __device__ __forceinline__ void release_fence_system() {
@@ -114,11 +126,7 @@ __device__ __forceinline__ claim_result try_claim_ready_token(
         return claim_result::invalid_token;
     if (!all_routes_ready_once(route_ready, token))
         return claim_result::not_ready;
-    const unsigned int prior =
-        atomicCAS(epilogue_claim + token, CLAIM_FREE, CLAIM_OWNED);
-    return prior == CLAIM_FREE
-        ? claim_result::claimed
-        : claim_result::already_claimed;
+    return claim_token_after_ready(epilogue_claim, token);
 }
 
 // Reduce one output element after the caller has won the token claim.  Valid
@@ -153,6 +161,9 @@ __device__ __forceinline__ void weighted_reduce_valid_element(
     pipeline::weighted_reduce_element(
         compact_combine, compact_weights, &reduced,
         0, 0, valid_routes, 1);
+    // Do not canonicalize signed zero here.  Valid routes must retain the
+    // production mul/FMA bit pattern (including -0); only the all-invalid
+    // padded-token branch above has an explicit BF16 +0 contract.
     output[static_cast<size_t>(token) * hidden + column] = reduced;
 }
 

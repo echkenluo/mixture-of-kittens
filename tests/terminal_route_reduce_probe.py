@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "skip", "require"), default="auto")
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--race-rounds", type=int, default=1000)
     parser.add_argument("--spin-limit", type=int, default=1 << 24)
     return parser.parse_args()
 
@@ -88,11 +89,19 @@ def check_source_contract() -> None:
     claim = function_body(
         header, "try_claim_ready_token", "weighted_reduce_valid_element"
     )
-    claim_order = (claim.find("all_routes_ready_once"), claim.find("atomicCAS"))
+    claim_order = (
+        claim.find("all_routes_ready_once"),
+        claim.find("claim_token_after_ready"),
+    )
     if any(index < 0 for index in claim_order) or claim_order[0] >= claim_order[1]:
         raise RuntimeError("CAS must occur only after the six-flag ready probe")
     if "while" in claim or "__nanosleep" in claim:
         raise RuntimeError("destination claim helper must not spin on an unready token")
+    claim_step = function_body(
+        header, "claim_token_after_ready", "release_fence_system"
+    )
+    if "atomicCAS" not in claim_step:
+        raise RuntimeError("factored ready-token claim is not an atomic CAS")
 
     reduce = function_body(
         header, "weighted_reduce_valid_element", "reduce_claimed_token"
@@ -107,6 +116,8 @@ def check_source_contract() -> None:
         raise RuntimeError("terminal reducer is not using the shared arithmetic core")
     if "__float2bfloat16_rn(0.0f)" not in reduce:
         raise RuntimeError("all-invalid token does not explicitly write BF16 +0")
+    if "Do not canonicalize signed zero" not in reduce:
+        raise RuntimeError("valid-route signed-zero preservation contract is missing")
 
     forbidden_header = (
         "__syncthreads(",
@@ -167,14 +178,19 @@ def sm90_device_available() -> bool:
     )
 
 
-def build_extension():
+def build_extension(verbose: bool):
     from torch.utils.cpp_extension import load
 
     return load(
         name="mok_terminal_route_reduce_probe",
         sources=[str(SOURCE)],
-        extra_cuda_cflags=["-O3", "-lineinfo", "--use_fast_math"],
-        verbose=False,
+        extra_cuda_cflags=[
+            "-O3",
+            "-lineinfo",
+            "--use_fast_math",
+            "-Xptxas=-v",
+        ],
+        verbose=verbose,
     )
 
 
@@ -187,7 +203,7 @@ def first_sm90_device() -> int:
     raise RuntimeError("no SM90 device found")
 
 
-def make_inputs(hidden: int, seed: int):
+def make_inputs(hidden: int, seed: int, negative_zero: bool):
     import torch
 
     generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -200,7 +216,9 @@ def make_inputs(hidden: int, seed: int):
         )
         * 3.0
     ).to(torch.bfloat16)
-    routed_y[11:].zero_()  # token 3: six valid all-zero payload rows
+    # Token 3 exercises both signed-zero legs.  Valid routes retain the
+    # production mul/FMA sign bit; only all-invalid token 2 is forced to +0.
+    routed_y[11:].fill_(-0.0 if negative_zero else 0.0)
 
     schedule_peer = torch.zeros(
         SCHEDULE_ROWS, dtype=torch.int32, device="cuda"
@@ -295,14 +313,77 @@ def make_inputs(hidden: int, seed: int):
     )
 
 
-def run_device(hidden: int, seeds: int, spin_limit: int) -> None:
+def run_device(
+    hidden: int, seeds: int, race_rounds: int,
+    spin_limit: int,
+) -> None:
     import torch
 
     device = first_sm90_device()
     torch.cuda.set_device(device)
-    module = build_extension()
+    # Keep the build verbose: -Xptxas=-v is part of the acceptance evidence,
+    # not optional troubleshooting output.
+    module = build_extension(True)
 
-    for seed in range(seeds):
+    attrs = [int(value) for value in module.kernel_attributes()]
+    print(
+        "TERMINAL_ROUTE_PTXAS"
+        f"|route_registers={attrs[0]}|route_local_bytes={attrs[1]}"
+        f"|race_registers={attrs[2]}|race_local_bytes={attrs[3]}"
+        "|spill_evidence=ptxas_verbose_build_log|result=INFO",
+        flush=True,
+    )
+
+    race_ready = torch.ones(TOPK, dtype=torch.int32, device="cuda")
+    race = {
+        "claim": torch.zeros(race_rounds, dtype=torch.int32, device="cuda"),
+        "arrivals": torch.zeros(race_rounds, dtype=torch.int32, device="cuda"),
+        "claimed": torch.zeros(race_rounds, dtype=torch.int32, device="cuda"),
+        "already": torch.zeros(race_rounds, dtype=torch.int32, device="cuda"),
+        "unexpected": torch.zeros(race_rounds, dtype=torch.int32, device="cuda"),
+        "timeout": torch.zeros(1, dtype=torch.int32, device="cuda"),
+    }
+    module.run_claim_race(
+        race_ready,
+        race["claim"],
+        race["arrivals"],
+        race["claimed"],
+        race["already"],
+        race["unexpected"],
+        race["timeout"],
+        race_rounds,
+        spin_limit,
+    )
+    torch.cuda.synchronize()
+    expected_ones = torch.ones(race_rounds, dtype=torch.int32, device="cuda")
+    expected_twos = torch.full(
+        (race_rounds,), 2, dtype=torch.int32, device="cuda"
+    )
+    if not torch.equal(race["claim"], expected_ones):
+        raise RuntimeError("claim-race ownership state was not exactly once")
+    if not torch.equal(race["arrivals"], expected_twos):
+        raise RuntimeError("both claim-race CTAs did not reach every CAS gate")
+    if not torch.equal(race["claimed"], expected_ones):
+        raise RuntimeError("claim-race did not produce one winner per round")
+    if not torch.equal(race["already"], expected_ones):
+        raise RuntimeError("claim-race did not produce one CAS loser per round")
+    if torch.count_nonzero(race["unexpected"]).item() != 0:
+        raise RuntimeError("claim-race returned an unexpected result")
+    if int(race["timeout"].item()) != 0:
+        raise RuntimeError("claim-race gate timed out")
+    print(
+        "TERMINAL_ROUTE_CAS_RACE"
+        f"|rounds={race_rounds}|contenders=2"
+        f"|claimed={race_rounds}|already_claimed={race_rounds}"
+        "|result=PASS",
+        flush=True,
+    )
+
+    for seed, negative_zero in (
+        (seed, negative_zero)
+        for seed in range(seeds)
+        for negative_zero in (False, True)
+    ):
         (
             routed_y,
             schedule_peer,
@@ -315,7 +396,7 @@ def run_device(hidden: int, seeds: int, spin_limit: int) -> None:
             output,
             reference,
             counters,
-        ) = make_inputs(hidden, seed)
+        ) = make_inputs(hidden, seed, negative_zero)
         module.run_probe(
             routed_y,
             schedule_peer,
@@ -388,17 +469,29 @@ def run_device(hidden: int, seeds: int, spin_limit: int) -> None:
             raise RuntimeError("all-invalid token combine rows were touched")
         if torch.count_nonzero(output[2].view(torch.uint16)).item() != 0:
             raise RuntimeError("all-invalid padded token did not produce BF16 +0")
-        if torch.count_nonzero(output[3].view(torch.uint16)).item() != 0:
-            raise RuntimeError("all-zero valid payload did not produce BF16 +0")
+        zero_bits = 0x8000 if negative_zero else 0x0000
+        if not torch.all(output[3].view(torch.uint16) == zero_bits):
+            raise RuntimeError(
+                "valid signed-zero output diverged from production mul/FMA semantics"
+            )
+        if not torch.all(
+            combine[3 * TOPK : 4 * TOPK].view(torch.uint16) == zero_bits
+        ):
+            raise RuntimeError("valid signed-zero payload bits were not preserved")
         for row, slot in enumerate(schedule_slot.cpu().tolist()):
-            if not torch.equal(combine[slot], routed_y[row]):
+            if not torch.equal(
+                combine[slot].view(torch.uint16),
+                routed_y[row].view(torch.uint16),
+            ):
                 raise RuntimeError(f"published payload mismatch at schedule row {row}")
 
         print(
             "TERMINAL_ROUTE_DEVICE"
-            f"|seed={seed}|hidden={hidden}|out_of_order=1"
+            f"|seed={seed}|hidden={hidden}"
+            f"|input_zero_sign={'negative' if negative_zero else 'positive'}"
+            "|out_of_order=1"
             f"|partial_not_ready={values('not_ready')[0]}"
-            "|stale_nan_not_read=1|zero_payload_poszero=1"
+            "|stale_nan_not_read=1|signed_zero=production_exact"
             "|all_invalid_poszero=1|exactly_once=1|overlap=1"
             "|numeric=bitwise_exact|result=PASS",
             flush=True,
@@ -411,13 +504,20 @@ def main() -> int:
         raise ValueError("hidden must be a positive multiple of 8")
     if args.seeds <= 0 or args.spin_limit <= 0:
         raise ValueError("seeds and spin-limit must be positive")
+    if args.race_rounds < 1000:
+        raise ValueError("race-rounds must be at least 1000")
 
     check_source_contract()
     available = sm90_device_available()
     if args.device == "require" and not available:
         raise RuntimeError("SM90 CUDA build/device probe was required but unavailable")
     if args.device != "skip" and available:
-        run_device(args.hidden, args.seeds, args.spin_limit)
+        run_device(
+            args.hidden,
+            args.seeds,
+            args.race_rounds,
+            args.spin_limit,
+        )
     else:
         print(
             "TERMINAL_ROUTE_DEVICE|result=SKIP"
@@ -426,7 +526,7 @@ def main() -> int:
         )
     print(
         "TERMINAL_ROUTE_MULTI_RANK|result=GAP"
-        "|reason=four_rank_peer_pointer_execution_not_run_by_this_probe",
+        "|reason=run_tests_peer_route_flag_probe_py_separately",
         flush=True,
     )
     print("TERMINAL_ROUTE_REDUCE_PROBE|result=PASS", flush=True)

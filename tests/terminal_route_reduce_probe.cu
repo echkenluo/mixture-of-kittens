@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <vector>
 
 #include "../csrc/sm90_fp8_block_terminal_route_flags.cuh"
 
@@ -22,6 +23,48 @@ constexpr int kScheduleRows = 17;
 constexpr int kThreads = 128;
 constexpr int kReducerBlocks = 2;
 constexpr int kProbeBlocks = 1 + kReducerBlocks;
+
+void check_int_tensor(
+    const at::Tensor &tensor, int64_t elements, const char *name);
+
+__global__ void terminal_claim_race_kernel(
+    const unsigned int *route_ready, unsigned int *round_claim,
+    unsigned int *round_arrivals, unsigned int *claimed_count,
+    unsigned int *already_claimed_count, unsigned int *unexpected_count,
+    unsigned int *timeout_count, int rounds,
+    unsigned long long spin_limit) {
+    if (blockIdx.x >= 2 || threadIdx.x != 0)
+        return;
+    for (int round = 0; round < rounds; ++round) {
+        // Both contenders must complete all six acquire loads before either
+        // is allowed to perform the ownership CAS for this round.
+        if (!terminal::all_routes_ready_once(route_ready, 0)) {
+            atomicAdd(unexpected_count + round, 1u);
+            return;
+        }
+        atomicAdd(round_arrivals + round, 1u);
+        bool gate_open = false;
+        for (unsigned long long spin = 0; spin < spin_limit; ++spin) {
+            if (atomicAdd(round_arrivals + round, 0u) == 2u) {
+                gate_open = true;
+                break;
+            }
+            __nanosleep(64);
+        }
+        if (!gate_open) {
+            atomicAdd(timeout_count, 1u);
+            return;
+        }
+        const terminal::claim_result result =
+            terminal::claim_token_after_ready(round_claim + round, 0);
+        if (result == terminal::claim_result::claimed)
+            atomicAdd(claimed_count + round, 1u);
+        else if (result == terminal::claim_result::already_claimed)
+            atomicAdd(already_claimed_count + round, 1u);
+        else
+            atomicAdd(unexpected_count + round, 1u);
+    }
+}
 
 struct probe_globals {
     uint8_t *combine_peer[1];
@@ -260,10 +303,65 @@ __global__ void reference_kernel(
                     value, weights[route_index], accumulator);
             }
         }
-        output[static_cast<size_t>(token) * hidden + column] = initialized
+        const __nv_bfloat16 reduced = initialized
             ? __float2bfloat16_rn(accumulator)
             : __float2bfloat16_rn(0.0f);
+        output[static_cast<size_t>(token) * hidden + column] = reduced;
     }
+}
+
+void run_claim_race(
+    const at::Tensor &route_ready, const at::Tensor &round_claim,
+    const at::Tensor &round_arrivals, const at::Tensor &claimed_count,
+    const at::Tensor &already_claimed_count,
+    const at::Tensor &unexpected_count, const at::Tensor &timeout_count,
+    int64_t rounds, int64_t spin_limit) {
+    TORCH_CHECK(rounds >= 1000 && rounds <= INT_MAX,
+                "claim race requires at least 1000 rounds");
+    check_int_tensor(route_ready, kTopk, "race route_ready");
+    for (const at::Tensor *tensor : {
+             &round_claim, &round_arrivals, &claimed_count,
+             &already_claimed_count, &unexpected_count}) {
+        check_int_tensor(*tensor, rounds, "race round tensor");
+        TORCH_CHECK(tensor->get_device() == route_ready.get_device(),
+                    "race tensors must share one CUDA device");
+    }
+    check_int_tensor(timeout_count, 1, "race timeout_count");
+    TORCH_CHECK(timeout_count.get_device() == route_ready.get_device(),
+                "race tensors must share one CUDA device");
+    TORCH_CHECK(spin_limit > 0, "spin_limit must be positive");
+
+    c10::cuda::CUDAGuard guard(route_ready.device());
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream(route_ready.get_device());
+    terminal_claim_race_kernel<<<2, 32, 0, stream>>>(
+        reinterpret_cast<const unsigned int *>(route_ready.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(round_claim.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(round_arrivals.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(claimed_count.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(
+            already_claimed_count.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(unexpected_count.data_ptr<int>()),
+        reinterpret_cast<unsigned int *>(timeout_count.data_ptr<int>()),
+        static_cast<int>(rounds),
+        static_cast<unsigned long long>(spin_limit));
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "terminal claim race launch failed");
+}
+
+std::vector<int64_t> kernel_attributes() {
+    cudaFuncAttributes route{};
+    cudaFuncAttributes race{};
+    TORCH_CHECK(cudaFuncGetAttributes(&route, terminal_route_probe_kernel)
+                    == cudaSuccess,
+                "failed to read route kernel attributes");
+    TORCH_CHECK(cudaFuncGetAttributes(&race, terminal_claim_race_kernel)
+                    == cudaSuccess,
+                "failed to read race kernel attributes");
+    return {
+        route.numRegs, static_cast<int64_t>(route.localSizeBytes),
+        race.numRegs, static_cast<int64_t>(race.localSizeBytes),
+    };
 }
 
 void check_int_tensor(
@@ -404,4 +502,6 @@ void run_probe(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("run_probe", &run_probe);
+    module.def("run_claim_race", &run_claim_race);
+    module.def("kernel_attributes", &kernel_attributes);
 }
