@@ -779,7 +779,11 @@ def run_device(args: argparse.Namespace) -> None:
                     scalar_expected = {
                         "cursor": total_tasks,
                         "reduce_done": local_tokens,
-                        "comm_closed": 2 if owner_only else 1,
+                        # One communication cluster closes exactly once after
+                        # exhausting the dense D/C cursor.  In owner-only
+                        # mode that same cluster also helps producer work, but
+                        # it does not own a second communication closure.
+                        "comm_closed": 1,
                         "comm_failed": 0,
                         "errors": 0,
                         "progress_timeouts": 0,
