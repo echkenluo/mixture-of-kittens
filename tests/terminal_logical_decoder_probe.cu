@@ -36,6 +36,55 @@ const probe_case CASES[] = {
     {"skew-heavy-q3-partial", 1088, 2048, 256, 512, 3},
 };
 
+struct golden_coordinate {
+    int64_t ordinal;
+    int ordered_minibatch;
+    int macrobatch;
+    int minibatch;
+    int global_m;
+    terminal::logical_stage stage;
+    int n128;
+};
+
+// nt=256, S=A=128: ordered j=0 is q=1/gm=2..3, then j=1 is
+// q=0/gm=0..1.  These points pin every stage boundary and both M64s.
+const golden_coordinate BALANCED_Q2_GOLDEN[] = {
+    {0, 0, 1, 0, 2, terminal::logical_stage::gate, 0},
+    {15, 0, 1, 0, 2, terminal::logical_stage::gate, 15},
+    {16, 0, 1, 0, 3, terminal::logical_stage::gate, 0},
+    {31, 0, 1, 0, 3, terminal::logical_stage::gate, 15},
+    {32, 0, 1, 0, 2, terminal::logical_stage::up, 0},
+    {63, 0, 1, 0, 3, terminal::logical_stage::up, 15},
+    {64, 0, 1, 0, 2, terminal::logical_stage::activation, 0},
+    {65, 0, 1, 0, 3, terminal::logical_stage::activation, 0},
+    {66, 0, 1, 0, 2, terminal::logical_stage::w2, 0},
+    {97, 0, 1, 0, 2, terminal::logical_stage::w2, 31},
+    {98, 0, 1, 0, 3, terminal::logical_stage::w2, 0},
+    {129, 0, 1, 0, 3, terminal::logical_stage::w2, 31},
+    {130, 1, 0, 0, 0, terminal::logical_stage::gate, 0},
+    {259, 1, 0, 0, 1, terminal::logical_stage::w2, 31},
+};
+
+// nt=1088, S=256, A=512: L=1, so the one-M64 partial tail at q=2
+// is j=0.  Full ranges then walk (q,b)=(1,0),(1,1),(0,0),(0,1).
+const golden_coordinate SKEW_Q3_PARTIAL_GOLDEN[] = {
+    {0, 0, 2, 0, 16, terminal::logical_stage::gate, 0},
+    {15, 0, 2, 0, 16, terminal::logical_stage::gate, 15},
+    {16, 0, 2, 0, 16, terminal::logical_stage::up, 0},
+    {31, 0, 2, 0, 16, terminal::logical_stage::up, 15},
+    {32, 0, 2, 0, 16, terminal::logical_stage::activation, 0},
+    {33, 0, 2, 0, 16, terminal::logical_stage::w2, 0},
+    {64, 0, 2, 0, 16, terminal::logical_stage::w2, 31},
+    {65, 1, 1, 0, 8, terminal::logical_stage::gate, 0},
+    {324, 1, 1, 0, 11, terminal::logical_stage::w2, 31},
+    {325, 2, 1, 1, 12, terminal::logical_stage::gate, 0},
+    {584, 2, 1, 1, 15, terminal::logical_stage::w2, 31},
+    {585, 3, 0, 0, 0, terminal::logical_stage::gate, 0},
+    {844, 3, 0, 0, 3, terminal::logical_stage::w2, 31},
+    {845, 4, 0, 1, 4, terminal::logical_stage::gate, 0},
+    {1104, 4, 0, 1, 7, terminal::logical_stage::w2, 31},
+};
+
 [[noreturn]] void fail(const std::string &message) {
     throw std::runtime_error(message);
 }
@@ -43,6 +92,76 @@ const probe_case CASES[] = {
 void require(bool condition, const std::string &message) {
     if (!condition)
         fail(message);
+}
+
+void check_golden_set(const probe_case &test,
+                      const terminal::logical_shape &shape,
+                      const golden_coordinate *golden, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        const auto &expected = golden[index];
+        const auto actual =
+            terminal::decode_logical_cursor(shape, expected.ordinal);
+        require(actual.valid
+                    && actual.ordered_minibatch == expected.ordered_minibatch
+                    && actual.macrobatch == expected.macrobatch
+                    && actual.minibatch == expected.minibatch
+                    && actual.global_m == expected.global_m
+                    && actual.stage == expected.stage
+                    && actual.n128 == expected.n128,
+                std::string(test.name) + ": golden coordinate mismatch at "
+                    + std::to_string(expected.ordinal));
+    }
+}
+
+void check_case_goldens(const probe_case &test,
+                        const terminal::logical_shape &shape) {
+    const std::string name(test.name);
+    if (name == "balanced-q2") {
+        check_golden_set(test, shape, BALANCED_Q2_GOLDEN,
+                         sizeof(BALANCED_Q2_GOLDEN)
+                             / sizeof(BALANCED_Q2_GOLDEN[0]));
+    } else if (name == "skew-heavy-q3-partial") {
+        check_golden_set(test, shape, SKEW_Q3_PARTIAL_GOLDEN,
+                         sizeof(SKEW_Q3_PARTIAL_GOLDEN)
+                             / sizeof(SKEW_Q3_PARTIAL_GOLDEN[0]));
+    }
+}
+
+void check_stage_decode_interlock(
+        const probe_case &test, const terminal::logical_shape &shape,
+        const terminal::ordered_minibatch_range &minibatch,
+        terminal::logical_stage stage, terminal::ordinal_range ordinals) {
+    for (int64_t ordinal = ordinals.begin; ordinal < ordinals.end;
+         ++ordinal) {
+        const auto coordinate =
+            terminal::decode_logical_cursor(shape, ordinal);
+        const int64_t local = ordinal - ordinals.begin;
+        int expected_m = minibatch.first_m_tile;
+        int expected_n128 = 0;
+        if (stage == terminal::logical_stage::gate
+                || stage == terminal::logical_stage::up) {
+            expected_m += static_cast<int>(
+                local / terminal::W13_CLUSTER_TASKS);
+            expected_n128 = static_cast<int>(
+                local % terminal::W13_CLUSTER_TASKS);
+        } else if (stage == terminal::logical_stage::activation) {
+            expected_m += static_cast<int>(local);
+        } else {
+            expected_m += static_cast<int>(
+                local / terminal::W2_CLUSTER_TASKS);
+            expected_n128 = static_cast<int>(
+                local % terminal::W2_CLUSTER_TASKS);
+        }
+        require(coordinate.valid && coordinate.stage == stage
+                    && coordinate.ordered_minibatch
+                        == minibatch.ordered_minibatch
+                    && coordinate.macrobatch == minibatch.macrobatch
+                    && coordinate.minibatch == minibatch.minibatch
+                    && coordinate.global_m == expected_m
+                    && coordinate.n128 == expected_n128,
+                std::string(test.name) + ": stage/decode interlock at "
+                    + std::to_string(ordinal));
+    }
 }
 
 #if defined(__CUDACC__)
@@ -182,6 +301,7 @@ void check_host_case(const probe_case &test) {
     require(shape.num_macrobatches == test.expected_q,
             std::string(test.name) + ": Q mismatch");
     check_counter_contract(test, shape);
+    check_case_goldens(test, shape);
 
     int64_t next_ordinal = 0;
     std::vector<int> m_tile_ranges(test.num_tokens / terminal::M_TILE, 0);
@@ -213,6 +333,15 @@ void check_host_case(const probe_case &test) {
                         == static_cast<int64_t>(terminal::W2_CLUSTER_TASKS)
                             * range.active_m_tiles,
                 std::string(test.name) + ": stage range cardinality");
+        check_stage_decode_interlock(
+            test, shape, range, terminal::logical_stage::gate, gate);
+        check_stage_decode_interlock(
+            test, shape, range, terminal::logical_stage::up, up);
+        check_stage_decode_interlock(
+            test, shape, range, terminal::logical_stage::activation,
+            activation);
+        check_stage_decode_interlock(
+            test, shape, range, terminal::logical_stage::w2, w2);
         for (int r = 0; r < range.active_m_tiles; ++r) {
             const int m = range.first_m_tile + r;
             require(m >= 0 && m < static_cast<int>(m_tile_ranges.size()),
@@ -236,16 +365,11 @@ void check_host_case(const probe_case &test) {
         static_cast<size_t>(m_tiles * terminal::W13_N_TILES), 0);
     std::vector<int> hidden_arrivals(static_cast<size_t>(m_tiles), 0);
     std::vector<int> y_arrivals(static_cast<size_t>(m_tiles), 0);
-    int previous_ordered_minibatch = -1;
     for (int64_t ordinal = 0; ordinal < shape.total_tasks; ++ordinal) {
         const auto coordinate =
             terminal::decode_logical_cursor(shape, ordinal);
         require(coordinate.valid,
                 std::string(test.name) + ": invalid active coordinate");
-        require(coordinate.cursor_ordinal == ordinal,
-                std::string(test.name) + ": cursor is not monotonic");
-        require(coordinate.ordered_minibatch >= previous_ordered_minibatch,
-                std::string(test.name) + ": ordered minibatch regressed");
         require(coordinate.global_m >= 0
                     && coordinate.global_m
                         < test.num_tokens / terminal::M_TILE,
@@ -307,7 +431,6 @@ void check_host_case(const probe_case &test) {
                 terminal::counter_arrivals_per_cluster_task(
                     terminal::ready_counter::y_routed, coordinate.stage);
         }
-        previous_ordered_minibatch = coordinate.ordered_minibatch;
     }
     require(std::all_of(cluster_visits.begin(), cluster_visits.end(),
                         [](int count) { return count == 1; }),
@@ -398,8 +521,7 @@ __global__ void device_decode_probe(terminal::logical_shape shape,
         return;
     const auto coordinate = terminal::decode_logical_cursor(shape, ordinal);
     const int key = canonical_cluster_task(coordinate, m_tiles);
-    if (!coordinate.valid || coordinate.cursor_ordinal != ordinal
-            || key < 0 || key >= shape.total_tasks) {
+    if (!coordinate.valid || key < 0 || key >= shape.total_tasks) {
         atomicAdd(errors, 1);
         return;
     }

@@ -81,9 +81,9 @@ struct logical_shape {
     int minibatches_per_macrobatch;
     int num_global_minibatches;
     int last_macrobatch_minibatches;
-    int tasks_per_full_minibatch;
+    int64_t tasks_per_full_minibatch;
     int tail_m_tiles;
-    int tasks_in_tail_minibatch;
+    int64_t tasks_in_tail_minibatch;
     int ordered_tail_minibatch;
     int64_t tail_ordinal;
     int64_t total_tasks;
@@ -156,8 +156,8 @@ MOK_TERMINAL_HD logical_shape make_logical_shape(
                ? 0
                : (result.num_macrobatches - 1)
                      * result.minibatches_per_macrobatch);
-    result.tasks_per_full_minibatch =
-        TASKS_PER_M64 * (minibatch_rows / M_TILE);
+    result.tasks_per_full_minibatch = static_cast<int64_t>(TASKS_PER_M64)
+        * (minibatch_rows / M_TILE);
     result.total_tasks = static_cast<int64_t>(TASKS_PER_M64)
         * (num_tokens / M_TILE);
 
@@ -169,7 +169,8 @@ MOK_TERMINAL_HD logical_shape make_logical_shape(
     result.tail_m_tiles =
         (num_tokens - (result.num_global_minibatches - 1) * minibatch_rows)
         / M_TILE;
-    result.tasks_in_tail_minibatch = TASKS_PER_M64 * result.tail_m_tiles;
+    result.tasks_in_tail_minibatch = static_cast<int64_t>(TASKS_PER_M64)
+        * result.tail_m_tiles;
     result.ordered_tail_minibatch = result.last_macrobatch_minibatches - 1;
     result.tail_ordinal = static_cast<int64_t>(
         result.ordered_tail_minibatch) * result.tasks_per_full_minibatch;
