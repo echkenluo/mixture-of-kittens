@@ -11,9 +11,118 @@
 // In particular, run_tile receives the already selected expert explicitly.
 // A dispatch/compute caller must perform its x-ready acquire before reading
 // m_indices and passing the result here.
-#if defined(KITTENS_SM90)
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+
+namespace mok_sm90::fp8_block_pipeline {
+
+// DeepSeek-V4 terminal activation contract.  A logical 256-thread worker
+// group covers one H4096 gate/up row: worker u owns eight adjacent output
+// values, and every 16-worker subgroup owns one K128 FP8 scale.  Cluster-2
+// callers form u as cta_rank * 128 + threadIdx.x; the contiguous reference
+// kernel passes threadIdx.x directly.  Keep this mapping and the arithmetic
+// order stable so both paths remain bitwise comparable.
+constexpr int V4_INTERMEDIATE = 2048;
+constexpr int V4_GATE_UP = 2 * V4_INTERMEDIATE;
+constexpr int V4_FP8_GROUP = 128;
+constexpr int V4_ACTIVATION_VALUES_PER_WORKER = 8;
+constexpr int V4_ACTIVATION_WORKERS =
+    V4_INTERMEDIATE / V4_ACTIVATION_VALUES_PER_WORKER;
+constexpr float V4_FP8_MAX = 448.0f;
+
+__device__ __forceinline__ uint16_t pack_v4_fp8x2(float x, float y) {
+    x = fmaxf(fminf(x, V4_FP8_MAX), -V4_FP8_MAX);
+    y = fmaxf(fminf(y, V4_FP8_MAX), -V4_FP8_MAX);
+    uint16_t result;
+    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}"
+                 : "=h"(result) : "f"(x), "f"(y));
+    return result;
+}
+
+__device__ __forceinline__ float subgroup_max_16(float value) {
+#pragma unroll
+    for (int mask = 8; mask > 0; mask >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
+    return value;
+}
+
+__device__ __forceinline__ void activate_quant_worker(
+    const __nv_bfloat16 *input, uint8_t *output, float *output_scale,
+    int row, int worker, float limit) {
+    const auto *row_pairs = reinterpret_cast<const __nv_bfloat162 *>(
+        input + static_cast<size_t>(row) * V4_GATE_UP);
+    auto *out_pairs = reinterpret_cast<uint16_t *>(
+        output + static_cast<size_t>(row) * V4_INTERMEDIATE);
+    const int element = worker * V4_ACTIVATION_VALUES_PER_WORKER;
+    const int pair = element / 2;
+    const __nv_bfloat162 limit2 = __floats2bfloat162_rn(limit, limit);
+    const __nv_bfloat162 neg_limit2 =
+        __floats2bfloat162_rn(-limit, -limit);
+    float values[V4_ACTIVATION_VALUES_PER_WORKER];
+    float local_max = 0.0f;
+
+#pragma unroll
+    for (int index = 0; index < V4_ACTIVATION_VALUES_PER_WORKER / 2;
+         ++index) {
+        __nv_bfloat162 gate = __hmin2(row_pairs[pair + index], limit2);
+        __nv_bfloat162 up = __hmax2(
+            row_pairs[V4_INTERMEDIATE / 2 + pair + index], neg_limit2);
+        up = __hmin2(up, limit2);
+        const float2 gate_f = __bfloat1622float2(gate);
+        const float2 up_f = __bfloat1622float2(up);
+        const float x =
+            gate_f.x / (1.0f + __expf(-gate_f.x)) * up_f.x;
+        const float y =
+            gate_f.y / (1.0f + __expf(-gate_f.y)) * up_f.y;
+        values[2 * index] = x;
+        values[2 * index + 1] = y;
+        local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
+
+    const float absmax = fmaxf(subgroup_max_16(local_max), 1e-10f);
+    const float scale = absmax / V4_FP8_MAX;
+    const float inv_scale = 1.0f / scale;
+#pragma unroll
+    for (int index = 0; index < V4_ACTIVATION_VALUES_PER_WORKER / 2;
+         ++index)
+        out_pairs[pair + index] = pack_v4_fp8x2(
+            values[2 * index] * inv_scale,
+            values[2 * index + 1] * inv_scale);
+    if ((threadIdx.x & 15) == 0)
+        output_scale[static_cast<size_t>(row)
+                         * (V4_INTERMEDIATE / V4_FP8_GROUP)
+                     + worker / 16] = scale;
+}
+
+// One worker owns one output column.  Route slots are accumulated in the
+// production routed-epilogue order: a rounded FP32 multiply for slot zero,
+// then rounded FP32 FMAs for slots one through topk-1, followed by one BF16
+// rounding.  Spelling out the instructions makes exact behavior independent
+// of compiler contraction choices under --use_fast_math.
+__device__ __forceinline__ void weighted_reduce_element(
+    const __nv_bfloat16 *combine, const float *weights,
+    __nv_bfloat16 *output, int token, int column, int topk, int hidden) {
+    const size_t route_base = static_cast<size_t>(token) * topk;
+    float accumulator = __fmul_rn(
+        __bfloat162float(combine[route_base * hidden + column]),
+        weights[route_base]);
+    for (int route = 1; route < topk; ++route) {
+        accumulator = __fmaf_rn(
+            __bfloat162float(
+                combine[(route_base + route) * hidden + column]),
+            weights[route_base + route], accumulator);
+    }
+    output[static_cast<size_t>(token) * hidden + column] =
+        __float2bfloat16_rn(accumulator);
+}
+
+}  // namespace mok_sm90::fp8_block_pipeline
+
+#if defined(KITTENS_SM90)
 
 #include "kittens.cuh"
 

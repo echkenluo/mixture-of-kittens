@@ -8,80 +8,25 @@
 #include <cstdint>
 #include <vector>
 
+#include "../csrc/sm90_fp8_block_pipeline_primitives.cuh"
+
 namespace {
 
-constexpr int kIntermediate = 2048;
-constexpr int kGateUp = 2 * kIntermediate;
-constexpr int kGroup = 128;
-constexpr int kValuesPerThread = 8;
-constexpr int kReferenceThreads = kIntermediate / kValuesPerThread;
+namespace pipeline = mok_sm90::fp8_block_pipeline;
+
+constexpr int kIntermediate = pipeline::V4_INTERMEDIATE;
+constexpr int kGateUp = pipeline::V4_GATE_UP;
+constexpr int kGroup = pipeline::V4_FP8_GROUP;
+constexpr int kReferenceThreads = pipeline::V4_ACTIVATION_WORKERS;
 constexpr int kClusterThreads = kReferenceThreads / 2;
-constexpr float kFp8Max = 448.0f;
-
-__device__ __forceinline__ uint16_t pack_fp8x2(float x, float y) {
-    x = fmaxf(fminf(x, kFp8Max), -kFp8Max);
-    y = fmaxf(fminf(y, kFp8Max), -kFp8Max);
-    uint16_t result;
-    asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}"
-                 : "=h"(result) : "f"(x), "f"(y));
-    return result;
-}
-
-__device__ __forceinline__ float subgroup_max_16(float value) {
-#pragma unroll
-    for (int mask = 8; mask > 0; mask >>= 1)
-        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
-    return value;
-}
-
-__device__ __forceinline__ void activate_row(
-    const __nv_bfloat16 *input, uint8_t *output, float *output_scale,
-    int row, int worker, float limit) {
-    const auto *row_pairs = reinterpret_cast<const __nv_bfloat162 *>(
-        input + static_cast<size_t>(row) * kGateUp);
-    auto *out_pairs = reinterpret_cast<uint16_t *>(
-        output + static_cast<size_t>(row) * kIntermediate);
-    const int element = worker * kValuesPerThread;
-    const int pair = element / 2;
-    const __nv_bfloat162 limit2 = __floats2bfloat162_rn(limit, limit);
-    const __nv_bfloat162 neg_limit2 = __floats2bfloat162_rn(-limit, -limit);
-    float values[kValuesPerThread];
-    float local_max = 0.0f;
-
-#pragma unroll
-    for (int index = 0; index < kValuesPerThread / 2; ++index) {
-        __nv_bfloat162 gate = __hmin2(row_pairs[pair + index], limit2);
-        __nv_bfloat162 up = __hmax2(
-            row_pairs[kIntermediate / 2 + pair + index], neg_limit2);
-        up = __hmin2(up, limit2);
-        const float2 gate_f = __bfloat1622float2(gate);
-        const float2 up_f = __bfloat1622float2(up);
-        const float x = gate_f.x / (1.0f + __expf(-gate_f.x)) * up_f.x;
-        const float y = gate_f.y / (1.0f + __expf(-gate_f.y)) * up_f.y;
-        values[2 * index] = x;
-        values[2 * index + 1] = y;
-        local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
-    }
-
-    const float absmax = fmaxf(subgroup_max_16(local_max), 1e-10f);
-    const float scale = absmax / kFp8Max;
-    const float inv_scale = 1.0f / scale;
-#pragma unroll
-    for (int index = 0; index < kValuesPerThread / 2; ++index)
-        out_pairs[pair + index] = pack_fp8x2(
-            values[2 * index] * inv_scale,
-            values[2 * index + 1] * inv_scale);
-    if ((threadIdx.x & 15) == 0)
-        output_scale[static_cast<size_t>(row) * (kIntermediate / kGroup)
-                     + worker / 16] = scale;
-}
 
 __global__ __launch_bounds__(kReferenceThreads, 1)
 void reference_kernel(const __nv_bfloat16 *input, uint8_t *output,
                       float *output_scale, int rows, float limit) {
     const int row = blockIdx.x;
     if (row < rows)
-        activate_row(input, output, output_scale, row, threadIdx.x, limit);
+        pipeline::activate_quant_worker(
+            input, output, output_scale, row, threadIdx.x, limit);
 }
 
 // Terminal mapping: one cluster owns one M64.  The two 128-thread CTAs form
@@ -97,7 +42,8 @@ __global__ void cluster_kernel(const __nv_bfloat16 *input, uint8_t *output,
     const int first_row = cluster * 64;
 #pragma unroll 1
     for (int row = first_row; row < first_row + 64 && row < rows; ++row)
-        activate_row(input, output, output_scale, row, worker, limit);
+        pipeline::activate_quant_worker(
+            input, output, output_scale, row, worker, limit);
 }
 
 void check_tensors(const at::Tensor &input, const at::Tensor &output,

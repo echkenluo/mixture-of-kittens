@@ -8,29 +8,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "../csrc/sm90_fp8_block_pipeline_primitives.cuh"
+
 namespace {
 
 constexpr int kThreads = 128;
 
-__device__ __forceinline__ void reduce_element(
-    const __nv_bfloat16 *combine, const float *weights,
-    __nv_bfloat16 *output, int token, int column, int topk, int hidden) {
-    const size_t route_base = static_cast<size_t>(token) * topk;
-    float accumulator = __fmul_rn(
-        __bfloat162float(combine[route_base * hidden + column]),
-        weights[route_base]);
-    for (int route = 1; route < topk; ++route) {
-        // ThunderKittens' production rv_fl mul+add sequence is compiled as
-        // FFMA under MoK's --use_fast_math build.  Spell that instruction
-        // explicitly so exact output does not depend on optimizer fusion.
-        accumulator = __fmaf_rn(
-            __bfloat162float(
-                combine[(route_base + route) * hidden + column]),
-            weights[route_base + route], accumulator);
-    }
-    output[static_cast<size_t>(token) * hidden + column] =
-        __float2bfloat16_rn(accumulator);
-}
+namespace pipeline = mok_sm90::fp8_block_pipeline;
 
 __global__ __launch_bounds__(2 * kThreads, 1)
 void reference_kernel(const __nv_bfloat16 *combine, const float *weights,
@@ -40,7 +24,7 @@ void reference_kernel(const __nv_bfloat16 *combine, const float *weights,
     if (token >= tokens) return;
     for (int column = threadIdx.x; column < hidden;
          column += 2 * kThreads)
-        reduce_element(
+        pipeline::weighted_reduce_element(
             combine, weights, output, token, column, topk, hidden);
 }
 
@@ -57,7 +41,7 @@ __global__ void reduce_kernel(const __nv_bfloat16 *combine,
     const int worker = cta_rank * kThreads + threadIdx.x;
     if (token >= tokens) return;
     for (int column = worker; column < hidden; column += 2 * kThreads)
-        reduce_element(
+        pipeline::weighted_reduce_element(
             combine, weights, output, token, column, topk, hidden);
 }
 
