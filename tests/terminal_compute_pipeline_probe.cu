@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "pyutils/torchutils.cuh"
 #include "../csrc/sm90_fp8_block_terminal_compute.cuh"
 #include "../csrc/sm90_fp8_block_worker_test.cuh"
 
