@@ -87,6 +87,7 @@ def check_source_contract() -> None:
     if header.count("__global__ void kernel") != 1:
         raise RuntimeError("full header must expose exactly one kernel")
     production_required = (
+        "constexpr int MAX_EXPERTS = 256",
         "production_input_barrier(g, cluster, cta_rank)",
         "production_completion_epilogue(g, cta_rank)",
         "multimem.red.release.sys.global.add.u32",
@@ -370,24 +371,26 @@ def run_device(args: argparse.Namespace) -> None:
         raise ValueError("--seeds and --spin-limit must be positive")
 
     local_tokens = 8
+    local_experts = 64
     for seed in range(args.seeds):
         generator = torch.Generator(device="cuda").manual_seed(seed)
         # The communication primitive owns raw E4M3 bytes; routed_x receives
         # those bytes into a typed float8 tensor consumed by WGMMA.
         peer_x = make_fp8((4, local_tokens, 4096), generator).view(torch.uint8)
         peer_scale = make_scale((4, local_tokens, 32), generator)
-        w13 = make_fp8((1, 4096, 4096), generator)
-        w13_scale = make_scale((1, 32, 32), generator)
-        w2 = make_fp8((1, 4096, 2048), generator)
-        w2_scale = make_scale((1, 32, 16), generator)
+        w13 = make_fp8((local_experts, 4096, 4096), generator)
+        w13_scale = make_scale((local_experts, 32, 32), generator)
+        w2 = make_fp8((local_experts, 4096, 2048), generator)
+        w2_scale = make_scale((local_experts, 32, 16), generator)
 
         for rows in rows_cases:
             schedule_peer, schedule_slot, push_order, invalid_rows, valid = (
                 make_route_contract(rows, local_tokens)
             )
             num_tokens = torch.tensor([rows], dtype=torch.int32, device="cuda")
-            tokens_per_expert = torch.tensor(
-                [rows], dtype=torch.int32, device="cuda"
+            tokens_per_expert = torch.full(
+                (local_experts,), rows // local_experts,
+                dtype=torch.int32, device="cuda"
             )
             topk_ids = torch.full(
                 (4, local_tokens, 6), -1, dtype=torch.int32, device="cuda"

@@ -30,7 +30,11 @@ namespace route = fp8_block_terminal_route_flags;
 
 constexpr int COMM_CLUSTERS = 1;
 constexpr int COMM_CLUSTER = 0;
-constexpr int MAX_EXPERTS = 16;
+// DeepSeek-V4 has 256 routed experts globally.  Production currently targets
+// EP4, so the common case is 64 local experts, but keeping the full model
+// bound here preserves the workspace/entry contract and costs only 1 KiB of
+// static shared memory for the expert row-end table.
+constexpr int MAX_EXPERTS = 256;
 constexpr unsigned int STOP_TICKET = ~0u;
 constexpr unsigned int DONE_TICKET = STOP_TICKET - 1u;
 constexpr unsigned int FAILED_TICKET = STOP_TICKET - 2u;
