@@ -92,8 +92,8 @@ def check_source_contract() -> None:
         raise RuntimeError("full header must expose exactly one kernel")
     production_required = (
         "constexpr int MAX_EXPERTS = 256",
-        "elect_comm_cluster(g, cluster, cta_rank)",
-        "production_input_barrier(g, cluster, cta_rank, comm_cluster)",
+        "elect_runtime_role(g, cluster, cta_rank)",
+        "production_input_barrier(g, cluster, cta_rank, role)",
         "production_completion_epilogue(g, cta_rank)",
         "multimem.red.release.sys.global.add.u32",
         "atom.add.acq_rel.gpu.global.u32",
@@ -113,7 +113,9 @@ def check_source_contract() -> None:
     nullable_fields = (
         "barrier_flag", "barrier_target", "barrier_multicast_ptr",
         "input_expected_scratch", "in_use", "epilogue_done",
-        "comm_owner", "comm_worker_ticket", "producer_done", "push_done",
+        "comm_owner", "role_cursor", "cluster_role",
+        "comm_worker_ticket", "dispatch_tile_cursor", "push_tile_cursor",
+        "producer_done", "push_done",
         "terminate",
         "trap_record",
     )
@@ -128,16 +130,17 @@ def check_source_contract() -> None:
         )
     kernel_body = header[header.find("__global__ void kernel") :]
     comm_branch = kernel_body[
-        kernel_body.find("if (cluster == comm_cluster)") :
+        kernel_body.find("if (role < g.comm_clusters)") :
         kernel_body.find("production_completion_epilogue")
     ]
     if "communication_role(g, cta_rank);\n        return;" in comm_branch:
         raise RuntimeError("communication role bypasses common lease epilogue")
     election_required = (
         "UNCLAIMED_COMM = ~0u",
-        "atom.cas.acq_rel.gpu.global.b32",
-        "cluster < comm_cluster",
-        "cluster - COMM_CLUSTERS",
+        "atomicAdd(g.role_cursor, 1u)",
+        "g.cluster_role + cluster",
+        "role < g.comm_clusters",
+        "role - g.comm_clusters",
         "SITE_TERMINAL_COMM_OWNER",
     )
     missing_election = [item for item in election_required if item not in header]
@@ -174,7 +177,8 @@ def check_source_contract() -> None:
         "g.reduce_done) >= total_tokens",
         "compute::add_release_gpu(g.producer_done, 1u)",
         "compute::add_release_gpu(g.push_done, 1u)",
-        "compute::store_release_gpu(g.comm_closed, 2u)",
+        "compute::store_release_gpu(g.comm_closed, 1u)",
+        '"l"(ticket_slot), "r"(decision)',
     )
     missing_closure = [item for item in closure_required if item not in header]
     if missing_closure:

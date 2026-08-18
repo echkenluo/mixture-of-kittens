@@ -232,6 +232,11 @@ def poison_terminal(workspace) -> None:
         workspace.epilogue_claim,
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
+        workspace.role_cursor,
+        workspace.cluster_role,
+        workspace.dispatch_tile_cursor,
+        workspace.dispatch_tiles_done,
+        workspace.push_tile_cursor,
         workspace.worker_ticket,
         workspace.comm_worker_ticket,
         workspace.producer_done,
@@ -324,10 +329,14 @@ def check_inactive_untouched(workspace) -> None:
 def check_closure(workspace) -> None:
     expected = {
         "in_use": 0,
+        "role_cursor": 1 + COMPUTE_CLUSTERS,
+        "dispatch_tile_cursor": 1,
+        "dispatch_tiles_done": 1,
+        "push_tile_cursor": 1,
         "next_logical_cluster": 65,
         "comm_worker_ticket": -2,
         "producer_done": 65,
-        "comm_closed": 2,
+        "comm_closed": 1,
         "push_done": ACTIVE_ROWS,
         "reduce_done": LOCAL_TOKENS,
         "terminate": 1,
@@ -344,6 +353,10 @@ def check_closure(workspace) -> None:
         raise RuntimeError(
             f"terminal closure mismatch: expected={expected}, observed={observed}"
         )
+    if sorted(workspace.cluster_role.tolist()) != list(
+        range(1 + COMPUTE_CLUSTERS)
+    ):
+        raise RuntimeError("terminal role ordinals are not unique")
     if not bool(torch.all(workspace.route_ready == 1).item()):
         raise RuntimeError("terminal route-ready closure is incomplete")
     if not bool(

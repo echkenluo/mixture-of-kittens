@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--aba-drift-limit", type=float, default=0.05)
     parser.add_argument(
+        "--comm-clusters",
+        type=int,
+        default=1,
+        help="runtime terminal communication clusters",
+    )
+    parser.add_argument(
         "--compute-clusters",
         type=int,
         default=0,
@@ -140,7 +146,11 @@ def parse_args() -> argparse.Namespace:
         or not 0 <= args.aba_drift_limit <= 0.25
     ):
         raise ValueError("--aba-drift-limit must be finite and in [0,0.25]")
-    if args.compute_clusters < 0 or args.copy_clusters <= 0:
+    if (
+        args.comm_clusters <= 0
+        or args.compute_clusters < 0
+        or args.copy_clusters <= 0
+    ):
         raise ValueError("cluster counts are invalid")
     if (
         args.minibatch_rows <= 0
@@ -504,6 +514,7 @@ def make_runners(
         num_local_tokens=cell.graph_tokens,
         schedule_capacity=cell.schedule_capacity,
         num_local_experts=LOCAL_EXPERTS,
+        comm_clusters=args.comm_clusters,
         compute_clusters=requested_compute,
     )
 
@@ -679,13 +690,17 @@ def assert_terminal_closed(workspace: object, cell: Cell) -> None:
     total_tasks = cell.active_rows // M_TILE * 65
     expected = {
         "in_use": 0,
+        "role_cursor": workspace.comm_clusters + workspace.compute_clusters,
+        "dispatch_tile_cursor": cell.active_rows // M_TILE,
+        "dispatch_tiles_done": cell.active_rows // M_TILE,
+        "push_tile_cursor": cell.active_rows // M_TILE,
         "next_logical_cluster": total_tasks,
         "producer_done": total_tasks,
-        "comm_closed": 2,
+        "comm_closed": 1,
         "push_done": cell.active_rows,
         "reduce_done": cell.graph_tokens,
         "terminate": 1,
-        "epilogue_done": 1 + workspace.compute_clusters,
+        "epilogue_done": workspace.comm_clusters + workspace.compute_clusters,
     }
     observed = {
         name: int(getattr(workspace, name).item()) for name in expected
@@ -694,6 +709,9 @@ def assert_terminal_closed(workspace: object, cell: Cell) -> None:
         raise RuntimeError(
             f"terminal closure mismatch: expected={expected} observed={observed}"
         )
+    roles = sorted(int(value) for value in workspace.cluster_role.tolist())
+    if roles != list(range(workspace.comm_clusters + workspace.compute_clusters)):
+        raise RuntimeError(f"terminal role assignment is not unique: {roles}")
     if not bool(torch.all(workspace.route_ready == 1).item()):
         raise RuntimeError("terminal route_ready is not closed")
     if not bool(torch.all(workspace.epilogue_claim == 1).item()):
@@ -913,6 +931,7 @@ def benchmark_cell(
         "valid_routes": cell.valid_routes,
         "active_rows": cell.active_rows,
         "schedule_capacity": cell.schedule_capacity,
+        "comm_clusters": terminal_workspace.comm_clusters,
         "compute_clusters": terminal_workspace.compute_clusters,
         "max_compute_clusters": terminal_workspace.max_compute_clusters,
         "copy_clusters": args.copy_clusters,

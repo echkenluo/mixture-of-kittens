@@ -193,6 +193,17 @@ def check_python_entry_contract() -> None:
         raise RuntimeError(
             "terminal leased entry must pass the owner ticket to prepare and full"
         )
+    for state in (
+        "role_cursor",
+        "cluster_role",
+        "dispatch_tile_cursor",
+        "dispatch_tiles_done",
+        "push_tile_cursor",
+    ):
+        if leased_source.count(f"workspace.{state}") != 2:
+            raise RuntimeError(
+                f"terminal leased entry must pass {state} to prepare and full"
+            )
 
     orchestrator_source = inspect.getsource(megakernel_fp8_block_from_topk)
     orchestrator_order = (
@@ -386,14 +397,18 @@ def main() -> int:
             )
             iteration_state = {
                 "in_use": 0,
+                "role_cursor": 1 + COMPUTE_CLUSTERS,
+                "dispatch_tile_cursor": 1,
+                "dispatch_tiles_done": 1,
+                "push_tile_cursor": 1,
                 "next_logical_cluster": 65,
                 "comm_worker_ticket": -2,
                 "producer_done": 65,
-                "comm_closed": 2,
+                "comm_closed": 1,
                 "push_done": CAPACITY,
                 "reduce_done": LOCAL_TOKENS,
                 "terminate": 1,
-                "epilogue_done": 1 + COMPUTE_CLUSTERS,
+                "epilogue_done": workspace.comm_clusters + COMPUTE_CLUSTERS,
                 "barrier_target": EP_SIZE * (iteration + 1),
                 "input_expected_scratch": EP_SIZE * (iteration + 1),
             }
@@ -407,6 +422,10 @@ def main() -> int:
                     f"expected={iteration_state}, "
                     f"observed={observed_iteration_state}"
                 )
+            if sorted(workspace.cluster_role.tolist()) != list(
+                range(workspace.comm_clusters + COMPUTE_CLUSTERS)
+            ):
+                raise RuntimeError("terminal role ordinals are not unique")
 
         require_exact("routed_x", reference["routed_x"], workspace.routed_x)
         require_exact(
