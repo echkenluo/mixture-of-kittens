@@ -268,6 +268,29 @@ __global__ void terminal_scheduler_kernel(
     }
 }
 
+int64_t terminal_scheduler_max_active_clusters(int64_t device_index) {
+    c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_index));
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(2, 1, 1);
+    config.blockDim = dim3(THREADS, 1, 1);
+    cudaLaunchAttribute attribute = {};
+    attribute.id = cudaLaunchAttributeClusterDimension;
+    attribute.val.clusterDim.x = 2;
+    attribute.val.clusterDim.y = 1;
+    attribute.val.clusterDim.z = 1;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    int max_clusters = 0;
+    const cudaError_t status = cudaOccupancyMaxActiveClusters(
+        &max_clusters, terminal_scheduler_kernel, &config);
+    TORCH_CHECK(status == cudaSuccess,
+                "terminal scheduler occupancy query failed: ",
+                cudaGetErrorString(status));
+    TORCH_CHECK(max_clusters >= 1,
+                "terminal scheduler has zero active cluster occupancy");
+    return static_cast<int64_t>(max_clusters);
+}
+
 void run_terminal_scheduler_probe(
     const at::Tensor &copy_head, const at::Tensor &terminal_count,
     const at::Tensor &w13_state, const at::Tensor &w13_descriptor,
@@ -369,4 +392,5 @@ void run_terminal_scheduler_probe(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("run", &run_terminal_scheduler_probe);
+    module.def("max_active_clusters", &terminal_scheduler_max_active_clusters);
 }

@@ -30,7 +30,7 @@ def build_extension():
     return load(
         name="mok_terminal_scheduler_probe",
         sources=[str(Path(__file__).with_suffix(".cu"))],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v"],
         verbose=False,
     )
 
@@ -50,10 +50,21 @@ def main() -> int:
     args = parse_args()
     torch.cuda.set_device(0)
     module = build_extension()
+    max_active_clusters = int(module.max_active_clusters(0))
+    requested_clusters = csv_ints(args.clusters)
+    if max(requested_clusters) > max_active_clusters:
+        raise RuntimeError(
+            "requested cluster grid is not fully resident: "
+            f"requested={max(requested_clusters)} occupancy={max_active_clusters}"
+        )
+    print(
+        f"TERMINAL_SCHEDULER_OCCUPANCY|max_active_clusters={max_active_clusters}",
+        flush=True,
+    )
     w13_per_m = 32
     w2_per_m = 32
     rows = []
-    for clusters in csv_ints(args.clusters):
+    for clusters in requested_clusters:
         worker_descriptor = zeros(clusters * 2)
         for m_tiles in csv_ints(args.m_tiles):
             for act_per_m in csv_ints(args.act_per_m):
