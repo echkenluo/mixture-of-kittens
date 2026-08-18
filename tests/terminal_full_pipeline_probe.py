@@ -49,6 +49,10 @@ def check_source_contract() -> None:
         "ep_rank",
         "combine_local",
         "route_ready_local",
+        "owner_help_one_producer",
+        "run_producer_task_body",
+        "claim_ready_for_owner",
+        "owner_task_ready",
     )
     missing = [needle for needle in required if needle not in header]
     if missing:
@@ -109,7 +113,8 @@ def check_source_contract() -> None:
     nullable_fields = (
         "barrier_flag", "barrier_target", "barrier_multicast_ptr",
         "input_expected_scratch", "in_use", "epilogue_done",
-        "comm_owner", "producer_done", "push_done", "terminate",
+        "comm_owner", "comm_worker_ticket", "producer_done", "push_done",
+        "terminate",
         "trap_record",
     )
     missing_null_defaults = [
@@ -140,6 +145,28 @@ def check_source_contract() -> None:
         raise RuntimeError(
             f"dynamic resident comm election missing: {missing_election}"
         )
+    owner_help_required = (
+        "claim_ready_for_owner(g, shape)",
+        "owner_task_ready(g, coordinate)",
+        "run_producer_task_body(",
+        "fence.proxy.async.global",
+        "try_reduce_one_ready_token(g)",
+        "g.ready.y_ready + m",
+        "g.producer_done",
+    )
+    owner_help = header[
+        header.find("owner_task_ready") :
+        header.find("// One CTA probes exactly one")
+    ]
+    missing_owner_help = [
+        item for item in owner_help_required if item not in owner_help
+    ]
+    if missing_owner_help:
+        raise RuntimeError(
+            f"communication-owner progress contract missing: {missing_owner_help}"
+        )
+    if "wait_until_at_least" in owner_help:
+        raise RuntimeError("communication owner must not claim a blocked producer")
     closure_required = (
         "g.producer_done) >= total_tasks",
         "g.comm_closed) >= 1u",
@@ -152,7 +179,8 @@ def check_source_contract() -> None:
     missing_closure = [item for item in closure_required if item not in header]
     if missing_closure:
         raise RuntimeError(f"production closure contract missing: {missing_closure}")
-    probe_start = header.find("try_reduce_one_ready_token")
+    probe_start = header.find("// One CTA probes exactly one")
+    probe_start = header.find("try_reduce_one_ready_token", probe_start)
     probe_end = header.find("compute_and_reduce_role", probe_start)
     probe = header[probe_start:probe_end]
     if "while" in probe or "for (" in probe or "__nanosleep" in probe:
@@ -169,8 +197,8 @@ def check_source_contract() -> None:
     if len(launches) != 1:
         raise RuntimeError(f"candidate path must launch one kernel, found {len(launches)}")
     dynamic_required = (
-        "worker_ticket.numel() == compute_clusters",
-        "worker_failed.numel() == compute_clusters",
+        "worker_ticket.numel() == worker_slots",
+        "worker_failed.numel() == worker_slots",
         "max_resident_clusters - full::COMM_CLUSTERS",
         "full::COMM_CLUSTERS + g.compute_clusters",
         "g.combine_local = g.combine_peer[ep_rank]",
@@ -181,6 +209,21 @@ def check_source_contract() -> None:
     missing_dynamic = [item for item in dynamic_required if item not in source]
     if missing_dynamic:
         raise RuntimeError(f"dynamic resident launch contract missing: {missing_dynamic}")
+    owner_only_required = (
+        "compute_clusters == 0",
+        "MOK_STATE_PTR(comm_owner, comm_owner)",
+        "MOK_STATE_PTR(comm_worker_ticket, comm_worker_ticket)",
+        "MOK_STATE_PTR(producer_done, producer_done)",
+        "MOK_STATE_PTR(push_done, push_done)",
+        "MOK_STATE_PTR(terminate, terminate)",
+    )
+    missing_owner_only = [
+        item for item in owner_only_required if item not in run_full
+    ]
+    if missing_owner_only:
+        raise RuntimeError(
+            f"forced owner-only probe wiring missing: {missing_owner_only}"
+        )
     scan_required = (
         "min(7, max_compute_clusters)",
         "resident_clusters - 1",
@@ -359,12 +402,18 @@ def run_device(args: argparse.Namespace) -> None:
     max_compute_clusters = attrs[6]
     compute_cases = sorted(
         {
+            0,
             1,
             min(7, max_compute_clusters),
             resident_clusters - 1,
         }
     )
-    if compute_cases[0] < 1 or compute_cases[-1] > max_compute_clusters:
+    if (
+        compute_cases[0] != 0
+        or len(compute_cases) < 2
+        or compute_cases[1] < 1
+        or compute_cases[-1] > max_compute_clusters
+    ):
         raise RuntimeError(
             f"N scan exceeds resident capacity: {compute_cases}, attrs={attrs}"
         )
@@ -484,6 +533,7 @@ def run_device(args: argparse.Namespace) -> None:
             m_tiles = rows // 64
             total_tasks = rows // 64 * 65
             for compute_clusters in compute_cases:
+                owner_only = compute_clusters == 0
                 for ep_rank in range(4):
                     candidate = stage_buffers(rank_local_output=True)
                     candidate["hidden"].view(torch.uint8).fill_(0x7F)
@@ -507,10 +557,14 @@ def run_device(args: argparse.Namespace) -> None:
                             1, dtype=torch.int32, device="cuda"
                         ),
                         "worker_ticket": torch.zeros(
-                            compute_clusters, dtype=torch.int32, device="cuda"
+                            max(1, compute_clusters),
+                            dtype=torch.int32,
+                            device="cuda",
                         ),
                         "worker_failed": torch.zeros(
-                            compute_clusters, dtype=torch.int32, device="cuda"
+                            max(1, compute_clusters),
+                            dtype=torch.int32,
+                            device="cuda",
                         ),
                         "next_reduce_probe": torch.zeros(
                             1, dtype=torch.int32, device="cuda"
@@ -554,6 +608,21 @@ def run_device(args: argparse.Namespace) -> None:
                         "overlap_witness": torch.zeros(
                             1, dtype=torch.int32, device="cuda"
                         ),
+                        "comm_owner": torch.full(
+                            (1,), -1, dtype=torch.int32, device="cuda"
+                        ),
+                        "comm_worker_ticket": torch.zeros(
+                            1, dtype=torch.int32, device="cuda"
+                        ),
+                        "producer_done": torch.zeros(
+                            1, dtype=torch.int32, device="cuda"
+                        ),
+                        "push_done": torch.zeros(
+                            1, dtype=torch.int32, device="cuda"
+                        ),
+                        "terminate": torch.zeros(
+                            1, dtype=torch.int32, device="cuda"
+                        ),
                     }
                     module.run_full(
                         peer_x, peer_scale, w13, w13_scale, w2, w2_scale,
@@ -575,8 +644,11 @@ def run_device(args: argparse.Namespace) -> None:
                         state["progress_timeouts"],
                         state["dispatch_tiles_done"],
                         state["compute_started"], state["overlap_witness"],
+                        state["comm_owner"], state["comm_worker_ticket"],
+                        state["producer_done"], state["push_done"],
+                        state["terminate"],
                         ep_rank, compute_clusters, rows, rows,
-                        (1 << 20) if rows > 64 else 0,
+                        (1 << 20) if rows > 64 and not owner_only else 0,
                         args.spin_limit, 10.0,
                     )
                     torch.cuda.synchronize()
@@ -611,13 +683,21 @@ def run_device(args: argparse.Namespace) -> None:
                     scalar_expected = {
                         "cursor": total_tasks,
                         "reduce_done": local_tokens,
-                        "comm_closed": 1,
+                        "comm_closed": 2 if owner_only else 1,
                         "comm_failed": 0,
                         "errors": 0,
                         "progress_timeouts": 0,
                         "dispatch_tiles_done": m_tiles,
-                        "compute_started": 1,
+                        "compute_started": 0 if owner_only else 1,
                     }
+                    if owner_only:
+                        scalar_expected.update(
+                            comm_owner=0,
+                            comm_worker_ticket=-2,
+                            producer_done=total_tasks,
+                            push_done=rows,
+                            terminate=1,
+                        )
                     for name, expected in scalar_expected.items():
                         actual = int(state[name].item())
                         if actual != expected:
@@ -666,7 +746,7 @@ def run_device(args: argparse.Namespace) -> None:
                         )
                     witness = int(state["overlap_witness"].item())
                     required_witness = 0
-                    if rows > 64:
+                    if rows > 64 and not owner_only:
                         required_witness = 0b011
                         if compute_clusters == 1:
                             required_witness |= 0b100
@@ -681,6 +761,7 @@ def run_device(args: argparse.Namespace) -> None:
                         "TERMINAL_FULL_EXACT"
                         f"|rows={rows}|seed={seed}|ep_rank={ep_rank}"
                         f"|compute_clusters={compute_clusters}"
+                        f"|owner_only={int(owner_only)}"
                         f"|resident_clusters={resident_clusters}"
                         f"|invalid_routes={len(invalid_rows)}"
                         "|push_order=reverse_m64|candidate_launches=1"

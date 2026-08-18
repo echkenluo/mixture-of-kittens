@@ -189,6 +189,10 @@ def check_python_entry_contract() -> None:
         raise RuntimeError(
             "terminal leased entry must pass comm_owner to prepare and full"
         )
+    if leased_source.count("workspace.comm_worker_ticket") != 2:
+        raise RuntimeError(
+            "terminal leased entry must pass the owner ticket to prepare and full"
+        )
 
     orchestrator_source = inspect.getsource(megakernel_fp8_block_from_topk)
     orchestrator_order = (
@@ -383,6 +387,7 @@ def main() -> int:
             iteration_state = {
                 "in_use": 0,
                 "next_logical_cluster": 65,
+                "comm_worker_ticket": -2,
                 "producer_done": 65,
                 "comm_closed": 2,
                 "push_done": CAPACITY,

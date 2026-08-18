@@ -233,6 +233,7 @@ def poison_terminal(workspace) -> None:
         workspace.next_logical_cluster,
         workspace.next_reduce_probe,
         workspace.worker_ticket,
+        workspace.comm_worker_ticket,
         workspace.producer_done,
         workspace.comm_closed,
         workspace.push_done,
@@ -324,6 +325,7 @@ def check_closure(workspace) -> None:
     expected = {
         "in_use": 0,
         "next_logical_cluster": 65,
+        "comm_worker_ticket": -2,
         "producer_done": 65,
         "comm_closed": 2,
         "push_done": ACTIVE_ROWS,

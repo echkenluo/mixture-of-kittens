@@ -110,6 +110,10 @@ struct globals {
     unsigned int *x_ready;
     unsigned int *cursor;
     unsigned int *worker_ticket;
+    // The elected communication cluster may temporarily execute producer
+    // tasks while a push tile is not ready.  Its cluster-lockstep publication
+    // slot is independent from the densely mapped non-owner worker slots.
+    unsigned int *comm_worker_ticket = nullptr;
     unsigned int *worker_failed;
     unsigned int *next_reduce_probe;
     unsigned int *reduce_done;
@@ -356,9 +360,187 @@ __device__ void production_completion_epilogue(
     everyone::tma::cluster::sync();
 }
 
+// Forward declaration: the communication owner uses the same bounded reducer
+// after each pushed tile and while closing the production iteration.
+template <typename GemmProblem>
+__device__ route::claim_result try_reduce_one_ready_token(
+        const globals<GemmProblem> &g);
+
+// The numerical producer body is shared by ordinary workers and the elected
+// communication owner.  The caller owns the persistent phase bits and the
+// once-initialized mbarriers for its physical cluster.
+template <typename GemmProblem>
+__device__ __forceinline__ void run_producer_task_body(
+        const globals<GemmProblem> &g,
+        const terminal::logical_coordinate &coordinate,
+        int current_expert, int cta_rank,
+        uint32_t &phasebits, uint32_t &ready_phase,
+        compute::a_st (&a_smem)[compute::PIPE_DEPTH],
+        compute::b_st (&b_smem)[compute::PIPE_DEPTH],
+        compute::d_st &d_smem,
+        semaphore (&inputs_arrived)[compute::PIPE_DEPTH],
+        semaphore (&inputs_finished)[compute::PIPE_DEPTH],
+        semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
+    if (coordinate.stage == terminal::logical_stage::gate
+            || coordinate.stage == terminal::logical_stage::up) {
+        compute::run_w13_task(
+            g.w13, coordinate, current_expert, cta_rank, g.ready,
+            phasebits, ready_phase, a_smem, b_smem, d_smem,
+            inputs_arrived, inputs_finished, inputs_ready);
+    } else if (coordinate.stage == terminal::logical_stage::activation) {
+        compute::run_activation_task(
+            g.activation, coordinate, cta_rank, g.ready);
+    } else {
+        compute::run_w2_task(
+            g.w2, coordinate, current_expert, cta_rank, g.ready,
+            phasebits, ready_phase, a_smem, b_smem, d_smem,
+            inputs_arrived, inputs_finished, inputs_ready);
+    }
+}
+
+template <typename GemmProblem>
+__device__ __forceinline__ bool owner_task_ready(
+        const globals<GemmProblem> &g,
+        const terminal::logical_coordinate &coordinate) {
+    if (coordinate.stage == terminal::logical_stage::gate
+            || coordinate.stage == terminal::logical_stage::up) {
+        return compute::load_acquire_gpu(
+            g.x_ready + coordinate.global_m) >= terminal::M_TILE;
+    }
+    if (coordinate.stage == terminal::logical_stage::activation) {
+        const int64_t base = terminal::counter_index(
+            terminal::ready_counter::gate_up_tile,
+            coordinate.global_m, 0);
+#pragma unroll
+        for (int n128 = 0; n128 < terminal::W13_N_TILES; ++n128) {
+            if (compute::load_acquire_gpu(g.ready.gate_up_ready + base + n128)
+                    < 2u)
+                return false;
+        }
+        return true;
+    }
+    const int64_t hidden = terminal::counter_index(
+        terminal::ready_counter::hidden_row_block, coordinate.global_m);
+    return compute::load_acquire_gpu(g.ready.hidden_ready + hidden) >= 1u;
+}
+
+// Only advance the shared cursor when its current task is dependency-ready.
+// In the sole-owner case cursor order is stage-topological (all gate, all up,
+// activation, then W2 inside each ordered minibatch), so the owner can execute
+// the whole chain serially.  With resident non-owners, a not-ready cursor means
+// an earlier claimed task is still in flight; WAIT_SIGNAL leaves ownership with
+// that worker and lets communication continue polling/reducing.
+template <typename GemmProblem>
+__device__ __forceinline__ unsigned int claim_ready_for_owner(
+        const globals<GemmProblem> &g,
+        const terminal::logical_shape &shape) {
+    const unsigned int limit = static_cast<unsigned int>(shape.total_tasks);
+    while (true) {
+        const unsigned int current = compute::load_acquire_gpu(g.cursor);
+        if (current >= limit)
+            return STOP_TICKET;
+        const terminal::logical_coordinate coordinate =
+            terminal::decode_logical_cursor(shape, current);
+        if (!coordinate.valid)
+            return FAILED_TICKET;
+        if (!owner_task_ready(g, coordinate))
+            return WAIT_SIGNAL;
+        const unsigned int prior = atomicCAS(
+            g.cursor, current, current + 1u);
+        if (prior == current)
+            return current;
+    }
+}
+
+// Claim and execute at most one producer task on the elected communication
+// cluster.  The independent publication slot keeps both CTAs lockstep without
+// colliding with any non-owner worker's ticket.  STOP_TICKET means the cursor
+// is exhausted; it is not permission to push until y_ready says this tile is
+// complete, because another resident cluster may still own an earlier task.
+template <typename GemmProblem>
+__device__ unsigned int owner_help_one_producer(
+        const globals<GemmProblem> &g,
+        const terminal::logical_shape &shape, int cta_rank,
+        uint32_t &phasebits, uint32_t &ready_phase,
+        compute::a_st (&a_smem)[compute::PIPE_DEPTH],
+        compute::b_st (&b_smem)[compute::PIPE_DEPTH],
+        compute::d_st &d_smem,
+        semaphore (&inputs_arrived)[compute::PIPE_DEPTH],
+        semaphore (&inputs_finished)[compute::PIPE_DEPTH],
+        semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
+    const unsigned int total_tasks = static_cast<unsigned int>(
+        shape.total_tasks);
+    if (cta_rank == 0 && threadIdx.x == 0) {
+        const unsigned int ticket = claim_ready_for_owner(g, shape);
+        asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
+                     "l"(g.comm_worker_ticket), "r"(ticket) : "memory");
+    }
+    everyone::tma::cluster::sync();
+    unsigned int ticket;
+    asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                 : "=r"(ticket)
+                 : "l"(g.comm_worker_ticket) : "memory");
+    if (ticket == STOP_TICKET || ticket == WAIT_SIGNAL)
+        return ticket;
+
+    if (ticket == FAILED_TICKET) {
+        if (cta_rank == 0 && threadIdx.x == 0)
+            trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
+                        0, total_tasks,
+                        compute::load_acquire_gpu(g.cursor), ticket, 0);
+        park_forever();
+    }
+
+    const terminal::logical_coordinate coordinate =
+        terminal::decode_logical_cursor(shape, ticket);
+    if (!coordinate.valid) {
+        if (cta_rank == 0 && threadIdx.x == 0)
+            trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
+                        0, total_tasks, ticket, ticket, 0);
+        park_forever();
+    }
+    if (cta_rank == 0 && threadIdx.x == 0 && g.task_visits != nullptr)
+        atomicAdd(g.task_visits + ticket, 1u);
+
+    int current_expert = -1;
+    if (coordinate.stage != terminal::logical_stage::activation) {
+        const unsigned int ready = compute::load_acquire_gpu(
+            g.x_ready + coordinate.global_m);
+        current_expert = g.m_indices[
+            coordinate.global_m * terminal::M_TILE];
+        if (ready < terminal::M_TILE || current_expert < 0
+                || current_expert >= g.num_local_experts) {
+            if (cta_rank == 0 && threadIdx.x == 0)
+                trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
+                            coordinate.global_m, terminal::M_TILE, ready,
+                            ticket, 0);
+            park_forever();
+        }
+    }
+
+    run_producer_task_body(
+        g, coordinate, current_expert, cta_rank, phasebits, ready_phase,
+        a_smem, b_smem, d_smem,
+        inputs_arrived, inputs_finished, inputs_ready);
+
+    // run_* returns only after its WGMMA/TMA stores and ready publication are
+    // drained.  Both CTAs cross the task boundary before producer completion.
+    everyone::tma::cluster::sync();
+    if (cta_rank == 0 && threadIdx.x == 0)
+        compute::add_release_gpu(g.producer_done, 1u);
+    everyone::tma::cluster::sync();
+    return ticket;
+}
+
 template <typename GemmProblem>
 __device__ void communication_role(
-        const globals<GemmProblem> &g, int cta_rank) {
+        const globals<GemmProblem> &g, int cta_rank,
+        compute::a_st (&a_smem)[compute::PIPE_DEPTH],
+        compute::b_st (&b_smem)[compute::PIPE_DEPTH],
+        compute::d_st &d_smem,
+        semaphore (&inputs_arrived)[compute::PIPE_DEPTH],
+        semaphore (&inputs_finished)[compute::PIPE_DEPTH],
+        semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
     __shared__ int expert_row_end[MAX_EXPERTS];
     __shared__ int wait_ok;
     if (threadIdx.x == 0)
@@ -437,36 +619,124 @@ __device__ void communication_role(
         }
     }
 
-    // Each M64 push waits only after every x producer has been published and
-    // the fixed compute cluster is known resident.  Rows are consumed through
-    // an explicit permutation so publication order is not assumed.
+    const bool owner_help_enabled = production_control_enabled(g);
+    uint32_t owner_phasebits = 0xFFFF0000u;
+    uint32_t owner_ready_phase = 0u;
+    if (owner_help_enabled) {
+        // dispatch_copy_row wrote routed inputs through the generic proxy.
+        // Bridge the fully published dispatch into the async proxy before
+        // this same cluster can issue its first W13 TMA load.
+        if (cta_rank == 0 && threadIdx.x == 0)
+            asm volatile("{fence.proxy.async.global;}" ::: "memory");
+        everyone::tma::cluster::sync();
+    }
+
+    // Preserve tile-level push overlap.  If the next M64 is not ready, the
+    // production communication owner claims one producer from the same global
+    // cursor instead of passively occupying the sole resident cluster.  Once
+    // the cursor is exhausted it keeps polling y_ready because another
+    // resident worker may still own an earlier task.
     for (int j = 0; j < shape.num_global_minibatches; ++j) {
         const terminal::ordered_minibatch_range minibatch =
             terminal::decode_ordered_minibatch(shape, j);
         for (int r = 0; r < minibatch.active_m_tiles; ++r) {
         const int m = minibatch.first_m_tile + r;
-        if (threadIdx.x == 0) {
-            wait_ok = bounded_wait_gpu(
-                g.ready.y_ready + m, terminal::W2_N_TILES,
-                g.spin_limit) ? 1 : 0;
+        if (owner_help_enabled) {
+            unsigned long long idle_windows = 0;
+            unsigned int last_producer = compute::load_acquire_gpu(
+                g.producer_done);
+            while (true) {
+                if (cta_rank == 0 && threadIdx.x == 0) {
+                    const unsigned int ready = compute::load_acquire_gpu(
+                        g.ready.y_ready + m);
+                    const unsigned int decision =
+                        ready >= terminal::W2_N_TILES
+                            ? DONE_TICKET : WAIT_SIGNAL;
+                    asm volatile(
+                        "{st.release.cluster.global.u32 [%0], %1;}" ::
+                        "l"(g.comm_worker_ticket), "r"(decision)
+                        : "memory");
+                }
+                everyone::tma::cluster::sync();
+                unsigned int decision;
+                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                             : "=r"(decision)
+                             : "l"(g.comm_worker_ticket) : "memory");
+                if (decision == DONE_TICKET)
+                    break;
+
+                owner_help_one_producer(
+                    g, shape, cta_rank,
+                    owner_phasebits, owner_ready_phase,
+                    a_smem, b_smem, d_smem,
+                    inputs_arrived, inputs_finished, inputs_ready);
+
+                // A prior tile may already have been pushed.  This one-shot
+                // reducer never waits for the current tile and therefore does
+                // not introduce a producer dependency.
+                try_reduce_one_ready_token(g);
+                everyone::tma::cluster::sync();
+
+                if (cta_rank == 0 && threadIdx.x == 0) {
+                    const unsigned int ready = compute::load_acquire_gpu(
+                        g.ready.y_ready + m);
+                    const unsigned int produced = compute::load_acquire_gpu(
+                        g.producer_done);
+                    unsigned int next = WAIT_SIGNAL;
+                    if (ready >= terminal::W2_N_TILES) {
+                        next = DONE_TICKET;
+                    } else {
+                        if (produced != last_producer) {
+                            last_producer = produced;
+                            idle_windows = 0;
+                        } else {
+                            ++idle_windows;
+                        }
+                        if (idle_windows >= g.spin_limit)
+                            trap_commit(
+                                g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
+                                m, terminal::W2_N_TILES, ready,
+                                compute::load_acquire_gpu(g.cursor),
+                                idle_windows);
+                    }
+                    asm volatile(
+                        "{st.release.cluster.global.u32 [%0], %1;}" ::
+                        "l"(g.comm_worker_ticket), "r"(next) : "memory");
+                }
+                everyone::tma::cluster::sync();
+                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                             : "=r"(decision)
+                             : "l"(g.comm_worker_ticket) : "memory");
+                if (decision == DONE_TICKET)
+                    break;
+                if (threadIdx.x == 0)
+                    __nanosleep(64);
+                __syncthreads();
+            }
+        } else {
+            if (threadIdx.x == 0) {
+                wait_ok = bounded_wait_gpu(
+                    g.ready.y_ready + m, terminal::W2_N_TILES,
+                    g.spin_limit) ? 1 : 0;
+            }
+            __syncthreads();
+            if (!wait_ok && threadIdx.x == 0) {
+                if (g.trap_record != nullptr)
+                    trap_commit(g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
+                                m, terminal::W2_N_TILES, 0, 0,
+                                g.spin_limit);
+                if (g.comm_failed != nullptr)
+                    atomicExch(g.comm_failed, 1u);
+                if (g.progress_timeouts != nullptr)
+                    atomicAdd(g.progress_timeouts, 1u);
+                if (g.errors != nullptr)
+                    atomicAdd(g.errors, 1u);
+            }
+            everyone::tma::cluster::sync();
+            if (g.comm_failed != nullptr
+                    && compute::load_acquire_gpu(g.comm_failed) != 0u)
+                return;
         }
-        __syncthreads();
-        if (!wait_ok && threadIdx.x == 0) {
-            if (g.trap_record != nullptr)
-                trap_commit(g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
-                            m, terminal::W2_N_TILES, 0, 0,
-                            g.spin_limit);
-            if (g.comm_failed != nullptr)
-                atomicExch(g.comm_failed, 1u);
-            if (g.progress_timeouts != nullptr)
-                atomicAdd(g.progress_timeouts, 1u);
-            if (g.errors != nullptr)
-                atomicAdd(g.errors, 1u);
-        }
-        everyone::tma::cluster::sync();
-        if (g.comm_failed != nullptr
-                && compute::load_acquire_gpu(g.comm_failed) != 0u)
-            return;
 
         const int first = m * terminal::M_TILE;
         for (int position = cluster_warp; position < terminal::M_TILE;
@@ -491,6 +761,12 @@ __device__ void communication_role(
         }
         __syncthreads();
         everyone::tma::cluster::sync();
+        if (owner_help_enabled) {
+            // Newly published routes can be reduced immediately by the owner;
+            // this is the sole-resident progress edge for combine.
+            try_reduce_one_ready_token(g);
+            everyone::tma::cluster::sync();
+        }
         }
     }
 
@@ -510,6 +786,11 @@ __device__ void communication_role(
         unsigned int last_push = 0u;
         unsigned int last_reduce = 0u;
         while (true) {
+            // Continue bounded reduction until every pushed local token has
+            // been claimed.  In the one-resident-cluster case no non-owner
+            // worker exists to perform this closure work.
+            try_reduce_one_ready_token(g);
+            everyone::tma::cluster::sync();
             if (cta_rank == 0 && threadIdx.x == 0) {
                 try_publish_terminate(
                     g, total_tasks, active_row_count, total_tokens);
@@ -900,22 +1181,10 @@ __device__ void compute_and_reduce_role(
                 && g.overlap_witness != nullptr)
             atomicOr(g.overlap_witness, OVERLAP_REDUCE_THEN_COMPUTE);
 
-        if (coordinate.stage == terminal::logical_stage::gate
-                || coordinate.stage == terminal::logical_stage::up) {
-            compute::run_w13_task(
-                g.w13, coordinate, current_expert, cta_rank, g.ready,
-                phasebits, ready_phase, a_smem, b_smem, d_smem,
-                inputs_arrived, inputs_finished, inputs_ready);
-        } else if (coordinate.stage
-                       == terminal::logical_stage::activation) {
-            compute::run_activation_task(
-                g.activation, coordinate, cta_rank, g.ready);
-        } else {
-            compute::run_w2_task(
-                g.w2, coordinate, current_expert, cta_rank, g.ready,
-                phasebits, ready_phase, a_smem, b_smem, d_smem,
-                inputs_arrived, inputs_finished, inputs_ready);
-        }
+        run_producer_task_body(
+            g, coordinate, current_expert, cta_rank, phasebits, ready_phase,
+            a_smem, b_smem, d_smem,
+            inputs_arrived, inputs_finished, inputs_ready);
 
         everyone::tma::cluster::sync();
         if (cta_rank == 0 && threadIdx.x == 0
@@ -966,10 +1235,15 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
         }
     }
     if (g.trap_record != nullptr && production_control_enabled(g)
-            && g.comm_owner == nullptr) {
+            && (g.comm_owner == nullptr
+                || g.comm_worker_ticket == nullptr)) {
         if (threadIdx.x == 0)
             trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_COMM_OWNER,
-                        cluster, 1, 0, 0, 0);
+                        cluster, 2,
+                        static_cast<unsigned long long>(
+                            (g.comm_owner != nullptr ? 1u : 0u)
+                            + (g.comm_worker_ticket != nullptr ? 1u : 0u)),
+                        0, 0);
         park_forever();
     }
 
@@ -994,7 +1268,9 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
     everyone::tma::cluster::sync();
 
     if (cluster == comm_cluster) {
-        communication_role(g, cta_rank);
+        communication_role(
+            g, cta_rank, a_smem, b_smem, d_smem,
+            inputs_arrived, inputs_finished, inputs_ready);
     } else {
         const int worker_cluster = cluster < comm_cluster
             ? cluster

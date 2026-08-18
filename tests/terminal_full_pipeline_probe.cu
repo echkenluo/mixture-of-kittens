@@ -5,8 +5,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "pyutils/torchutils.cuh"
@@ -312,6 +314,11 @@ void run_full(
         const at::Tensor &dispatch_tiles_done,
         const at::Tensor &compute_started,
         const at::Tensor &overlap_witness,
+        const at::Tensor &comm_owner,
+        const at::Tensor &comm_worker_ticket,
+        const at::Tensor &producer_done,
+        const at::Tensor &push_done,
+        const at::Tensor &terminate,
         int64_t ep_rank, int64_t compute_clusters, int64_t minibatch_rows,
         int64_t macrobatch_rows,
         int64_t overlap_delay_cycles, int64_t spin_limit, double limit) {
@@ -333,23 +340,38 @@ void run_full(
                     && overlap_delay_cycles <= UINT32_MAX,
                 "overlap delay must fit uint32");
     const int max_resident_clusters = resident_clusters();
-    TORCH_CHECK(compute_clusters >= 1
+    TORCH_CHECK(compute_clusters >= 0
                     && compute_clusters
                         <= max_resident_clusters - full::COMM_CLUSTERS,
-                "compute_clusters must fit measured resident capacity");
+                "compute_clusters must be zero for the owner-only probe or "
+                "fit measured resident capacity");
+    const int64_t worker_slots = compute_clusters == 0 ? 1 : compute_clusters;
     TORCH_CHECK(worker_ticket.is_cuda() && worker_ticket.is_contiguous()
                     && worker_ticket.scalar_type() == at::kInt
-                    && worker_ticket.numel() == compute_clusters,
-                "worker_ticket must be int32 [compute_clusters]");
+                    && worker_ticket.numel() == worker_slots,
+                "worker_ticket must be int32 [max(1, compute_clusters)]");
     TORCH_CHECK(worker_failed.is_cuda() && worker_failed.is_contiguous()
                     && worker_failed.scalar_type() == at::kInt
-                    && worker_failed.numel() == compute_clusters,
-                "worker_failed must be int32 [compute_clusters]");
+                    && worker_failed.numel() == worker_slots,
+                "worker_failed must be int32 [max(1, compute_clusters)]");
     TORCH_CHECK(progress_timeouts.is_cuda()
                     && progress_timeouts.is_contiguous()
                     && progress_timeouts.scalar_type() == at::kInt
                     && progress_timeouts.numel() == 1,
                 "progress_timeouts must be CUDA int32 [1]");
+    for (const auto &[tensor, name] :
+         std::array<std::pair<const at::Tensor *, const char *>, 5>{{
+             {&comm_owner, "comm_owner"},
+             {&comm_worker_ticket, "comm_worker_ticket"},
+             {&producer_done, "producer_done"},
+             {&push_done, "push_done"},
+             {&terminate, "terminate"},
+         }}) {
+        TORCH_CHECK(tensor->is_cuda() && tensor->is_contiguous()
+                        && tensor->scalar_type() == at::kInt
+                        && tensor->numel() == 1,
+                    name, " must be CUDA int32 [1]");
+    }
     TORCH_CHECK(weights.is_cuda() && weights.is_contiguous()
                     && weights.scalar_type() == at::kFloat
                     && weights.numel()
@@ -468,6 +490,16 @@ void run_full(
     MOK_STATE_PTR(dispatch_tiles_done, dispatch_tiles_done);
     MOK_STATE_PTR(compute_started, compute_started);
     MOK_STATE_PTR(overlap_witness, overlap_witness);
+    if (compute_clusters == 0) {
+        // Test-only forced owner case: launch exactly one physical cluster and
+        // connect the production closure plane.  With no non-owner in the
+        // grid, task_visits proves that every producer ran on the owner.
+        MOK_STATE_PTR(comm_owner, comm_owner);
+        MOK_STATE_PTR(comm_worker_ticket, comm_worker_ticket);
+        MOK_STATE_PTR(producer_done, producer_done);
+        MOK_STATE_PTR(push_done, push_done);
+        MOK_STATE_PTR(terminate, terminate);
+    }
 #undef MOK_STATE_PTR
     g.compute_clusters = static_cast<int>(compute_clusters);
     g.minibatch_rows = static_cast<int>(minibatch_rows);

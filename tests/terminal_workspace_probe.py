@@ -48,6 +48,10 @@ def main() -> int:
             raise RuntimeError("terminal comm-owner shape mismatch")
         if int(workspace.comm_owner.item()) != -1:
             raise RuntimeError("terminal comm owner must start unclaimed")
+        if tuple(workspace.comm_worker_ticket.shape) != (1,):
+            raise RuntimeError("terminal comm-worker-ticket shape mismatch")
+        if int(workspace.comm_worker_ticket.item()) != 0:
+            raise RuntimeError("terminal comm worker ticket must start cleared")
         if not workspace.trap_record.is_pinned() or workspace.trap_record.is_cuda:
             raise RuntimeError("terminal trap record is not host-mapped pinned memory")
 
