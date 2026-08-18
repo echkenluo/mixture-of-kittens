@@ -232,6 +232,59 @@ def check_source_contract() -> None:
         )
     if "wait_until_at_least" in owner_help:
         raise RuntimeError("communication owner must not claim a blocked producer")
+    control_begin = header.find("struct producer_control")
+    control_end = header.find("owner_task_ready", control_begin)
+    control = header[control_begin:control_end]
+    control_required = (
+        "static_assert(sizeof(producer_control) == 32",
+        "load_decode_producer_control(",
+        "publish_producer_readiness(",
+        "if (threadIdx.x == 0)",
+        "control.coordinate = terminal::decode_logical_cursor(shape, ticket)",
+        "everyone::tma::cluster::sync()",
+        "__syncthreads()",
+        "terminal::logical_stage::w2",
+        "g.ready.hidden_ready + hidden",
+        "g.x_ready + coordinate.global_m",
+    )
+    missing_control = [item for item in control_required if item not in control]
+    if missing_control:
+        raise RuntimeError(
+            f"CTA-leader producer control compaction missing: {missing_control}"
+        )
+    decode_control = control[
+        control.find("load_decode_producer_control(") :
+        control.find("producer_dependency_expected")
+    ]
+    if not (
+        decode_control.find("if (threadIdx.x == 0)")
+        < decode_control.find("ld.acquire.cluster.global.u32")
+        < decode_control.find(
+            "control.coordinate = terminal::decode_logical_cursor(shape, ticket)"
+        )
+        < decode_control.find("__syncthreads()")
+    ):
+        raise RuntimeError("producer ticket decode is not CTA-leader published")
+    readiness_control = control[control.find("publish_producer_readiness(") :]
+    if not (
+        readiness_control.find("st.release.cluster.global.u32")
+        < readiness_control.find("everyone::tma::cluster::sync()")
+        < readiness_control.find("ld.acquire.cluster.global.u32")
+        < readiness_control.find("__syncthreads()")
+    ):
+        raise RuntimeError("producer readiness lost cluster/CTA publication order")
+    owner_body = header[
+        header.find("__device__ unsigned int owner_help_one_producer") :
+        header.find("__device__ void communication_role")
+    ]
+    if "load_decode_producer_control(" not in owner_body \
+            or "publish_producer_readiness(" not in owner_body:
+        raise RuntimeError("owner-help bypasses compact producer control")
+    if "terminal::decode_logical_cursor(shape, ticket)" in owner_body \
+            or "g.x_ready + coordinate.global_m" in owner_body:
+        raise RuntimeError(
+            "owner-help retained per-thread decode or unconditional x_ready"
+        )
     communication = header[
         header.find("__device__ void communication_role") :
         header.find("// One CTA probes exactly one")
@@ -285,6 +338,14 @@ def check_source_contract() -> None:
         )
     if "result == route::claim_result::claimed" not in compute:
         raise RuntimeError("winning CTA does not resume the compute loop")
+    if "load_decode_producer_control(" not in compute \
+            or "publish_producer_readiness(" not in compute:
+        raise RuntimeError("compute worker bypasses compact producer control")
+    if "terminal::decode_logical_cursor(shape, ticket)" in compute \
+            or "g.x_ready + coordinate.global_m" in compute:
+        raise RuntimeError(
+            "compute worker retained per-thread decode or unconditional x_ready"
+        )
     run_full = source[source.find("void run_full(") : source.find("std::vector<int64_t> attributes")]
     launches = re.findall(r"full::kernel<gemm_problem>\s*\n?\s*<<<", run_full)
     if len(launches) != 1:
@@ -335,6 +396,7 @@ def check_source_contract() -> None:
         "|comm_timeline=native_dense_dcd"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
         "|logical_ticket=M64xN256|n128_subtasks=2|tasks_per_m64=33"
+        "|control_broadcast=cta_shared|w2_dependency=hidden_ready"
         "|legacy_arithmetic=1|split_fallback=0"
         "|core_arithmetic_copy=0|result=PASS",
         flush=True,

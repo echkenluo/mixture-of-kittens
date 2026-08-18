@@ -435,6 +435,110 @@ __device__ __forceinline__ void run_producer_task_body(
     }
 }
 
+// CTA-local control receipt for one cluster-wide producer ticket.  The dense
+// cursor and the publication slot remain cluster scoped, but only thread 0 in
+// each CTA loads/decodes them.  A CTA barrier then makes the immutable receipt
+// available to the 127 numerical followers without repeating global loads or
+// the logical decoder in every thread.
+struct producer_control {
+    unsigned int ticket;
+    unsigned int signal;
+    unsigned int dependency;
+    int expert;
+    terminal::logical_coordinate coordinate;
+};
+
+static_assert(sizeof(producer_control) == 32,
+              "producer control unexpectedly regained hot state");
+
+__device__ __forceinline__ void load_cluster_slot_for_cta(
+        const unsigned int *ticket_slot, unsigned int &shared_value) {
+    if (threadIdx.x == 0) {
+        unsigned int value;
+        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                     : "=r"(value) : "l"(ticket_slot) : "memory");
+        shared_value = value;
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ void load_decode_producer_control(
+        const terminal::logical_shape &shape,
+        const unsigned int *ticket_slot, producer_control &control) {
+    if (threadIdx.x == 0) {
+        unsigned int ticket;
+        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                     : "=r"(ticket) : "l"(ticket_slot) : "memory");
+        control.ticket = ticket;
+        control.signal = WAIT_SIGNAL;
+        control.dependency = 0u;
+        control.expert = -1;
+        control.coordinate = terminal::logical_coordinate{};
+        if (ticket < WAIT_SIGNAL)
+            control.coordinate = terminal::decode_logical_cursor(shape, ticket);
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ unsigned int producer_dependency_expected(
+        const terminal::logical_coordinate &coordinate) {
+    return coordinate.stage == terminal::logical_stage::w2
+        ? 1u : static_cast<unsigned int>(terminal::M_TILE);
+}
+
+template <typename GemmProblem>
+__device__ __forceinline__ unsigned int load_producer_dependency(
+        const globals<GemmProblem> &g,
+        const terminal::logical_coordinate &coordinate) {
+    if (coordinate.stage == terminal::logical_stage::w2) {
+        const int64_t hidden = terminal::counter_index(
+            terminal::ready_counter::hidden_row_block,
+            coordinate.global_m);
+        return compute::load_acquire_gpu(g.ready.hidden_ready + hidden);
+    }
+    return compute::load_acquire_gpu(g.x_ready + coordinate.global_m);
+}
+
+// Rank 0 remains the sole dependency/expert decision maker so the two CTAs
+// cannot observe a racing ready transition differently.  After its release
+// publication and the cluster barrier, each CTA leader loads the one decision
+// into CTA-local shared memory and converges its followers with __syncthreads.
+template <typename GemmProblem>
+__device__ __forceinline__ void publish_producer_readiness(
+        const globals<GemmProblem> &g,
+        const terminal::logical_coordinate &coordinate, int cta_rank,
+        unsigned int *ticket_slot, producer_control &control) {
+    if (cta_rank == 0 && threadIdx.x == 0) {
+        const unsigned int observed = load_producer_dependency(g, coordinate);
+        const unsigned int expected =
+            producer_dependency_expected(coordinate);
+        unsigned int signal = WAIT_SIGNAL;
+        int expert = -1;
+        if (observed >= expected) {
+            expert = g.m_indices[
+                coordinate.global_m * terminal::M_TILE];
+            signal = expert >= 0 && expert < g.num_local_experts
+                ? READY_EXPERT_BASE + static_cast<unsigned int>(expert)
+                : FAILED_TICKET;
+        }
+        control.dependency = observed;
+        control.expert = expert;
+        asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
+                     "l"(ticket_slot), "r"(signal) : "memory");
+    }
+    everyone::tma::cluster::sync();
+    if (threadIdx.x == 0) {
+        unsigned int signal;
+        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                     : "=r"(signal) : "l"(ticket_slot) : "memory");
+        control.signal = signal;
+        if (signal < WAIT_SIGNAL)
+            control.expert = static_cast<int>(
+                signal - READY_EXPERT_BASE);
+    }
+    __syncthreads();
+}
+
 template <typename GemmProblem>
 __device__ __forceinline__ bool owner_task_ready(
         const globals<GemmProblem> &g,
@@ -498,7 +602,7 @@ template <typename GemmProblem>
 __device__ unsigned int owner_help_one_producer(
         const globals<GemmProblem> &g,
         const terminal::logical_shape &shape, int cta_rank,
-        unsigned int *ticket_slot,
+        unsigned int *ticket_slot, producer_control &control,
         uint32_t &phasebits, uint32_t &ready_phase,
         compute::a_st (&a_smem)[compute::PIPE_DEPTH],
         compute::b_st (&b_smem)[compute::PIPE_DEPTH],
@@ -514,10 +618,8 @@ __device__ unsigned int owner_help_one_producer(
                      "l"(ticket_slot), "r"(ticket) : "memory");
     }
     everyone::tma::cluster::sync();
-    unsigned int ticket;
-    asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                 : "=r"(ticket)
-                 : "l"(ticket_slot) : "memory");
+    load_decode_producer_control(shape, ticket_slot, control);
+    const unsigned int ticket = control.ticket;
     if (ticket == STOP_TICKET || ticket == WAIT_SIGNAL)
         return ticket;
 
@@ -529,8 +631,7 @@ __device__ unsigned int owner_help_one_producer(
         park_forever();
     }
 
-    const terminal::logical_coordinate coordinate =
-        terminal::decode_logical_cursor(shape, ticket);
+    const terminal::logical_coordinate coordinate = control.coordinate;
     if (!coordinate.valid) {
         if (cta_rank == 0 && threadIdx.x == 0)
             trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
@@ -542,15 +643,17 @@ __device__ unsigned int owner_help_one_producer(
 
     int current_expert = -1;
     if (coordinate.stage != terminal::logical_stage::activation) {
-        const unsigned int ready = compute::load_acquire_gpu(
-            g.x_ready + coordinate.global_m);
-        current_expert = g.m_indices[
-            coordinate.global_m * terminal::M_TILE];
-        if (ready < terminal::M_TILE || current_expert < 0
-                || current_expert >= g.num_local_experts) {
+        publish_producer_readiness(
+            g, coordinate, cta_rank, ticket_slot, control);
+        current_expert = control.expert;
+        const unsigned int expected =
+            producer_dependency_expected(coordinate);
+        if (control.signal == WAIT_SIGNAL
+                || control.signal == FAILED_TICKET) {
             if (cta_rank == 0 && threadIdx.x == 0)
                 trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
-                            coordinate.global_m, terminal::M_TILE, ready,
+                            coordinate.global_m, expected,
+                            control.dependency,
                             ticket, 0);
             park_forever();
         }
@@ -595,6 +698,7 @@ __device__ void communication_role(
     // metadata.  Construct it once per CTA and retain only its shared address
     // across the resident loop instead of one materialized copy per thread.
     __shared__ terminal::logical_shape shape;
+    __shared__ producer_control producer;
     // Only CTA-rank-0/thread-0 observes progress history.  Volatile shared
     // storage deliberately breaks these values' live ranges across the
     // owner-help WGMMA call; no other thread consumes them.
@@ -806,7 +910,7 @@ __device__ void communication_role(
                     break;
 
                 owner_help_one_producer(
-                    g, shape, cta_rank, ticket_slot,
+                    g, shape, cta_rank, ticket_slot, producer,
                     owner_phasebits, owner_ready_phase,
                     a_smem, b_smem, d_smem,
                     inputs_arrived, inputs_finished, inputs_ready);
@@ -940,7 +1044,7 @@ __device__ void communication_role(
             // A role that exhausted the communication queues remains a useful
             // resident worker.  This is the progress edge for C-only residency.
             owner_help_one_producer(
-                g, shape, cta_rank, ticket_slot,
+                g, shape, cta_rank, ticket_slot, producer,
                 owner_phasebits, owner_ready_phase,
                 a_smem, b_smem, d_smem,
                 inputs_arrived, inputs_finished, inputs_ready);
@@ -1087,6 +1191,7 @@ __device__ void compute_and_reduce_role(
     // one copy per CTA rather than four int64 fields plus metadata live in
     // every producer thread across WGMMA/TMA task bodies.
     __shared__ terminal::logical_shape shape;
+    __shared__ producer_control producer;
     // These values are consumed only by CTA thread 0.  Shared placement keeps
     // timeout/debug history out of the resident producer's register live set.
     __shared__ volatile unsigned long long leader_wait_windows;
@@ -1136,10 +1241,9 @@ __device__ void compute_and_reduce_role(
                          : "memory");
         }
         everyone::tma::cluster::sync();
-        unsigned int ticket;
-        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                     : "=r"(ticket)
-                     : "l"(g.worker_ticket + worker_cluster) : "memory");
+        load_decode_producer_control(
+            shape, g.worker_ticket + worker_cluster, producer);
+        const unsigned int ticket = producer.ticket;
         if (ticket == STOP_TICKET) {
             // Cursor exhaustion is not worker termination: outstanding
             // compute/comm producers may make another token ready.  Each CTA
@@ -1208,10 +1312,9 @@ __device__ void compute_and_reduce_role(
                     : "memory");
             }
             everyone::tma::cluster::sync();
-            unsigned int decision;
-            asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                         : "=r"(decision)
-                         : "l"(g.worker_ticket + worker_cluster) : "memory");
+            load_cluster_slot_for_cta(
+                g.worker_ticket + worker_cluster, producer.signal);
+            const unsigned int decision = producer.signal;
             if (decision == DONE_TICKET || decision == FAILED_TICKET)
                 return;
             if (threadIdx.x == 0)
@@ -1220,8 +1323,7 @@ __device__ void compute_and_reduce_role(
             continue;
         }
 
-        const terminal::logical_coordinate coordinate =
-            terminal::decode_logical_cursor(shape, ticket);
+        const terminal::logical_coordinate coordinate = producer.coordinate;
         if (!coordinate.valid) {
             if (cta_rank == 0 && threadIdx.x == 0) {
                 if (g.trap_record != nullptr)
@@ -1243,30 +1345,10 @@ __device__ void compute_and_reduce_role(
             if (cta_rank == 0 && threadIdx.x == 0)
                 leader_wait_windows = 0;
             while (true) {
-                if (cta_rank == 0 && threadIdx.x == 0) {
-                    unsigned int signal = WAIT_SIGNAL;
-                    if (compute::load_acquire_gpu(
-                            g.x_ready + coordinate.global_m)
-                            >= terminal::M_TILE) {
-                        const int expert = g.m_indices[
-                            coordinate.global_m * terminal::M_TILE];
-                        if (expert >= 0 && expert < g.num_local_experts)
-                            signal = READY_EXPERT_BASE
-                                + static_cast<unsigned int>(expert);
-                        else
-                            signal = FAILED_TICKET;
-                    }
-                    asm volatile(
-                        "{st.release.cluster.global.u32 [%0], %1;}" ::
-                        "l"(g.worker_ticket + worker_cluster), "r"(signal)
-                        : "memory");
-                }
-                everyone::tma::cluster::sync();
-                unsigned int signal;
-                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                             : "=r"(signal)
-                             : "l"(g.worker_ticket + worker_cluster)
-                             : "memory");
+                publish_producer_readiness(
+                    g, coordinate, cta_rank,
+                    g.worker_ticket + worker_cluster, producer);
+                const unsigned int signal = producer.signal;
                 if (signal != WAIT_SIGNAL) {
                     if (signal == FAILED_TICKET) {
                         if (cta_rank == 0 && threadIdx.x == 0) {
@@ -1285,8 +1367,7 @@ __device__ void compute_and_reduce_role(
                         }
                         return;
                     }
-                    current_expert = static_cast<int>(
-                        signal - READY_EXPERT_BASE);
+                    current_expert = producer.expert;
                     break;
                 }
 
@@ -1307,9 +1388,9 @@ __device__ void compute_and_reduce_role(
                             trap_commit(
                                 g, ERR_TIMEOUT,
                                 SITE_TERMINAL_CONTRACT,
-                                coordinate.global_m, terminal::M_TILE,
-                                compute::load_acquire_gpu(
-                                    g.x_ready + coordinate.global_m),
+                                coordinate.global_m,
+                                producer_dependency_expected(coordinate),
+                                load_producer_dependency(g, coordinate),
                                 ticket, leader_wait_windows);
                         if (g.worker_failed != nullptr)
                             atomicExch(
@@ -1326,11 +1407,9 @@ __device__ void compute_and_reduce_role(
                         : "memory");
                 }
                 everyone::tma::cluster::sync();
-                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                             : "=r"(signal)
-                             : "l"(g.worker_ticket + worker_cluster)
-                             : "memory");
-                if (signal == FAILED_TICKET)
+                load_cluster_slot_for_cta(
+                    g.worker_ticket + worker_cluster, producer.signal);
+                if (producer.signal == FAILED_TICKET)
                     return;
                 if (threadIdx.x == 0)
                     __nanosleep(64);
