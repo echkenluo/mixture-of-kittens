@@ -50,6 +50,7 @@ def check_source_contract() -> None:
         "combine_local",
         "route_ready_local",
         "owner_help_one_producer",
+        "dispatch_one_tile",
         "run_producer_task_body",
         "claim_ready_for_owner",
         "owner_task_ready",
@@ -170,6 +171,23 @@ def check_source_contract() -> None:
         )
     if "wait_until_at_least" in owner_help:
         raise RuntimeError("communication owner must not claim a blocked producer")
+    comm_interleave_required = (
+        "dispatch_one_tile(",
+        "g.ready.y_ready + m",
+        "g.push_tile_cursor",
+    )
+    communication = header[
+        header.find("__device__ void communication_role") :
+        header.find("// One CTA probes exactly one")
+    ]
+    missing_comm_interleave = [
+        item for item in comm_interleave_required if item not in communication
+    ]
+    if missing_comm_interleave:
+        raise RuntimeError(
+            "dispatch/push interleave missing: "
+            f"{missing_comm_interleave}"
+        )
     closure_required = (
         "g.producer_done) >= total_tasks",
         "g.comm_closed) >= 1u",
@@ -242,7 +260,7 @@ def check_source_contract() -> None:
         "TERMINAL_FULL_SOURCE"
         "|milestone=M1|comm_clusters=1|compute_clusters=dynamic"
         "|reduction=ep_rank_local"
-        "|reduce_probe=bounded_one_shot|not_ready_wait=0"
+        "|reduce_probe=bounded_one_shot|not_ready_wait=0|comm_interleave=1"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
         "|split_fallback=0|core_arithmetic_copy=0|result=PASS",
         flush=True,
@@ -560,6 +578,9 @@ def run_device(args: argparse.Namespace) -> None:
                         "cursor": torch.zeros(
                             1, dtype=torch.int32, device="cuda"
                         ),
+                        "dispatch_tile_cursor": torch.zeros(
+                            1, dtype=torch.int32, device="cuda"
+                        ),
                         "worker_ticket": torch.zeros(
                             max(1, compute_clusters),
                             dtype=torch.int32,
@@ -639,6 +660,7 @@ def run_device(args: argparse.Namespace) -> None:
                         candidate["output"], state["gate_up_ready"],
                         state["hidden_ready"], state["y_ready"],
                         state["x_ready"], state["cursor"],
+                        state["dispatch_tile_cursor"],
                         state["worker_ticket"], state["worker_failed"],
                         state["next_reduce_probe"], state["reduce_done"],
                         state["comm_closed"], state["comm_failed"],
@@ -686,8 +708,9 @@ def run_device(args: argparse.Namespace) -> None:
 
                     scalar_expected = {
                         "cursor": total_tasks,
+                        "dispatch_tile_cursor": m_tiles,
                         "reduce_done": local_tokens,
-                        "comm_closed": 2 if owner_only else 1,
+                        "comm_closed": 1,
                         "comm_failed": 0,
                         "errors": 0,
                         "progress_timeouts": 0,

@@ -548,6 +548,77 @@ __device__ unsigned int owner_help_one_producer(
     return ticket;
 }
 
+// Claim and publish at most one complete M64 dispatch tile.  Communication
+// roles call this primitive while their current push tile is not ready, so
+// dispatch can advance without forcing the grid through an all-dispatch then
+// all-push phase boundary.  The dense cursor preserves the logical reverse-
+// macrobatch order while making late resident-role admission harmless.
+template <typename GemmProblem>
+__device__ __noinline__ bool dispatch_one_tile(
+        const globals<GemmProblem> &g,
+        const terminal::logical_shape &shape,
+        const int *expert_row_end,
+        int cta_rank, int comm_role, int cluster_warp,
+        int m_tiles, unsigned int *ticket_slot) {
+    if (cta_rank == 0 && threadIdx.x == 0) {
+        const unsigned int ticket = claim_bounded(
+            g.dispatch_tile_cursor, static_cast<unsigned int>(m_tiles));
+        asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
+                     "l"(ticket_slot), "r"(ticket) : "memory");
+    }
+    everyone::tma::cluster::sync();
+    unsigned int ticket;
+    asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                 : "=r"(ticket) : "l"(ticket_slot) : "memory");
+    if (ticket == STOP_TICKET)
+        return false;
+
+    const int m = terminal::decode_ordered_m_tile(
+        shape, static_cast<int>(ticket));
+    if (m < 0 || m >= shape.num_tokens / terminal::M_TILE) {
+        if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
+            trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
+                        comm_role, m_tiles, m, ticket, 0);
+        park_forever();
+    }
+    const int lane = threadIdx.x & 31;
+    constexpr int WARPS_PER_CTA = terminal::THREADS_PER_CTA / 32;
+    constexpr int WARPS_PER_CLUSTER =
+        terminal::CLUSTER_CTAS * WARPS_PER_CTA;
+    const int first_row = m * terminal::M_TILE;
+    for (int local = cluster_warp; local < terminal::M_TILE;
+         local += WARPS_PER_CLUSTER) {
+        const int row = first_row + local;
+        comm::dispatch_copy_row(g, expert_row_end, row, lane);
+        __syncwarp(0xffffffffu);
+        if (lane == 0 && g.dispatch_visits != nullptr)
+            atomicAdd(g.dispatch_visits + row, 1u);
+    }
+    __syncthreads();
+    everyone::tma::cluster::sync();
+    if (cta_rank == 0 && threadIdx.x == 0) {
+        compute::store_release_gpu(g.x_ready + m, terminal::M_TILE);
+        if (g.dispatch_tiles_done != nullptr)
+            compute::add_release_gpu(g.dispatch_tiles_done, 1u);
+    }
+    everyone::tma::cluster::sync();
+
+    // Test-only finite delay makes the first dispatch/compute overlap
+    // deterministic.  Production leaves the value zero.
+    if (ticket == 0u && m_tiles > 1
+            && g.overlap_delay_after_first_dispatch_cycles != 0u) {
+        unsigned int remaining =
+            g.overlap_delay_after_first_dispatch_cycles;
+        while (remaining != 0u) {
+            const unsigned int step = remaining > 1024u
+                ? 1024u : remaining;
+            __nanosleep(step);
+            remaining -= step;
+        }
+    }
+    return true;
+}
+
 template <typename GemmProblem>
 __device__ void communication_role(
         const globals<GemmProblem> &g, int cta_rank, int comm_role,
@@ -586,74 +657,13 @@ __device__ void communication_role(
         return;
     }
 
-    // Dispatch never waits on compute.  Dense queue tickets preserve the
-    // reverse-macrobatch tile order without assigning indispensable work to a
-    // communication role that may not yet be resident.
-    unsigned int probe_dispatch_ticket = 0u;
-    while (true) {
-        if (cta_rank == 0 && threadIdx.x == 0) {
-            const unsigned int ticket = g.dispatch_tile_cursor != nullptr
-                ? claim_bounded(
-                    g.dispatch_tile_cursor, static_cast<unsigned int>(m_tiles))
-                : (probe_dispatch_ticket < static_cast<unsigned int>(m_tiles)
-                    ? probe_dispatch_ticket++ : STOP_TICKET);
-            asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
-                         "l"(ticket_slot), "r"(ticket) : "memory");
-        }
-        everyone::tma::cluster::sync();
-        unsigned int ticket;
-        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                     : "=r"(ticket) : "l"(ticket_slot) : "memory");
-        if (ticket == STOP_TICKET)
-            break;
-
-        const int m = terminal::decode_ordered_m_tile(
-            shape, static_cast<int>(ticket));
-        if (m < 0 || m >= shape.num_tokens / terminal::M_TILE) {
-            if (cta_rank == 0 && threadIdx.x == 0 && g.trap_record != nullptr)
-                trap_commit(g, ERR_CONTRACT, SITE_TERMINAL_CONTRACT,
-                            comm_role, m_tiles, m, ticket, 0);
-            park_forever();
-        }
-        const int first_row = m * terminal::M_TILE;
-        for (int local = cluster_warp; local < terminal::M_TILE;
-             local += WARPS_PER_CLUSTER) {
-            const int row = first_row + local;
-            comm::dispatch_copy_row(g, expert_row_end, row, lane);
-            __syncwarp(0xffffffffu);
-            if (lane == 0 && g.dispatch_visits != nullptr)
-                atomicAdd(g.dispatch_visits + row, 1u);
-        }
-        __syncthreads();
-        everyone::tma::cluster::sync();
-        if (cta_rank == 0 && threadIdx.x == 0) {
-            compute::store_release_gpu(g.x_ready + m, terminal::M_TILE);
-            if (g.dispatch_tiles_done != nullptr)
-                compute::add_release_gpu(g.dispatch_tiles_done, 1u);
-        }
-        everyone::tma::cluster::sync();
-
-        // Test-only finite delay makes the first dispatch/compute overlap
-        // deterministic.  Production leaves the value zero.
-        if (ticket == 0u && m_tiles > 1
-                && g.overlap_delay_after_first_dispatch_cycles != 0u) {
-            unsigned int remaining =
-                g.overlap_delay_after_first_dispatch_cycles;
-            while (remaining != 0u) {
-                const unsigned int step = remaining > 1024u
-                    ? 1024u : remaining;
-                __nanosleep(step);
-                remaining -= step;
-            }
-        }
-    }
-
     const bool owner_help_enabled = production_control_enabled(g);
     uint32_t owner_phasebits = 0xFFFF0000u;
     uint32_t owner_ready_phase = 0u;
     // Claim complete M64 push tiles dynamically.  A role holding a not-ready
-    // tile helps the producer DAG and reducer instead of occupying residency
-    // with a passive wait.
+    // tile advances one dispatch tile, then helps the producer DAG and reducer.
+    // This restores the original MoK direction: push ready work while pulling
+    // the next reverse-macrobatch dispatch, with no global phase boundary.
     unsigned int probe_push_ticket = 0u;
     while (true) {
         if (cta_rank == 0 && threadIdx.x == 0) {
@@ -679,10 +689,10 @@ __device__ void communication_role(
                             comm_role, m_tiles, m, push_ticket, 0);
             park_forever();
         }
-        if (owner_help_enabled) {
+        {
             unsigned long long idle_windows = 0;
-            unsigned int last_producer = compute::load_acquire_gpu(
-                g.producer_done);
+            unsigned int last_producer = owner_help_enabled
+                ? compute::load_acquire_gpu(g.producer_done) : 0u;
             while (true) {
                 if (cta_rank == 0 && threadIdx.x == 0) {
                     const unsigned int ready = compute::load_acquire_gpu(
@@ -703,11 +713,17 @@ __device__ void communication_role(
                 if (decision == DONE_TICKET)
                     break;
 
-                owner_help_one_producer(
-                    g, shape, cta_rank, ticket_slot,
-                    owner_phasebits, owner_ready_phase,
-                    a_smem, b_smem, d_smem,
-                    inputs_arrived, inputs_finished, inputs_ready);
+                dispatch_one_tile(
+                    g, shape, expert_row_end, cta_rank, comm_role,
+                    cluster_warp, m_tiles, ticket_slot);
+
+                if (owner_help_enabled) {
+                    owner_help_one_producer(
+                        g, shape, cta_rank, ticket_slot,
+                        owner_phasebits, owner_ready_phase,
+                        a_smem, b_smem, d_smem,
+                        inputs_arrived, inputs_finished, inputs_ready);
+                }
 
                 // A prior tile may already have been pushed.  This one-shot
                 // reducer never waits for the current tile and therefore does
@@ -718,8 +734,8 @@ __device__ void communication_role(
                 if (cta_rank == 0 && threadIdx.x == 0) {
                     const unsigned int ready = compute::load_acquire_gpu(
                         g.ready.y_ready + m);
-                    const unsigned int produced = compute::load_acquire_gpu(
-                        g.producer_done);
+                    const unsigned int produced = owner_help_enabled
+                        ? compute::load_acquire_gpu(g.producer_done) : 0u;
                     unsigned int next = WAIT_SIGNAL;
                     if (ready >= terminal::W2_N_TILES) {
                         next = DONE_TICKET;
@@ -751,29 +767,6 @@ __device__ void communication_role(
                     __nanosleep(64);
                 __syncthreads();
             }
-        } else {
-            if (threadIdx.x == 0) {
-                wait_ok = bounded_wait_gpu(
-                    g.ready.y_ready + m, terminal::W2_N_TILES,
-                    g.spin_limit) ? 1 : 0;
-            }
-            __syncthreads();
-            if (!wait_ok && threadIdx.x == 0) {
-                if (g.trap_record != nullptr)
-                    trap_commit(g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
-                                m, terminal::W2_N_TILES, 0, 0,
-                                g.spin_limit);
-                if (g.comm_failed != nullptr)
-                    atomicExch(g.comm_failed, 1u);
-                if (g.progress_timeouts != nullptr)
-                    atomicAdd(g.progress_timeouts, 1u);
-                if (g.errors != nullptr)
-                    atomicAdd(g.errors, 1u);
-            }
-            everyone::tma::cluster::sync();
-            if (g.comm_failed != nullptr
-                    && compute::load_acquire_gpu(g.comm_failed) != 0u)
-                return;
         }
 
         const int first = m * terminal::M_TILE;
