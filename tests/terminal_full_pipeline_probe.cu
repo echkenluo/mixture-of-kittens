@@ -161,8 +161,6 @@ __global__ void reference_reduce_kernel(reference_globals g) {
         __nv_bfloat16 result = initialized
             ? __float2bfloat16_rn(accumulator)
             : __float2bfloat16_rn(0.0f);
-        if (__bfloat162float(result) == 0.0f)
-            result = __float2bfloat16_rn(0.0f);
         g.output[(static_cast<size_t>(peer) * g.local_tokens + token)
                      * g.hidden + column] = result;
     }

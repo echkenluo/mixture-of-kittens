@@ -64,6 +64,15 @@ def check_source_contract() -> None:
     leaked = [needle for needle in forbidden if needle in header]
     if leaked:
         raise RuntimeError(f"barrier/queue/copied arithmetic leaked into full header: {leaked}")
+    reference_reduce = source[
+        source.find("reference_reduce_kernel") : source.find(
+            "constexpr int kDynamicSmem"
+        )
+    ]
+    if "__bfloat162float(result) == 0.0f" in reference_reduce:
+        raise RuntimeError(
+            "split oracle must not canonicalize valid-route signed zero"
+        )
     rank_global_reduction = (
         "g.ep_size * g.num_local_tokens",
         "selected_peer",
