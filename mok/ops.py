@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from . import _C
@@ -878,6 +880,642 @@ def fp8_block_dispatch_gemm_prewarm(device_index: int) -> int:
     if hasattr(_C, "fp8_block_dispatch_gemm_prewarm"):
         return int(_C.fp8_block_dispatch_gemm_prewarm(device_index))
     return -1
+
+
+def require_fp8_block_megakernel() -> None:
+    """Fail closed unless the complete terminal production API is loaded."""
+    required = (
+        "fp8_block_megakernel_prewarm",
+        "fp8_block_megakernel_prepare_out",
+        "fp8_block_megakernel_out",
+        "mok_workspace_lease_acquire",
+    )
+    missing = [name for name in required if not hasattr(_C, name)]
+    if missing:
+        raise RuntimeError(
+            "the loaded MoK extension lacks terminal FP8 megakernel APIs: "
+            + ", ".join(missing)
+        )
+
+
+def fp8_block_megakernel_prewarm(device_index: int) -> int:
+    """Warm the terminal megakernel occupancy cache outside graph capture.
+
+    Unlike the legacy K1 helper, the terminal path has no unsupported-op
+    fallback: all three production entry points must be present before a
+    graph-stable workspace can be created.  Returns the maximum number of
+    compute clusters after reserving the fixed communication cluster.
+    """
+    if type(device_index) is not int or device_index < 0:
+        raise ValueError("device_index must be a nonnegative integer")
+    require_fp8_block_megakernel()
+    maximum = int(_C.fp8_block_megakernel_prewarm(device_index))
+    if maximum <= 0:
+        raise RuntimeError(
+            "terminal FP8 megakernel occupancy prewarm returned no compute "
+            "clusters"
+        )
+    return maximum
+
+
+def _terminal_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or not tensor.is_cuda
+        or tensor.device != device
+        or tensor.dtype != dtype
+        or not tensor.is_contiguous()
+        or tuple(tensor.shape) != shape
+    ):
+        raise ValueError(
+            f"{name} must be contiguous CUDA {dtype} with shape {shape} "
+            f"on {device}"
+        )
+
+
+def _terminal_scalar(
+    name: str, tensor: torch.Tensor, *, device: torch.device
+) -> None:
+    _terminal_tensor(
+        name, tensor, device=device, dtype=torch.int32, shape=(1,)
+    )
+
+
+def _terminal_peer_ptrs(name: str, pointers: list[int]) -> None:
+    if (
+        not isinstance(pointers, list)
+        or len(pointers) != 4
+        or any(type(pointer) is not int or pointer <= 0 for pointer in pointers)
+    ):
+        raise ValueError(f"{name} must contain exactly four positive pointers")
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_megakernel_prepare_out",
+    mutates_args=(
+        "route_ready",
+        "x_routed_ready",
+        "gate_up_tile_ready",
+        "hidden_row_block_ready",
+        "y_routed_ready",
+        "y_routed_done",
+        "epilogue_claim",
+        "next_logical_cluster",
+        "next_reduce_probe",
+        "worker_ticket",
+        "producer_done",
+        "comm_closed",
+        "push_done",
+        "reduce_done",
+        "terminate",
+        "epilogue_done",
+        "input_expected_scratch",
+    ),
+)
+def fp8_block_megakernel_prepare_out(
+    topk_ids: torch.Tensor,
+    route_ready: torch.Tensor,
+    x_routed_ready: torch.Tensor,
+    gate_up_tile_ready: torch.Tensor,
+    hidden_row_block_ready: torch.Tensor,
+    y_routed_ready: torch.Tensor,
+    y_routed_done: torch.Tensor,
+    epilogue_claim: torch.Tensor,
+    next_logical_cluster: torch.Tensor,
+    next_reduce_probe: torch.Tensor,
+    worker_ticket: torch.Tensor,
+    producer_done: torch.Tensor,
+    comm_closed: torch.Tensor,
+    push_done: torch.Tensor,
+    reduce_done: torch.Tensor,
+    terminate: torch.Tensor,
+    epilogue_done: torch.Tensor,
+    input_expected_scratch: torch.Tensor,
+) -> None:
+    """Prepare one terminal forward after its workspace lease is acquired."""
+    if not hasattr(_C, "fp8_block_megakernel_prepare_out"):
+        raise RuntimeError(
+            "the loaded MoK extension lacks terminal megakernel prepare"
+        )
+    if (
+        not isinstance(topk_ids, torch.Tensor)
+        or not topk_ids.is_cuda
+        or topk_ids.dtype != torch.int32
+        or not topk_ids.is_contiguous()
+        or topk_ids.ndim != 2
+        or topk_ids.shape[0] <= 0
+        or topk_ids.shape[1] != 6
+    ):
+        raise ValueError("topk_ids must be contiguous CUDA int32 [T,6]")
+    device = topk_ids.device
+    local_tokens = topk_ids.shape[0]
+    if (
+        not route_ready.is_cuda
+        or route_ready.device != device
+        or route_ready.dtype != torch.int32
+        or not route_ready.is_contiguous()
+        or route_ready.ndim != 2
+        or route_ready.shape[0] < local_tokens
+        or route_ready.shape[0] % 64 != 0
+        or route_ready.shape[1] != 6
+    ):
+        raise ValueError(
+            "route_ready must be contiguous CUDA int32 [padded_T,6], "
+            "where padded_T >= T and is divisible by 64"
+        )
+    padded_tokens = route_ready.shape[0]
+    if (
+        not x_routed_ready.is_cuda
+        or x_routed_ready.device != device
+        or x_routed_ready.dtype != torch.int32
+        or not x_routed_ready.is_contiguous()
+        or x_routed_ready.ndim != 1
+        or x_routed_ready.numel() <= 0
+    ):
+        raise ValueError("x_routed_ready must be contiguous CUDA int32 [M_tiles]")
+    m_tiles = x_routed_ready.numel()
+    _terminal_tensor(
+        "gate_up_tile_ready",
+        gate_up_tile_ready,
+        device=device,
+        dtype=torch.int32,
+        shape=(m_tiles, 16),
+    )
+    for name, tensor in (
+        ("hidden_row_block_ready", hidden_row_block_ready),
+        ("y_routed_ready", y_routed_ready),
+        ("y_routed_done", y_routed_done),
+    ):
+        _terminal_tensor(
+            name, tensor, device=device, dtype=torch.int32, shape=(m_tiles,)
+        )
+    _terminal_tensor(
+        "epilogue_claim",
+        epilogue_claim,
+        device=device,
+        dtype=torch.int32,
+        shape=(padded_tokens,),
+    )
+    if (
+        not worker_ticket.is_cuda
+        or worker_ticket.device != device
+        or worker_ticket.dtype != torch.int32
+        or not worker_ticket.is_contiguous()
+        or worker_ticket.ndim != 1
+        or worker_ticket.numel() <= 0
+    ):
+        raise ValueError(
+            "worker_ticket must be contiguous CUDA int32 [compute_clusters]"
+        )
+    for name, tensor in (
+        ("next_logical_cluster", next_logical_cluster),
+        ("next_reduce_probe", next_reduce_probe),
+        ("producer_done", producer_done),
+        ("comm_closed", comm_closed),
+        ("push_done", push_done),
+        ("reduce_done", reduce_done),
+        ("terminate", terminate),
+        ("epilogue_done", epilogue_done),
+        ("input_expected_scratch", input_expected_scratch),
+    ):
+        _terminal_scalar(name, tensor, device=device)
+    _C.fp8_block_megakernel_prepare_out(
+        topk_ids,
+        route_ready,
+        x_routed_ready,
+        gate_up_tile_ready,
+        hidden_row_block_ready,
+        y_routed_ready,
+        y_routed_done,
+        epilogue_claim,
+        next_logical_cluster,
+        next_reduce_probe,
+        worker_ticket,
+        producer_done,
+        comm_closed,
+        push_done,
+        reduce_done,
+        terminate,
+        epilogue_done,
+        input_expected_scratch,
+    )
+
+
+@torch.library.custom_op(
+    "mok::fp8_block_megakernel_out",
+    mutates_args=(
+        "routed_x",
+        "routed_x_scale",
+        "m_indices",
+        "gate_up",
+        "down_input",
+        "down_input_scale",
+        "routed_y",
+        "combine_buffer",
+        "route_ready",
+        "output",
+        "x_routed_ready",
+        "gate_up_tile_ready",
+        "hidden_row_block_ready",
+        "y_routed_ready",
+        "y_routed_done",
+        "epilogue_claim",
+        "next_logical_cluster",
+        "next_reduce_probe",
+        "worker_ticket",
+        "producer_done",
+        "comm_closed",
+        "push_done",
+        "reduce_done",
+        "terminate",
+        "epilogue_done",
+        "in_use",
+        "barrier_buffer",
+        "barrier_target",
+        "input_expected_scratch",
+    ),
+)
+def fp8_block_megakernel_out(
+    x_buffer: torch.Tensor,
+    x_ptrs: list[int],
+    x_scale_buffer: torch.Tensor,
+    x_scale_ptrs: list[int],
+    routed_x: torch.Tensor,
+    routed_x_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    schedule_peer_rank: torch.Tensor,
+    schedule_peer_token_idx: torch.Tensor,
+    num_tokens: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    gate_up: torch.Tensor,
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    routed_y: torch.Tensor,
+    combine_buffer: torch.Tensor,
+    combine_ptrs: list[int],
+    route_ready: torch.Tensor,
+    route_ready_ptrs: list[int],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    x_routed_ready: torch.Tensor,
+    gate_up_tile_ready: torch.Tensor,
+    hidden_row_block_ready: torch.Tensor,
+    y_routed_ready: torch.Tensor,
+    y_routed_done: torch.Tensor,
+    epilogue_claim: torch.Tensor,
+    next_logical_cluster: torch.Tensor,
+    next_reduce_probe: torch.Tensor,
+    worker_ticket: torch.Tensor,
+    producer_done: torch.Tensor,
+    comm_closed: torch.Tensor,
+    push_done: torch.Tensor,
+    reduce_done: torch.Tensor,
+    terminate: torch.Tensor,
+    epilogue_done: torch.Tensor,
+    in_use: torch.Tensor,
+    barrier_buffer: torch.Tensor,
+    barrier_target: torch.Tensor,
+    input_expected_scratch: torch.Tensor,
+    barrier_multicast_ptr: int,
+    trap_record_ptr: int,
+    ep_rank: int,
+    compute_clusters: int,
+    minibatch_rows: int,
+    macrobatch_rows: int,
+    swiglu_limit: float,
+    spin_limit: int,
+) -> None:
+    """Execute the fixed EP4/H4096/I2048/top-6 terminal megakernel."""
+    if not hasattr(_C, "fp8_block_megakernel_out"):
+        raise RuntimeError("the loaded MoK extension lacks terminal megakernel")
+    if (
+        not isinstance(x_buffer, torch.Tensor)
+        or not x_buffer.is_cuda
+        or x_buffer.dtype != torch.float8_e4m3fn
+        or not x_buffer.is_contiguous()
+        or x_buffer.ndim != 2
+        or x_buffer.shape[0] <= 0
+        or x_buffer.shape[1] != 4096
+    ):
+        raise ValueError("x_buffer must be contiguous CUDA float8_e4m3fn [T,4096]")
+    device = x_buffer.device
+    local_tokens = x_buffer.shape[0]
+    _terminal_peer_ptrs("x_ptrs", x_ptrs)
+    _terminal_peer_ptrs("x_scale_ptrs", x_scale_ptrs)
+    _terminal_peer_ptrs("combine_ptrs", combine_ptrs)
+    _terminal_peer_ptrs("route_ready_ptrs", route_ready_ptrs)
+    _terminal_tensor(
+        "x_scale_buffer",
+        x_scale_buffer,
+        device=device,
+        dtype=torch.float32,
+        shape=(local_tokens, 32),
+    )
+    if (
+        not routed_x.is_cuda
+        or routed_x.device != device
+        or routed_x.dtype != torch.float8_e4m3fn
+        or not routed_x.is_contiguous()
+        or routed_x.ndim != 2
+        or routed_x.shape[0] <= 0
+        or routed_x.shape[0] % 64 != 0
+        or routed_x.shape[1] != 4096
+    ):
+        raise ValueError(
+            "routed_x must be contiguous CUDA float8_e4m3fn "
+            "[schedule_capacity,4096] with M divisible by 64"
+        )
+    schedule_capacity = routed_x.shape[0]
+    m_tiles = schedule_capacity // 64
+    _terminal_tensor(
+        "routed_x_scale",
+        routed_x_scale,
+        device=device,
+        dtype=torch.float32,
+        shape=(schedule_capacity, 32),
+    )
+    for name, tensor in (
+        ("m_indices", m_indices),
+        ("schedule_peer_rank", schedule_peer_rank),
+        ("schedule_peer_token_idx", schedule_peer_token_idx),
+    ):
+        _terminal_tensor(
+            name,
+            tensor,
+            device=device,
+            dtype=torch.int32,
+            shape=(schedule_capacity,),
+        )
+    _terminal_scalar("num_tokens", num_tokens, device=device)
+    if (
+        not tokens_per_expert.is_cuda
+        or tokens_per_expert.device != device
+        or tokens_per_expert.dtype != torch.int32
+        or not tokens_per_expert.is_contiguous()
+        or tokens_per_expert.ndim != 1
+        or not 1 <= tokens_per_expert.numel() <= 256
+    ):
+        raise ValueError(
+            "tokens_per_expert must be contiguous CUDA int32 [E], 1 <= E <= 256"
+        )
+    experts = tokens_per_expert.numel()
+    _terminal_tensor(
+        "w13",
+        w13,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+        shape=(experts, 4096, 4096),
+    )
+    _terminal_tensor(
+        "w13_scale",
+        w13_scale,
+        device=device,
+        dtype=torch.float32,
+        shape=(experts, 32, 32),
+    )
+    _terminal_tensor(
+        "gate_up",
+        gate_up,
+        device=device,
+        dtype=torch.bfloat16,
+        shape=(schedule_capacity, 4096),
+    )
+    _terminal_tensor(
+        "down_input",
+        down_input,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+        shape=(schedule_capacity, 2048),
+    )
+    _terminal_tensor(
+        "down_input_scale",
+        down_input_scale,
+        device=device,
+        dtype=torch.float32,
+        shape=(schedule_capacity, 16),
+    )
+    _terminal_tensor(
+        "w2",
+        w2,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+        shape=(experts, 4096, 2048),
+    )
+    _terminal_tensor(
+        "w2_scale",
+        w2_scale,
+        device=device,
+        dtype=torch.float32,
+        shape=(experts, 32, 16),
+    )
+    _terminal_tensor(
+        "routed_y",
+        routed_y,
+        device=device,
+        dtype=torch.bfloat16,
+        shape=(schedule_capacity, 4096),
+    )
+    if (
+        not route_ready.is_cuda
+        or route_ready.device != device
+        or route_ready.dtype != torch.int32
+        or not route_ready.is_contiguous()
+        or route_ready.ndim != 2
+        or route_ready.shape[0] < local_tokens
+        or route_ready.shape[0] % 64 != 0
+        or route_ready.shape[1] != 6
+    ):
+        raise ValueError(
+            "route_ready must be contiguous CUDA int32 [padded_T,6]"
+        )
+    padded_tokens = route_ready.shape[0]
+    _terminal_tensor(
+        "combine_buffer",
+        combine_buffer,
+        device=device,
+        dtype=torch.bfloat16,
+        shape=(padded_tokens * 6, 4096),
+    )
+    _terminal_tensor(
+        "topk_weights",
+        topk_weights,
+        device=device,
+        dtype=torch.float32,
+        shape=(local_tokens, 6),
+    )
+    _terminal_tensor(
+        "topk_ids",
+        topk_ids,
+        device=device,
+        dtype=torch.int32,
+        shape=(local_tokens, 6),
+    )
+    _terminal_tensor(
+        "output",
+        output,
+        device=device,
+        dtype=torch.bfloat16,
+        shape=(local_tokens, 4096),
+    )
+    _terminal_tensor(
+        "x_routed_ready",
+        x_routed_ready,
+        device=device,
+        dtype=torch.int32,
+        shape=(m_tiles,),
+    )
+    _terminal_tensor(
+        "gate_up_tile_ready",
+        gate_up_tile_ready,
+        device=device,
+        dtype=torch.int32,
+        shape=(m_tiles, 16),
+    )
+    for name, tensor in (
+        ("hidden_row_block_ready", hidden_row_block_ready),
+        ("y_routed_ready", y_routed_ready),
+        ("y_routed_done", y_routed_done),
+    ):
+        _terminal_tensor(
+            name, tensor, device=device, dtype=torch.int32, shape=(m_tiles,)
+        )
+    _terminal_tensor(
+        "epilogue_claim",
+        epilogue_claim,
+        device=device,
+        dtype=torch.int32,
+        shape=(padded_tokens,),
+    )
+    if (
+        type(compute_clusters) is not int
+        or compute_clusters <= 0
+        or compute_clusters > (1 << 31) - 1
+    ):
+        raise ValueError("compute_clusters must be a positive int32")
+    _terminal_tensor(
+        "worker_ticket",
+        worker_ticket,
+        device=device,
+        dtype=torch.int32,
+        shape=(compute_clusters,),
+    )
+    for name, tensor in (
+        ("next_logical_cluster", next_logical_cluster),
+        ("next_reduce_probe", next_reduce_probe),
+        ("producer_done", producer_done),
+        ("comm_closed", comm_closed),
+        ("push_done", push_done),
+        ("reduce_done", reduce_done),
+        ("terminate", terminate),
+        ("epilogue_done", epilogue_done),
+        ("in_use", in_use),
+        ("barrier_buffer", barrier_buffer),
+        ("barrier_target", barrier_target),
+        ("input_expected_scratch", input_expected_scratch),
+    ):
+        _terminal_scalar(name, tensor, device=device)
+    if type(barrier_multicast_ptr) is not int or barrier_multicast_ptr <= 0:
+        raise ValueError("barrier_multicast_ptr must be a positive integer")
+    if type(trap_record_ptr) is not int or trap_record_ptr <= 0:
+        raise ValueError("trap_record_ptr must be a positive integer")
+    if type(ep_rank) is not int or not 0 <= ep_rank < 4:
+        raise ValueError("ep_rank must be an integer in [0,4)")
+    if (
+        type(minibatch_rows) is not int
+        or minibatch_rows <= 0
+        or minibatch_rows > (1 << 31) - 1
+        or minibatch_rows % 64 != 0
+    ):
+        raise ValueError("minibatch_rows must be positive and divisible by 64")
+    if (
+        type(macrobatch_rows) is not int
+        or macrobatch_rows <= 0
+        or macrobatch_rows > (1 << 31) - 1
+        or macrobatch_rows % minibatch_rows != 0
+    ):
+        raise ValueError(
+            "macrobatch_rows must be positive and divisible by minibatch_rows"
+        )
+    if (
+        type(swiglu_limit) not in (int, float)
+        or not math.isfinite(float(swiglu_limit))
+        or swiglu_limit <= 0
+        or swiglu_limit > 3.4028234663852886e38
+    ):
+        raise ValueError("swiglu_limit must be a finite positive number")
+    if (
+        type(spin_limit) is not int
+        or spin_limit <= 0
+        or spin_limit > (1 << 63) - 1
+    ):
+        raise ValueError("spin_limit must be a positive int64")
+    _C.fp8_block_megakernel_out(
+        x_buffer,
+        x_ptrs,
+        x_scale_buffer,
+        x_scale_ptrs,
+        routed_x,
+        routed_x_scale,
+        m_indices,
+        schedule_peer_rank,
+        schedule_peer_token_idx,
+        num_tokens,
+        tokens_per_expert,
+        w13,
+        w13_scale,
+        gate_up,
+        down_input,
+        down_input_scale,
+        w2,
+        w2_scale,
+        routed_y,
+        combine_buffer,
+        combine_ptrs,
+        route_ready,
+        route_ready_ptrs,
+        topk_weights,
+        topk_ids,
+        output,
+        x_routed_ready,
+        gate_up_tile_ready,
+        hidden_row_block_ready,
+        y_routed_ready,
+        y_routed_done,
+        epilogue_claim,
+        next_logical_cluster,
+        next_reduce_probe,
+        worker_ticket,
+        producer_done,
+        comm_closed,
+        push_done,
+        reduce_done,
+        terminate,
+        epilogue_done,
+        in_use,
+        barrier_buffer,
+        barrier_target,
+        input_expected_scratch,
+        barrier_multicast_ptr,
+        trap_record_ptr,
+        ep_rank,
+        compute_clusters,
+        minibatch_rows,
+        macrobatch_rows,
+        float(swiglu_limit),
+        spin_limit,
+    )
 
 
 @torch.library.custom_op(

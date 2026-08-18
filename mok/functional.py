@@ -26,8 +26,12 @@ from .ops import (
     fp8_block_routed_dispatch_out,
     fwd_epilogue,
     fp8_block_dispatch_gemm_prewarm,
+    fp8_block_megakernel_out,
+    fp8_block_megakernel_prepare_out,
+    fp8_block_megakernel_prewarm,
     routed_epilogue_fused_out,
     routed_epilogue_out,
+    require_fp8_block_megakernel,
     schedule,
     workspace_lease_acquire,
     workspace_lease_release,
@@ -174,6 +178,7 @@ class MoKFP8TerminalWorkspace:
     num_local_experts: int
     schedule_capacity: int
     compute_clusters: int
+    max_compute_clusters: int
     x_buffer: torch.Tensor
     x_buffer_handle: Any
     x_buffer_ptrs: list[int]
@@ -681,15 +686,16 @@ def create_fp8_terminal_workspace(
     num_local_tokens: int,
     schedule_capacity: int,
     num_local_experts: int,
-    compute_clusters: int,
+    compute_clusters: int | None = None,
 ) -> MoKFP8TerminalWorkspace:
     """Allocate the graph-stable storage for the terminal H20 forward.
 
     The first terminal specialization is intentionally fixed to EP4,
     H4096/I2048/top-6.  ``schedule_capacity`` is physical routed-row storage,
     not the active device-side token count, and must therefore already include
-    padding to an M64 boundary.  This factory only owns storage: it does not
-    invoke a terminal op or prepare route flags for a particular forward.
+    padding to an M64 boundary.  Occupancy is prewarmed here, outside graph
+    capture, to derive or validate ``compute_clusters``.  The factory does not
+    launch a forward or prepare route flags for a particular iteration.
     """
     import os
 
@@ -740,8 +746,18 @@ def create_fp8_terminal_workspace(
         or not 1 <= num_local_experts <= 256
     ):
         raise ValueError("num_local_experts must be an integer in [1, 256]")
-    if type(compute_clusters) is not int or compute_clusters <= 0:
-        raise ValueError("compute_clusters must be a positive integer")
+    max_compute_clusters = fp8_block_megakernel_prewarm(device_index)
+    if compute_clusters is None:
+        compute_clusters = max_compute_clusters
+    elif (
+        type(compute_clusters) is not int
+        or compute_clusters <= 0
+        or compute_clusters > max_compute_clusters
+    ):
+        raise ValueError(
+            "compute_clusters must be in [1, "
+            f"{max_compute_clusters}] for this terminal kernel/device"
+        )
 
     group_name = group.group_name
     if not isinstance(group_name, str) or not group_name:
@@ -919,6 +935,13 @@ def create_fp8_terminal_workspace(
         group=group, async_op=True, device_ids=[device_index]
     ).block_current_stream()
 
+    print(
+        f"MOK_TERMINAL_OCCUPANCY|device={device_index}"
+        f"|max_compute_clusters={max_compute_clusters}"
+        f"|compute_clusters={compute_clusters}",
+        flush=True,
+    )
+
     return MoKFP8TerminalWorkspace(
         group_name=group_name,
         ep_rank=ep_rank,
@@ -932,6 +955,7 @@ def create_fp8_terminal_workspace(
         num_local_experts=num_local_experts,
         schedule_capacity=schedule_capacity,
         compute_clusters=compute_clusters,
+        max_compute_clusters=max_compute_clusters,
         x_buffer=x_buffer,
         x_buffer_handle=x_buffer_handle,
         x_buffer_ptrs=x_buffer_ptrs,
@@ -1356,6 +1380,461 @@ def dispatch_fp8_block(
         workspace.topk,
     )
     return routed_x, routed_x_scale, m_indices
+
+
+def _validate_terminal_forward(
+    workspace: MoKFP8TerminalWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    minibatch_rows: int,
+    macrobatch_rows: int,
+    swiglu_limit: float,
+    spin_limit: int,
+) -> None:
+    """Host-only validation run before the terminal lease is acquired."""
+    if not isinstance(workspace, MoKFP8TerminalWorkspace):
+        raise TypeError("workspace must be a MoKFP8TerminalWorkspace")
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    if (
+        workspace.ep_size != 4
+        or not 0 <= workspace.ep_rank < 4
+        or workspace.hidden_size != 4096
+        or workspace.intermediate_size != 2048
+        or workspace.topk != 6
+        or not 1 <= workspace.num_local_experts <= 256
+        or workspace.schedule_capacity <= 0
+        or workspace.schedule_capacity % 64 != 0
+        or workspace.padded_num_local_tokens < workspace.num_local_tokens
+        or workspace.padded_num_local_tokens % 64 != 0
+        or workspace.compute_clusters <= 0
+        or workspace.compute_clusters > workspace.max_compute_clusters
+    ):
+        raise ValueError(
+            "terminal workspace must satisfy the fixed "
+            "EP4/H4096/I2048/top-6 contract"
+        )
+    if workspace.device.type != "cuda":
+        raise ValueError("terminal workspace must be on CUDA")
+    device = workspace.device
+
+    def tensor(
+        name: str,
+        value: torch.Tensor,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> None:
+        if (
+            not isinstance(value, torch.Tensor)
+            or not value.is_cuda
+            or value.device != device
+            or value.dtype != dtype
+            or not value.is_contiguous()
+            or tuple(value.shape) != shape
+        ):
+            raise ValueError(
+                f"{name} must be contiguous CUDA {dtype} with shape {shape} "
+                f"on {device}"
+            )
+
+    def peer_ptrs(name: str, values: list[int]) -> None:
+        if (
+            not isinstance(values, list)
+            or len(values) != 4
+            or any(type(value) is not int or value <= 0 for value in values)
+        ):
+            raise ValueError(
+                f"{name} must contain exactly four positive pointers"
+            )
+
+    local_tokens = workspace.num_local_tokens
+    padded_tokens = workspace.padded_num_local_tokens
+    capacity = workspace.schedule_capacity
+    experts = workspace.num_local_experts
+    m_tiles = capacity // 64
+    tensor(
+        "workspace.x_buffer",
+        workspace.x_buffer,
+        torch.float8_e4m3fn,
+        (local_tokens, 4096),
+    )
+    tensor(
+        "workspace.x_scale_buffer",
+        workspace.x_scale_buffer,
+        torch.float32,
+        (local_tokens, 32),
+    )
+    peer_ptrs("workspace.x_buffer_ptrs", workspace.x_buffer_ptrs)
+    peer_ptrs("workspace.x_scale_buffer_ptrs", workspace.x_scale_buffer_ptrs)
+    if (
+        workspace.x_buffer_ptrs[workspace.ep_rank] != workspace.x_buffer.data_ptr()
+        or workspace.x_scale_buffer_ptrs[workspace.ep_rank]
+        != workspace.x_scale_buffer.data_ptr()
+    ):
+        raise ValueError(
+            "rank-local symmetric x pointers must alias workspace storage"
+        )
+    tensor("x", x, torch.float8_e4m3fn, (local_tokens, 4096))
+    tensor("x_scale", x_scale, torch.float32, (local_tokens, 32))
+    tensor(
+        "workspace.routed_x",
+        workspace.routed_x,
+        torch.float8_e4m3fn,
+        (capacity, 4096),
+    )
+    tensor(
+        "workspace.routed_x_scale",
+        workspace.routed_x_scale,
+        torch.float32,
+        (capacity, 32),
+    )
+    tensor("workspace.m_indices", workspace.m_indices, torch.int32, (capacity,))
+    tensor(
+        "workspace.gate_up",
+        workspace.gate_up,
+        torch.bfloat16,
+        (capacity, 4096),
+    )
+    tensor(
+        "workspace.down_input",
+        workspace.down_input,
+        torch.float8_e4m3fn,
+        (capacity, 2048),
+    )
+    tensor(
+        "workspace.down_input_scale",
+        workspace.down_input_scale,
+        torch.float32,
+        (capacity, 16),
+    )
+    tensor(
+        "workspace.routed_y",
+        workspace.routed_y,
+        torch.bfloat16,
+        (capacity, 4096),
+    )
+    tensor(
+        "workspace.combine_buffer",
+        workspace.combine_buffer,
+        torch.bfloat16,
+        (padded_tokens * 6, 4096),
+    )
+    tensor(
+        "workspace.route_ready",
+        workspace.route_ready,
+        torch.int32,
+        (padded_tokens, 6),
+    )
+    peer_ptrs("workspace.combine_buffer_ptrs", workspace.combine_buffer_ptrs)
+    peer_ptrs("workspace.route_ready_ptrs", workspace.route_ready_ptrs)
+    if (
+        workspace.combine_buffer_ptrs[workspace.ep_rank]
+        != workspace.combine_buffer.data_ptr()
+        or workspace.route_ready_ptrs[workspace.ep_rank]
+        != workspace.route_ready.data_ptr()
+    ):
+        raise ValueError(
+            "rank-local symmetric combine pointers must alias workspace storage"
+        )
+    tensor(
+        "workspace.x_routed_ready",
+        workspace.x_routed_ready,
+        torch.int32,
+        (m_tiles,),
+    )
+    tensor(
+        "workspace.gate_up_tile_ready",
+        workspace.gate_up_tile_ready,
+        torch.int32,
+        (m_tiles, 16),
+    )
+    for name, value in (
+        ("hidden_row_block_ready", workspace.hidden_row_block_ready),
+        ("y_routed_ready", workspace.y_routed_ready),
+        ("y_routed_done", workspace.y_routed_done),
+    ):
+        tensor(f"workspace.{name}", value, torch.int32, (m_tiles,))
+    tensor(
+        "workspace.epilogue_claim",
+        workspace.epilogue_claim,
+        torch.int32,
+        (padded_tokens,),
+    )
+    tensor(
+        "workspace.worker_ticket",
+        workspace.worker_ticket,
+        torch.int32,
+        (workspace.compute_clusters,),
+    )
+    for name, value in (
+        ("next_logical_cluster", workspace.next_logical_cluster),
+        ("next_reduce_probe", workspace.next_reduce_probe),
+        ("producer_done", workspace.producer_done),
+        ("comm_closed", workspace.comm_closed),
+        ("push_done", workspace.push_done),
+        ("reduce_done", workspace.reduce_done),
+        ("terminate", workspace.terminate),
+        ("epilogue_done", workspace.epilogue_done),
+        ("in_use", workspace.in_use),
+        ("barrier_buffer", workspace.barrier_buffer),
+        ("barrier_target", workspace.barrier_target),
+        ("input_expected_scratch", workspace.input_expected_scratch),
+    ):
+        tensor(f"workspace.{name}", value, torch.int32, (1,))
+    if (
+        type(workspace.barrier_buffer_multicast_ptr) is not int
+        or workspace.barrier_buffer_multicast_ptr <= 0
+        or type(workspace.trap_record_ptr) is not int
+        or workspace.trap_record_ptr <= 0
+    ):
+        raise ValueError("terminal workspace device pointers must be positive")
+    if (
+        workspace.trap_record.is_cuda
+        or workspace.trap_record.dtype != torch.int64
+        or not workspace.trap_record.is_contiguous()
+        or tuple(workspace.trap_record.shape) != (8,)
+        or not workspace.trap_record.is_pinned()
+        or workspace.trap_record_ptr != workspace.trap_record.data_ptr()
+    ):
+        raise ValueError(
+            "trap_record must be contiguous pinned CPU int64 [8] and its "
+            "pointer must match trap_record_ptr"
+        )
+
+    tensor(
+        "schedule.peer_rank",
+        schedule.peer_rank,
+        torch.int32,
+        (capacity,),
+    )
+    tensor(
+        "schedule.peer_token_idx",
+        schedule.peer_token_idx,
+        torch.int32,
+        (capacity,),
+    )
+    tensor("schedule.num_tokens", schedule.num_tokens, torch.int32, (1,))
+    tensor(
+        "schedule.tokens_per_expert",
+        schedule.tokens_per_expert,
+        torch.int32,
+        (experts,),
+    )
+    tensor(
+        "w13", w13, torch.float8_e4m3fn, (experts, 4096, 4096)
+    )
+    tensor("w13_scale", w13_scale, torch.float32, (experts, 32, 32))
+    tensor("w2", w2, torch.float8_e4m3fn, (experts, 4096, 2048))
+    tensor("w2_scale", w2_scale, torch.float32, (experts, 32, 16))
+    tensor(
+        "topk_weights", topk_weights, torch.float32, (local_tokens, 6)
+    )
+    tensor("topk_ids", topk_ids, torch.int32, (local_tokens, 6))
+    tensor("output", output, torch.bfloat16, (local_tokens, 4096))
+    if (
+        type(minibatch_rows) is not int
+        or minibatch_rows <= 0
+        or minibatch_rows > (1 << 31) - 1
+        or minibatch_rows % 64 != 0
+        or type(macrobatch_rows) is not int
+        or macrobatch_rows <= 0
+        or macrobatch_rows > (1 << 31) - 1
+        or macrobatch_rows % minibatch_rows != 0
+    ):
+        raise ValueError(
+            "minibatch_rows must be a positive M64 multiple and "
+            "macrobatch_rows must be a positive multiple of minibatch_rows"
+        )
+    if (
+        type(swiglu_limit) not in (int, float)
+        or not math.isfinite(float(swiglu_limit))
+        or swiglu_limit <= 0
+        or swiglu_limit > 3.4028234663852886e38
+    ):
+        raise ValueError("swiglu_limit must be a finite positive number")
+    if (
+        type(spin_limit) is not int
+        or spin_limit <= 0
+        or spin_limit > (1 << 63) - 1
+    ):
+        raise ValueError("spin_limit must be a positive int64")
+
+    # Release happens inside the terminal kernel.  Its output must outlive the
+    # released workspace and therefore cannot share storage with any workspace
+    # tensor or another input that the kernel consumes.
+    output_storage = output.untyped_storage().data_ptr()
+    workspace_storages = {
+        value.untyped_storage().data_ptr()
+        for field in workspace.__dataclass_fields__
+        if isinstance((value := getattr(workspace, field)), torch.Tensor)
+    }
+    if (
+        x.untyped_storage().data_ptr() in workspace_storages
+        or x_scale.untyped_storage().data_ptr() in workspace_storages
+    ):
+        raise ValueError(
+            "x and x_scale must be caller-owned and must not already alias "
+            "terminal workspace storage"
+        )
+    forbidden = set(workspace_storages)
+    forbidden.update(
+        value.untyped_storage().data_ptr()
+        for value in (
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            x,
+            x_scale,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+        )
+    )
+    if output_storage in forbidden:
+        raise ValueError(
+            "output must be caller-owned contiguous storage and must not "
+            "alias the terminal workspace, schedule, weights, or routes"
+        )
+
+
+def megakernel_fp8_block(
+    workspace: MoKFP8TerminalWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    minibatch_rows: int = 4096,
+    macrobatch_rows: int = 131072,
+    swiglu_limit: float = 10.0,
+    spin_limit: int = 1 << 27,
+) -> torch.Tensor:
+    """Run the strict terminal dispatch/W13/activation/W2/combine kernel.
+
+    This entry has no split fallback and no Python release tail.  After all
+    host-only validation, lease acquire is its first device operation; the
+    caller-owned rank-local ``x``/``x_scale`` are then copied into symmetric
+    storage before prepare and the single megakernel launch.  The final
+    physical cluster releases the lease only after the caller-owned output has
+    been materialized.
+    """
+    require_fp8_block_megakernel()
+    _validate_terminal_forward(
+        workspace,
+        schedule,
+        x,
+        x_scale,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        output,
+        minibatch_rows,
+        macrobatch_rows,
+        swiglu_limit,
+        spin_limit,
+    )
+    workspace_lease_acquire(
+        workspace.in_use, workspace.trap_record_ptr, workspace.ep_rank
+    )
+    workspace.x_buffer.copy_(x)
+    workspace.x_scale_buffer.copy_(x_scale)
+    fp8_block_megakernel_prepare_out(
+        topk_ids,
+        workspace.route_ready,
+        workspace.x_routed_ready,
+        workspace.gate_up_tile_ready,
+        workspace.hidden_row_block_ready,
+        workspace.y_routed_ready,
+        workspace.y_routed_done,
+        workspace.epilogue_claim,
+        workspace.next_logical_cluster,
+        workspace.next_reduce_probe,
+        workspace.worker_ticket,
+        workspace.producer_done,
+        workspace.comm_closed,
+        workspace.push_done,
+        workspace.reduce_done,
+        workspace.terminate,
+        workspace.epilogue_done,
+        workspace.input_expected_scratch,
+    )
+    fp8_block_megakernel_out(
+        workspace.x_buffer,
+        workspace.x_buffer_ptrs,
+        workspace.x_scale_buffer,
+        workspace.x_scale_buffer_ptrs,
+        workspace.routed_x,
+        workspace.routed_x_scale,
+        workspace.m_indices,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        w13,
+        w13_scale,
+        workspace.gate_up,
+        workspace.down_input,
+        workspace.down_input_scale,
+        w2,
+        w2_scale,
+        workspace.routed_y,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        workspace.route_ready,
+        workspace.route_ready_ptrs,
+        topk_weights,
+        topk_ids,
+        output,
+        workspace.x_routed_ready,
+        workspace.gate_up_tile_ready,
+        workspace.hidden_row_block_ready,
+        workspace.y_routed_ready,
+        workspace.y_routed_done,
+        workspace.epilogue_claim,
+        workspace.next_logical_cluster,
+        workspace.next_reduce_probe,
+        workspace.worker_ticket,
+        workspace.producer_done,
+        workspace.comm_closed,
+        workspace.push_done,
+        workspace.reduce_done,
+        workspace.terminate,
+        workspace.epilogue_done,
+        workspace.in_use,
+        workspace.barrier_buffer,
+        workspace.barrier_target,
+        workspace.input_expected_scratch,
+        workspace.barrier_buffer_multicast_ptr,
+        workspace.trap_record_ptr,
+        workspace.ep_rank,
+        workspace.compute_clusters,
+        minibatch_rows,
+        macrobatch_rows,
+        swiglu_limit,
+        spin_limit,
+    )
+    return output
 
 
 def dispatch_gemm_fused_fp8_block(
