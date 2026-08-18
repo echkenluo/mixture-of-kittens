@@ -15,7 +15,7 @@ from torch.utils.cpp_extension import load
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", default="2,64,4096")
-    parser.add_argument("--hidden", type=int, default=7168)
+    parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=20)

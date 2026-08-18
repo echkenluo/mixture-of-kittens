@@ -45,7 +45,7 @@ void reference_kernel(const __nv_bfloat16 *combine, const float *weights,
 }
 
 // Numeric core of the ready-token terminal epilogue.  One cluster owns one
-// token; its two CTAs form a 256-thread column group and loop over H7168.
+// token; its two CTAs form a 256-thread column group and loop over hidden.
 // Route slots are accumulated in the same fixed order as routed_epilogue.
 __cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
 __global__ void reduce_kernel(const __nv_bfloat16 *combine,
