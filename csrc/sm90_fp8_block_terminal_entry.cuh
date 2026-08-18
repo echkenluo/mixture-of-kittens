@@ -29,7 +29,11 @@ namespace compute = fp8_block_terminal_compute;
 using namespace kittens;
 
 using a_gl = gl<fp8e4m3, 1, 1, -1, -1, compute::a_st>;
-using b_gl = gl<fp8e4m3, 1, 1, -1, -1, compute::b_st>;
+// A/D are compact rank-local [M,K]/[M,N] matrices, while each weight is an
+// expert stack [E,N,K].  Keep the expert depth dynamic exactly as in the
+// proven contiguous grouped-GEMM descriptor; fixing it to one makes
+// tensor_to_gl reject every production E>1 weight before launch.
+using b_gl = gl<fp8e4m3, 1, -1, -1, -1, compute::b_st>;
 using d_gl = gl<bf16, 1, 1, -1, -1, compute::d_st>;
 
 // This type is deliberately fixed.  The terminal entry is not a generic
