@@ -275,9 +275,14 @@ std::vector<int64_t> kernel_attributes(int64_t device_index) {
     TORCH_CHECK(status == cudaSuccess,
                 "coarse route attribute query failed: ",
                 cudaGetErrorString(status));
-    return {attributes.numRegs, attributes.sharedSizeBytes,
-            attributes.localSizeBytes, attributes.maxThreadsPerBlock,
-            attributes.binaryVersion, attributes.ptxVersion};
+    return {
+        static_cast<int64_t>(attributes.numRegs),
+        static_cast<int64_t>(attributes.sharedSizeBytes),
+        static_cast<int64_t>(attributes.localSizeBytes),
+        static_cast<int64_t>(attributes.maxThreadsPerBlock),
+        static_cast<int64_t>(attributes.binaryVersion),
+        static_cast<int64_t>(attributes.ptxVersion),
+    };
 }
 
 void run(
