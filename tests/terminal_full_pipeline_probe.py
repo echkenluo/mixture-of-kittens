@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-launch terminal FP8 M0 pipeline versus a fully split oracle."""
+"""Single-launch terminal FP8 M1 N-worker pipeline versus split oracle."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
 def check_source_contract() -> None:
     header = HEADER.read_text(encoding="utf-8")
     source = SOURCE.read_text(encoding="utf-8")
+    driver = Path(__file__).read_text(encoding="utf-8")
     required = (
         "sm90_fp8_block_terminal_comm_primitives.cuh",
         "sm90_fp8_block_terminal_compute.cuh",
@@ -37,11 +38,14 @@ def check_source_contract() -> None:
         "dispatch_copy_row",
         "push_routed_row_and_publish",
         "try_claim_ready_token",
+        "try_reduce_one_ready_token",
         "reduce_claimed_token",
         "decode_logical_cursor",
         "fence.proxy.async.global",
         "worker_failed",
+        "progress_timeouts",
         "overlap_witness",
+        "OVERLAP_REDUCE_COMM",
     )
     missing = [needle for needle in required if needle not in header]
     if missing:
@@ -59,13 +63,44 @@ def check_source_contract() -> None:
         raise RuntimeError(f"barrier/queue/copied arithmetic leaked into full header: {leaked}")
     if header.count("__global__ void kernel") != 1:
         raise RuntimeError("full header must expose exactly one kernel")
+    probe_start = header.find("try_reduce_one_ready_token")
+    probe_end = header.find("compute_and_reduce_role", probe_start)
+    probe = header[probe_start:probe_end]
+    if "while" in probe or "for (" in probe or "__nanosleep" in probe:
+        raise RuntimeError("ready-token probe must be one-shot and nonblocking")
+    compute = header[probe_end : header.find("__global__ void kernel", probe_end)]
+    if compute.count("try_reduce_one_ready_token(g)") < 3:
+        raise RuntimeError(
+            "compute workers must probe after tasks, cursor stop, and wait windows"
+        )
+    if "result == route::claim_result::claimed" not in compute:
+        raise RuntimeError("winning CTA does not resume the compute loop")
     run_full = source[source.find("void run_full(") : source.find("std::vector<int64_t> attributes")]
     launches = re.findall(r"full::kernel<gemm_problem>\s*\n?\s*<<<", run_full)
     if len(launches) != 1:
         raise RuntimeError(f"candidate path must launch one kernel, found {len(launches)}")
+    dynamic_required = (
+        "worker_ticket.numel() == compute_clusters",
+        "worker_failed.numel() == compute_clusters",
+        "max_resident_clusters - full::COMM_CLUSTERS",
+        "full::COMM_CLUSTERS + g.compute_clusters",
+    )
+    missing_dynamic = [item for item in dynamic_required if item not in source]
+    if missing_dynamic:
+        raise RuntimeError(f"dynamic resident launch contract missing: {missing_dynamic}")
+    scan_required = (
+        "min(7, max_compute_clusters)",
+        "resident_clusters - 1",
+        '"progress_timeouts"',
+        '"worker_ticket": torch.zeros(\n                        compute_clusters',
+    )
+    missing_scan = [item for item in scan_required if item not in driver]
+    if missing_scan:
+        raise RuntimeError(f"M1 N-scan/progress contract missing: {missing_scan}")
     print(
         "TERMINAL_FULL_SOURCE"
-        "|milestone=M0|comm_clusters=1|compute_clusters=1"
+        "|milestone=M1|comm_clusters=1|compute_clusters=dynamic"
+        "|reduce_probe=bounded_one_shot|not_ready_wait=0"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
         "|split_fallback=0|core_arithmetic_copy=0|result=PASS",
         flush=True,
@@ -223,13 +258,28 @@ def run_device(args: argparse.Namespace) -> None:
     torch.cuda.set_device(first_sm90_device())
     module = build_extension(args.verbose_build)
     attrs = [int(value) for value in module.attributes()]
-    if attrs[5] < 2 or attrs[6] != 2:
-        raise RuntimeError(f"fixed clusters are not co-resident: {attrs}")
+    if attrs[5] < 2 or attrs[6] != attrs[5] - 1:
+        raise RuntimeError(f"resident compute capacity is invalid: {attrs}")
+    resident_clusters = attrs[5]
+    max_compute_clusters = attrs[6]
+    compute_cases = sorted(
+        {
+            1,
+            min(7, max_compute_clusters),
+            resident_clusters - 1,
+        }
+    )
+    if compute_cases[0] < 1 or compute_cases[-1] > max_compute_clusters:
+        raise RuntimeError(
+            f"N scan exceeds resident capacity: {compute_cases}, attrs={attrs}"
+        )
     print(
         "TERMINAL_FULL_ATTR"
         f"|regs={attrs[0]}|static_smem={attrs[1]}|local={attrs[2]}"
         f"|max_dynamic_smem={attrs[3]}|launch_smem={attrs[4]}"
-        f"|resident_clusters={attrs[5]}|m0_clusters={attrs[6]}",
+        f"|resident_clusters={resident_clusters}"
+        f"|max_compute_clusters={max_compute_clusters}"
+        f"|compute_scan={','.join(map(str, compute_cases))}",
         flush=True,
     )
 
@@ -263,10 +313,10 @@ def run_device(args: argparse.Namespace) -> None:
             topk_ids = torch.full(
                 (4, local_tokens, 6), -1, dtype=torch.int32, device="cuda"
             )
-            route_ready = torch.ones_like(topk_ids)
+            route_ready_initial = torch.ones_like(topk_ids)
             for ordinal, (peer, slot) in enumerate(valid):
                 topk_ids.view(4, -1)[peer, slot] = ordinal
-                route_ready.view(4, -1)[peer, slot] = 0
+                route_ready_initial.view(4, -1)[peer, slot] = 0
             weights = torch.zeros(
                 (4, local_tokens, 6), dtype=torch.float32, device="cuda"
             )
@@ -319,9 +369,7 @@ def run_device(args: argparse.Namespace) -> None:
                 }
 
             reference = stage_buffers()
-            candidate = stage_buffers()
             reference["hidden"].view(torch.uint8).fill_(0x7F)
-            candidate["hidden"].view(torch.uint8).fill_(0x7F)
             module.run_split(
                 peer_x, peer_scale, w13, w13_scale, w2, w2_scale,
                 schedule_peer, schedule_slot, tokens_per_expert, push_order,
@@ -333,104 +381,190 @@ def run_device(args: argparse.Namespace) -> None:
             )
 
             m_tiles = rows // 64
-            state = {
-                "gate_up_ready": torch.zeros((m_tiles, 16), dtype=torch.int32, device="cuda"),
-                "hidden_ready": torch.zeros(m_tiles, dtype=torch.int32, device="cuda"),
-                "y_ready": torch.zeros(m_tiles, dtype=torch.int32, device="cuda"),
-                "x_ready": torch.zeros(m_tiles, dtype=torch.int32, device="cuda"),
-                "cursor": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "worker_ticket": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "worker_failed": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "next_reduce_probe": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "reduce_done": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "comm_closed": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "comm_failed": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "task_visits": torch.zeros(rows // 64 * 65, dtype=torch.int32, device="cuda"),
-                "dispatch_visits": torch.zeros(rows, dtype=torch.int32, device="cuda"),
-                "push_visits": torch.zeros(rows, dtype=torch.int32, device="cuda"),
-                "epilogue_claim": torch.zeros((4, local_tokens), dtype=torch.int32, device="cuda"),
-                "reduce_visits": torch.zeros(global_tokens, dtype=torch.int32, device="cuda"),
-                "errors": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "dispatch_tiles_done": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "compute_started": torch.zeros(1, dtype=torch.int32, device="cuda"),
-                "overlap_witness": torch.zeros(1, dtype=torch.int32, device="cuda"),
-            }
-            module.run_full(
-                peer_x, peer_scale, w13, w13_scale, w2, w2_scale,
-                schedule_peer, schedule_slot, num_tokens, tokens_per_expert,
-                push_order, weights, topk_ids,
-                candidate["x"], candidate["x_scale"], candidate["m_indices"],
-                candidate["gate_up"], candidate["hidden"],
-                candidate["hidden_scale"], candidate["y"],
-                candidate["combine"], route_ready, candidate["output"],
-                state["gate_up_ready"], state["hidden_ready"], state["y_ready"],
-                state["x_ready"], state["cursor"], state["worker_ticket"],
-                state["worker_failed"], state["next_reduce_probe"],
-                state["reduce_done"], state["comm_closed"],
-                state["comm_failed"],
-                state["task_visits"], state["dispatch_visits"],
-                state["push_visits"], state["epilogue_claim"],
-                state["reduce_visits"], state["errors"],
-                state["dispatch_tiles_done"], state["compute_started"],
-                state["overlap_witness"], rows, rows,
-                (1 << 20) if rows > 64 else 0, args.spin_limit, 10.0,
-            )
-            torch.cuda.synchronize()
+            total_tasks = rows // 64 * 65
+            for compute_clusters in compute_cases:
+                candidate = stage_buffers()
+                candidate["hidden"].view(torch.uint8).fill_(0x7F)
+                route_ready = route_ready_initial.clone()
+                state = {
+                    "gate_up_ready": torch.zeros(
+                        (m_tiles, 16), dtype=torch.int32, device="cuda"
+                    ),
+                    "hidden_ready": torch.zeros(
+                        m_tiles, dtype=torch.int32, device="cuda"
+                    ),
+                    "y_ready": torch.zeros(
+                        m_tiles, dtype=torch.int32, device="cuda"
+                    ),
+                    "x_ready": torch.zeros(
+                        m_tiles, dtype=torch.int32, device="cuda"
+                    ),
+                    "cursor": torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    "worker_ticket": torch.zeros(
+                        compute_clusters, dtype=torch.int32, device="cuda"
+                    ),
+                    "worker_failed": torch.zeros(
+                        compute_clusters, dtype=torch.int32, device="cuda"
+                    ),
+                    "next_reduce_probe": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "reduce_done": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "comm_closed": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "comm_failed": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "task_visits": torch.zeros(
+                        total_tasks, dtype=torch.int32, device="cuda"
+                    ),
+                    "dispatch_visits": torch.zeros(
+                        rows, dtype=torch.int32, device="cuda"
+                    ),
+                    "push_visits": torch.zeros(
+                        rows, dtype=torch.int32, device="cuda"
+                    ),
+                    "epilogue_claim": torch.zeros(
+                        (4, local_tokens), dtype=torch.int32, device="cuda"
+                    ),
+                    "reduce_visits": torch.zeros(
+                        global_tokens, dtype=torch.int32, device="cuda"
+                    ),
+                    "errors": torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    "progress_timeouts": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "dispatch_tiles_done": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "compute_started": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    "overlap_witness": torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                }
+                module.run_full(
+                    peer_x, peer_scale, w13, w13_scale, w2, w2_scale,
+                    schedule_peer, schedule_slot, num_tokens, tokens_per_expert,
+                    push_order, weights, topk_ids,
+                    candidate["x"], candidate["x_scale"],
+                    candidate["m_indices"], candidate["gate_up"],
+                    candidate["hidden"], candidate["hidden_scale"],
+                    candidate["y"], candidate["combine"], route_ready,
+                    candidate["output"], state["gate_up_ready"],
+                    state["hidden_ready"], state["y_ready"], state["x_ready"],
+                    state["cursor"], state["worker_ticket"],
+                    state["worker_failed"], state["next_reduce_probe"],
+                    state["reduce_done"], state["comm_closed"],
+                    state["comm_failed"], state["task_visits"],
+                    state["dispatch_visits"], state["push_visits"],
+                    state["epilogue_claim"], state["reduce_visits"],
+                    state["errors"], state["progress_timeouts"],
+                    state["dispatch_tiles_done"], state["compute_started"],
+                    state["overlap_witness"], compute_clusters, rows, rows,
+                    (1 << 20) if rows > 64 else 0, args.spin_limit, 10.0,
+                )
+                torch.cuda.synchronize()
 
-            for name in (
-                "x", "x_scale", "m_indices", "gate_up", "hidden",
-                "hidden_scale", "y", "combine", "output"
-            ):
-                require_exact(name, rows, seed, reference[name], candidate[name])
-            if not bool((candidate["x"][list(invalid_rows)].view(torch.uint8) == 0).all()):
-                raise RuntimeError(f"invalid dispatch payload is not zero rows={rows}")
-            if not bool((candidate["x_scale"][list(invalid_rows)] == 0).all()):
-                raise RuntimeError(f"invalid dispatch scale is not zero rows={rows}")
-
-            scalar_expected = {
-                "cursor": rows // 64 * 65,
-                "worker_failed": 0,
-                "reduce_done": global_tokens,
-                "comm_closed": 1,
-                "comm_failed": 0,
-                "errors": 0,
-                "dispatch_tiles_done": m_tiles,
-                "compute_started": 1,
-                "overlap_witness": int(rows > 64),
-            }
-            for name, expected in scalar_expected.items():
-                actual = int(state[name].item())
-                if actual != expected:
-                    raise RuntimeError(
-                        f"{name} mismatch rows={rows}: {actual} != {expected}"
+                for name in (
+                    "x", "x_scale", "m_indices", "gate_up", "hidden",
+                    "hidden_scale", "y", "combine", "output"
+                ):
+                    require_exact(
+                        name, rows, seed, reference[name], candidate[name]
                     )
-            exact_once = (
-                "task_visits", "dispatch_visits", "push_visits",
-                "epilogue_claim", "reduce_visits"
-            )
-            for name in exact_once:
-                if not bool((state[name] == 1).all()):
-                    raise RuntimeError(f"{name} is not exactly once rows={rows}")
-            counter_expected = {
-                "x_ready": 64,
-                "gate_up_ready": 2,
-                "hidden_ready": 1,
-                "y_ready": 32,
-            }
-            for name, expected in counter_expected.items():
-                if not bool((state[name] == expected).all()):
-                    raise RuntimeError(f"{name} mismatch rows={rows}")
-            if not bool((route_ready == 1).all()):
-                raise RuntimeError(f"route flags did not close rows={rows}")
+                if not bool(
+                    (candidate["x"][list(invalid_rows)].view(torch.uint8) == 0)
+                    .all()
+                ):
+                    raise RuntimeError(
+                        f"invalid dispatch payload is not zero rows={rows}"
+                    )
+                if not bool(
+                    (candidate["x_scale"][list(invalid_rows)] == 0).all()
+                ):
+                    raise RuntimeError(
+                        f"invalid dispatch scale is not zero rows={rows}"
+                    )
 
-            print(
-                "TERMINAL_FULL_EXACT"
-                f"|rows={rows}|seed={seed}|invalid_routes={len(invalid_rows)}"
-                "|push_order=reverse_m64|candidate_launches=1"
-                f"|overlap={int(rows > 64)}|tasks={rows // 64 * 65}"
-                f"|tokens={global_tokens}|result=PASS",
-                flush=True,
-            )
+                scalar_expected = {
+                    "cursor": total_tasks,
+                    "reduce_done": global_tokens,
+                    "comm_closed": 1,
+                    "comm_failed": 0,
+                    "errors": 0,
+                    "progress_timeouts": 0,
+                    "dispatch_tiles_done": m_tiles,
+                    "compute_started": 1,
+                }
+                for name, expected in scalar_expected.items():
+                    actual = int(state[name].item())
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"{name} mismatch rows={rows} N={compute_clusters}: "
+                            f"{actual} != {expected}"
+                        )
+                if not bool((state["worker_failed"] == 0).all()):
+                    raise RuntimeError(
+                        f"worker failure rows={rows} N={compute_clusters}"
+                    )
+                exact_once = (
+                    "task_visits", "dispatch_visits", "push_visits",
+                    "epilogue_claim", "reduce_visits"
+                )
+                for name in exact_once:
+                    if not bool((state[name] == 1).all()):
+                        raise RuntimeError(
+                            f"{name} is not exactly once rows={rows} "
+                            f"N={compute_clusters}"
+                        )
+                counter_expected = {
+                    "x_ready": 64,
+                    "gate_up_ready": 2,
+                    "hidden_ready": 1,
+                    "y_ready": 32,
+                }
+                for name, expected in counter_expected.items():
+                    if not bool((state[name] == expected).all()):
+                        raise RuntimeError(
+                            f"{name} mismatch rows={rows} N={compute_clusters}"
+                        )
+                if not bool((route_ready == 1).all()):
+                    raise RuntimeError(
+                        f"route flags did not close rows={rows} N={compute_clusters}"
+                    )
+                probes = int(state["next_reduce_probe"].item())
+                if probes < 2 * total_tasks:
+                    raise RuntimeError(
+                        f"missing task-boundary probes rows={rows} "
+                        f"N={compute_clusters}: {probes}"
+                    )
+                witness = int(state["overlap_witness"].item())
+                required_witness = 0
+                if rows > 64:
+                    required_witness = 0b011
+                    if compute_clusters == 1:
+                        required_witness |= 0b100
+                if witness & required_witness != required_witness:
+                    raise RuntimeError(
+                        f"overlap witness rows={rows} N={compute_clusters}: "
+                        f"0x{witness:x} lacks 0x{required_witness:x}"
+                    )
+
+                print(
+                    "TERMINAL_FULL_EXACT"
+                    f"|rows={rows}|seed={seed}|compute_clusters={compute_clusters}"
+                    f"|resident_clusters={resident_clusters}"
+                    f"|invalid_routes={len(invalid_rows)}"
+                    "|push_order=reverse_m64|candidate_launches=1"
+                    f"|overlap_bits=0x{witness:x}|tasks={total_tasks}"
+                    f"|probes={probes}|tokens={global_tokens}|result=PASS",
+                    flush=True,
+                )
 
 
 def main() -> int:

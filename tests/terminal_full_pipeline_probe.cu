@@ -179,7 +179,7 @@ int resident_clusters() {
         cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmem));
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(
-        full::M0_FIXED_CLUSTERS * terminal::CLUSTER_CTAS, 1, 1);
+        (full::COMM_CLUSTERS + 1) * terminal::CLUSTER_CTAS, 1, 1);
     config.blockDim = dim3(kThreads, 1, 1);
     config.dynamicSmemBytes = kDynamicSmem;
     cudaLaunchAttribute attribute{};
@@ -192,7 +192,7 @@ int resident_clusters() {
     int clusters = 0;
     CUDACHECK(cudaOccupancyMaxActiveClusters(
         &clusters, full::kernel<gemm_problem>, &config));
-    TORCH_CHECK(clusters >= full::M0_FIXED_CLUSTERS,
+    TORCH_CHECK(clusters >= full::COMM_CLUSTERS + 1,
                 "full terminal kernel cannot co-reside fixed comm+compute");
     return clusters;
 }
@@ -310,10 +310,12 @@ void run_full(
         const at::Tensor &push_visits,
         const at::Tensor &epilogue_claim,
         const at::Tensor &reduce_visits, const at::Tensor &errors,
+        const at::Tensor &progress_timeouts,
         const at::Tensor &dispatch_tiles_done,
         const at::Tensor &compute_started,
         const at::Tensor &overlap_witness,
-        int64_t minibatch_rows, int64_t macrobatch_rows,
+        int64_t compute_clusters, int64_t minibatch_rows,
+        int64_t macrobatch_rows,
         int64_t overlap_delay_cycles, int64_t spin_limit, double limit) {
     c10::cuda::CUDAGuard guard(peer_x.device());
     const int rows = static_cast<int>(routed_x.size(0));
@@ -330,7 +332,24 @@ void run_full(
     TORCH_CHECK(overlap_delay_cycles >= 0
                     && overlap_delay_cycles <= UINT32_MAX,
                 "overlap delay must fit uint32");
-    resident_clusters();
+    const int max_resident_clusters = resident_clusters();
+    TORCH_CHECK(compute_clusters >= 1
+                    && compute_clusters
+                        <= max_resident_clusters - full::COMM_CLUSTERS,
+                "compute_clusters must fit measured resident capacity");
+    TORCH_CHECK(worker_ticket.is_cuda() && worker_ticket.is_contiguous()
+                    && worker_ticket.scalar_type() == at::kInt
+                    && worker_ticket.numel() == compute_clusters,
+                "worker_ticket must be int32 [compute_clusters]");
+    TORCH_CHECK(worker_failed.is_cuda() && worker_failed.is_contiguous()
+                    && worker_failed.scalar_type() == at::kInt
+                    && worker_failed.numel() == compute_clusters,
+                "worker_failed must be int32 [compute_clusters]");
+    TORCH_CHECK(progress_timeouts.is_cuda()
+                    && progress_timeouts.is_contiguous()
+                    && progress_timeouts.scalar_type() == at::kInt
+                    && progress_timeouts.numel() == 1,
+                "progress_timeouts must be CUDA int32 [1]");
 
     gemm_problem w13_problem{
         kittens::py::tensor_to_gl<a_gl>(
@@ -420,11 +439,12 @@ void run_full(
     MOK_STATE_PTR(push_visits, push_visits);
     MOK_STATE_PTR(reduce_visits, reduce_visits);
     MOK_STATE_PTR(errors, errors);
+    MOK_STATE_PTR(progress_timeouts, progress_timeouts);
     MOK_STATE_PTR(dispatch_tiles_done, dispatch_tiles_done);
     MOK_STATE_PTR(compute_started, compute_started);
     MOK_STATE_PTR(overlap_witness, overlap_witness);
 #undef MOK_STATE_PTR
-    g.compute_clusters = full::M0_COMPUTE_CLUSTERS;
+    g.compute_clusters = static_cast<int>(compute_clusters);
     g.minibatch_rows = static_cast<int>(minibatch_rows);
     g.macrobatch_rows = static_cast<int>(macrobatch_rows);
     g.overlap_delay_after_first_dispatch_cycles =
@@ -433,7 +453,8 @@ void run_full(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(peer_x.get_device());
     full::kernel<gemm_problem>
-        <<<full::M0_FIXED_CLUSTERS * terminal::CLUSTER_CTAS,
+        <<<(full::COMM_CLUSTERS + g.compute_clusters)
+               * terminal::CLUSTER_CTAS,
            kThreads, kDynamicSmem, stream>>>(g);
     CUDACHECK(cudaGetLastError());
 }
@@ -450,7 +471,7 @@ std::vector<int64_t> attributes() {
         static_cast<int64_t>(attributes.maxDynamicSharedSizeBytes),
         static_cast<int64_t>(kDynamicSmem),
         static_cast<int64_t>(clusters),
-        static_cast<int64_t>(full::M0_FIXED_CLUSTERS),
+        static_cast<int64_t>(clusters - full::COMM_CLUSTERS),
     };
 }
 

@@ -1,12 +1,12 @@
 #pragma once
 
 // Single-GPU peer-emulation milestone for the terminal SM90 FP8 forward.
-// The M0 probe launches one comm plus one compute cluster, both required to
-// be co-resident.  The interface accepts one comm plus N compute clusters so
-// a later occupancy-selected launch can widen the cursor consumer set without
-// changing task semantics.  This is a correctness scaffold, not the terminal
-// production occupancy choice.  There is no grid/rank barrier, split path, or
-// fallback in this kernel.
+// M1 launches one permanently resident communication cluster plus N compute
+// clusters, with 1 + N bounded by the measured active-cluster limit.  Every
+// compute CTA performs only one nonblocking ready-token probe at a task or
+// wait boundary; NOT_READY work remains unclaimed, while a winning CTA
+// reduces one token and then resumes compute claims.  There is no grid/rank
+// barrier, split path, or fallback in this kernel.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -27,12 +27,17 @@ namespace compute = fp8_block_terminal_compute;
 namespace route = fp8_block_terminal_route_flags;
 
 constexpr int COMM_CLUSTERS = 1;
-constexpr int M0_COMPUTE_CLUSTERS = 1;
-constexpr int M0_FIXED_CLUSTERS = COMM_CLUSTERS + M0_COMPUTE_CLUSTERS;
 constexpr int COMM_CLUSTER = 0;
-constexpr int COMPUTE_CLUSTER = 1;
 constexpr int MAX_EXPERTS = 16;
 constexpr unsigned int STOP_TICKET = ~0u;
+constexpr unsigned int DONE_TICKET = STOP_TICKET - 1u;
+constexpr unsigned int FAILED_TICKET = STOP_TICKET - 2u;
+constexpr unsigned int WAIT_SIGNAL = STOP_TICKET - 3u;
+constexpr unsigned int READY_EXPERT_BASE = 0u;
+
+constexpr unsigned int OVERLAP_COMPUTE_DISPATCH = 1u << 0;
+constexpr unsigned int OVERLAP_REDUCE_COMM = 1u << 1;
+constexpr unsigned int OVERLAP_REDUCE_THEN_COMPUTE = 1u << 2;
 
 #if defined(KITTENS_SM90)
 
@@ -91,6 +96,7 @@ struct globals {
     unsigned int *push_visits;
     unsigned int *reduce_visits;
     unsigned int *errors;
+    unsigned int *progress_timeouts;
     unsigned int *dispatch_tiles_done;
     unsigned int *compute_started;
     unsigned int *overlap_witness;
@@ -182,7 +188,7 @@ __device__ void communication_role(
                     g.dispatch_tiles_done, dispatched_tiles);
             everyone::tma::cluster::sync();
 
-            // Test-only finite delay makes the M0 overlap witness
+            // Test-only finite delay makes the dispatch/compute overlap
             // deterministic.  It never observes compute state; the
             // production-default value is zero.
             if (dispatched_tiles == 1 && m_tiles > 1
@@ -216,6 +222,7 @@ __device__ void communication_role(
         __syncthreads();
         if (!wait_ok && threadIdx.x == 0) {
             atomicExch(g.comm_failed, 1u);
+            atomicAdd(g.progress_timeouts, 1u);
             atomicAdd(g.errors, 1u);
         }
         everyone::tma::cluster::sync();
@@ -244,10 +251,34 @@ __device__ void communication_role(
 
     if (cta_rank == 0 && threadIdx.x == 0)
         compute::store_release_gpu(g.comm_closed, 1u);
+    everyone::tma::cluster::sync();
+
+    // The fixed communication cluster never changes roles or leaves early.
+    // Once every producer push is closed it remains resident until the
+    // opportunistic compute CTAs have reduced every token.  This wait cannot
+    // exclude a producer: all dispatch and push work is already complete.
+    const unsigned int total_tokens = static_cast<unsigned int>(
+        g.ep_size * g.num_local_tokens);
+    if (threadIdx.x == 0) {
+        wait_ok = bounded_wait_gpu(
+            g.reduce_done, total_tokens, g.spin_limit) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!wait_ok && threadIdx.x == 0) {
+        atomicExch(g.comm_failed, 1u);
+        atomicAdd(g.progress_timeouts, 1u);
+        atomicAdd(g.errors, 1u);
+    }
+    everyone::tma::cluster::sync();
 }
 
+// One CTA probes exactly one round-robin token and returns immediately for
+// NOT_READY, ALREADY_CLAIMED, or an invalid/empty domain.  Only a CTA that won
+// the ready-token CAS enters the column-parallel reduction.  This bounded
+// primitive is safe to call between producer tasks: it never waits for a
+// route whose compute/push producer is still outstanding.
 template <typename GemmProblem>
-__device__ void reduce_ready_tokens(
+__device__ route::claim_result try_reduce_one_ready_token(
         const globals<GemmProblem> &g) {
     __shared__ int selected_peer;
     __shared__ int selected_token;
@@ -255,67 +286,56 @@ __device__ void reduce_ready_tokens(
     const int tokens_per_peer = g.num_local_tokens;
     const int total_tokens = g.ep_size * tokens_per_peer;
 
-    for (unsigned long long iteration = 0;
-         iteration < g.spin_limit; ++iteration) {
-        if (threadIdx.x == 0) {
-            const unsigned int probe = atomicAdd(g.next_reduce_probe, 1u);
-            const int global_token = total_tokens == 0
-                ? -1
-                : static_cast<int>(probe % total_tokens);
-            selected_peer = global_token < 0
-                ? -1
-                : global_token / tokens_per_peer;
-            selected_token = global_token < 0
-                ? -1
-                : global_token % tokens_per_peer;
-            selected_result = global_token < 0
-                ? static_cast<int>(route::claim_result::invalid_token)
-                : static_cast<int>(route::try_claim_ready_token(
-                    g.route_ready_peer[selected_peer],
-                    g.epilogue_claim + selected_peer * tokens_per_peer,
-                    selected_token, tokens_per_peer));
-        }
-        __syncthreads();
-
-        if (selected_result
-                == static_cast<int>(route::claim_result::claimed)) {
-            const size_t route_stride =
-                static_cast<size_t>(tokens_per_peer) * terminal::TOP_K;
-            const size_t output_stride =
-                static_cast<size_t>(tokens_per_peer) * g.hidden_size;
-            const auto *combine = reinterpret_cast<const __nv_bfloat16 *>(
-                g.combine_peer[selected_peer]);
-            route::reduce_claimed_token(
-                combine, g.weights + selected_peer * route_stride,
-                g.topk_ids + selected_peer * route_stride,
-                g.output + selected_peer * output_stride,
-                selected_token, g.hidden_size,
-                threadIdx.x, blockDim.x);
-            route::release_fence_system();
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0
-                && selected_result
-                    == static_cast<int>(route::claim_result::claimed)) {
-            const int global_token =
-                selected_peer * tokens_per_peer + selected_token;
-            atomicAdd(g.reduce_visits + global_token, 1u);
-            atomicAdd(g.reduce_done, 1u);
-        }
-        __syncthreads();
-
-        if (compute::load_acquire_gpu(g.reduce_done)
-                    >= static_cast<unsigned int>(total_tokens)
-                && compute::load_acquire_gpu(g.comm_closed) >= 1u)
-            return;
-        if (selected_result
-                != static_cast<int>(route::claim_result::claimed))
-            __nanosleep(64);
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int probe = atomicAdd(g.next_reduce_probe, 1u);
+        const int global_token = total_tokens == 0
+            ? -1
+            : static_cast<int>(probe % total_tokens);
+        selected_peer = global_token < 0
+            ? -1
+            : global_token / tokens_per_peer;
+        selected_token = global_token < 0
+            ? -1
+            : global_token % tokens_per_peer;
+        selected_result = global_token < 0
+            ? static_cast<int>(route::claim_result::invalid_token)
+            : static_cast<int>(route::try_claim_ready_token(
+                g.route_ready_peer[selected_peer],
+                g.epilogue_claim + selected_peer * tokens_per_peer,
+                selected_token, tokens_per_peer));
     }
-    if (threadIdx.x == 0)
-        atomicAdd(g.errors, 1u);
+    __syncthreads();
+
+    if (selected_result
+            == static_cast<int>(route::claim_result::claimed)) {
+        const size_t route_stride =
+            static_cast<size_t>(tokens_per_peer) * terminal::TOP_K;
+        const size_t output_stride =
+            static_cast<size_t>(tokens_per_peer) * g.hidden_size;
+        const auto *combine = reinterpret_cast<const __nv_bfloat16 *>(
+            g.combine_peer[selected_peer]);
+        route::reduce_claimed_token(
+            combine, g.weights + selected_peer * route_stride,
+            g.topk_ids + selected_peer * route_stride,
+            g.output + selected_peer * output_stride,
+            selected_token, g.hidden_size,
+            threadIdx.x, blockDim.x);
+        route::release_fence_system();
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0
+            && selected_result
+                == static_cast<int>(route::claim_result::claimed)) {
+        const int global_token =
+            selected_peer * tokens_per_peer + selected_token;
+        atomicAdd(g.reduce_visits + global_token, 1u);
+        atomicAdd(g.reduce_done, 1u);
+        if (compute::load_acquire_gpu(g.comm_closed) == 0u)
+            atomicOr(g.overlap_witness, OVERLAP_REDUCE_COMM);
+    }
+    __syncthreads();
+    return static_cast<route::claim_result>(selected_result);
 }
 
 template <typename GemmProblem>
@@ -329,20 +349,26 @@ __device__ void compute_and_reduce_role(
         semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
     uint32_t phasebits = 0xFFFF0000u;
     uint32_t ready_phase = 0u;
-    __shared__ int current_expert;
+    bool reduced_by_this_cta = false;
+    unsigned long long idle_windows = 0;
+    unsigned int last_reduce_done = 0u;
+    unsigned int last_comm_closed = 0u;
+    const terminal::logical_shape shape = terminal::make_logical_shape(
+        g.num_tokens[0], g.schedule_capacity,
+        g.minibatch_rows, g.macrobatch_rows);
+    if (!shape.valid) {
+        if (cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(g.errors, 1u);
+        return;
+    }
+    const unsigned int total_tasks =
+        static_cast<unsigned int>(shape.total_tasks);
+    const unsigned int total_tokens = static_cast<unsigned int>(
+        g.ep_size * g.num_local_tokens);
 
     while (true) {
         if (cta_rank == 0 && threadIdx.x == 0) {
-            const terminal::logical_shape shape =
-                terminal::make_logical_shape(
-                    g.num_tokens[0], g.schedule_capacity,
-                    g.minibatch_rows, g.macrobatch_rows);
-            const unsigned int ticket = shape.valid
-                ? claim_bounded(
-                    g.cursor, static_cast<unsigned int>(shape.total_tasks))
-                : STOP_TICKET;
-            if (!shape.valid)
-                atomicAdd(g.errors, 1u);
+            const unsigned int ticket = claim_bounded(g.cursor, total_tasks);
             asm volatile("{st.release.cluster.global.u32 [%0], %1;}" ::
                          "l"(g.worker_ticket + worker_cluster), "r"(ticket)
                          : "memory");
@@ -352,12 +378,60 @@ __device__ void compute_and_reduce_role(
         asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
                      : "=r"(ticket)
                      : "l"(g.worker_ticket + worker_cluster) : "memory");
-        if (ticket == STOP_TICKET)
-            break;
+        if (ticket == STOP_TICKET) {
+            // Cursor exhaustion is not worker termination: outstanding
+            // compute/comm producers may make another token ready.  Each CTA
+            // performs one bounded probe, then the cluster leader decides
+            // whether global progress closed or another poll window is due.
+            const route::claim_result result =
+                try_reduce_one_ready_token(g);
+            if (result == route::claim_result::claimed)
+                reduced_by_this_cta = true;
+            everyone::tma::cluster::sync();
 
-        const terminal::logical_shape shape = terminal::make_logical_shape(
-            g.num_tokens[0], g.schedule_capacity,
-            g.minibatch_rows, g.macrobatch_rows);
+            if (cta_rank == 0 && threadIdx.x == 0) {
+                const unsigned int reduced =
+                    compute::load_acquire_gpu(g.reduce_done);
+                const unsigned int closed =
+                    compute::load_acquire_gpu(g.comm_closed);
+                unsigned int decision = STOP_TICKET;
+                if (reduced >= total_tokens && closed >= 1u) {
+                    decision = DONE_TICKET;
+                } else {
+                    if (reduced != last_reduce_done
+                            || closed != last_comm_closed) {
+                        idle_windows = 0;
+                        last_reduce_done = reduced;
+                        last_comm_closed = closed;
+                    } else {
+                        ++idle_windows;
+                    }
+                    if (idle_windows >= g.spin_limit) {
+                        atomicExch(
+                            g.worker_failed + worker_cluster, 1u);
+                        atomicAdd(g.progress_timeouts, 1u);
+                        atomicAdd(g.errors, 1u);
+                        decision = FAILED_TICKET;
+                    }
+                }
+                asm volatile(
+                    "{st.release.cluster.global.u32 [%0], %1;}" ::
+                    "l"(g.worker_ticket + worker_cluster), "r"(decision)
+                    : "memory");
+            }
+            everyone::tma::cluster::sync();
+            unsigned int decision;
+            asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                         : "=r"(decision)
+                         : "l"(g.worker_ticket + worker_cluster) : "memory");
+            if (decision == DONE_TICKET || decision == FAILED_TICKET)
+                return;
+            if (threadIdx.x == 0)
+                __nanosleep(64);
+            __syncthreads();
+            continue;
+        }
+
         const terminal::logical_coordinate coordinate =
             terminal::decode_logical_cursor(shape, ticket);
         if (!coordinate.valid) {
@@ -369,31 +443,90 @@ __device__ void compute_and_reduce_role(
         if (cta_rank == 0 && threadIdx.x == 0)
             atomicAdd(g.task_visits + ticket, 1u);
 
+        int current_expert = -1;
         if (coordinate.stage != terminal::logical_stage::activation) {
-            if (threadIdx.x == 0) {
-                const bool ready = bounded_wait_gpu(
-                    g.x_ready + coordinate.global_m,
-                    terminal::M_TILE, g.spin_limit);
-                current_expert = ready
-                    ? g.m_indices[coordinate.global_m * terminal::M_TILE]
-                    : -1;
-                if (!ready) {
-                    atomicExch(g.worker_failed + worker_cluster, 1u);
-                    atomicAdd(g.errors, 1u);
+            unsigned long long wait_windows = 0;
+            while (true) {
+                if (cta_rank == 0 && threadIdx.x == 0) {
+                    unsigned int signal = WAIT_SIGNAL;
+                    if (compute::load_acquire_gpu(
+                            g.x_ready + coordinate.global_m)
+                            >= terminal::M_TILE) {
+                        const int expert = g.m_indices[
+                            coordinate.global_m * terminal::M_TILE];
+                        if (expert >= 0 && expert < g.num_local_experts)
+                            signal = READY_EXPERT_BASE
+                                + static_cast<unsigned int>(expert);
+                        else
+                            signal = FAILED_TICKET;
+                    }
+                    asm volatile(
+                        "{st.release.cluster.global.u32 [%0], %1;}" ::
+                        "l"(g.worker_ticket + worker_cluster), "r"(signal)
+                        : "memory");
                 }
-                // dispatch_copy_row uses generic stores while run_w13_task's
-                // rank-0 TMA consumes through the async proxy.
-                if (ready && cta_rank == 0
-                        && (coordinate.stage == terminal::logical_stage::gate
-                            || coordinate.stage
-                                == terminal::logical_stage::up))
-                    asm volatile("{fence.proxy.async.global;}" ::: "memory");
+                everyone::tma::cluster::sync();
+                unsigned int signal;
+                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                             : "=r"(signal)
+                             : "l"(g.worker_ticket + worker_cluster)
+                             : "memory");
+                if (signal != WAIT_SIGNAL) {
+                    if (signal == FAILED_TICKET) {
+                        if (cta_rank == 0 && threadIdx.x == 0) {
+                            atomicExch(
+                                g.worker_failed + worker_cluster, 1u);
+                            atomicAdd(g.errors, 1u);
+                        }
+                        return;
+                    }
+                    current_expert = static_cast<int>(
+                        signal - READY_EXPERT_BASE);
+                    break;
+                }
+
+                // A waiting task keeps ownership, but its CTA may help one
+                // already-ready epilogue token.  NOT_READY returns directly;
+                // no producer dependency is waited on by the reducer.
+                const route::claim_result result =
+                    try_reduce_one_ready_token(g);
+                if (result == route::claim_result::claimed)
+                    reduced_by_this_cta = true;
+                everyone::tma::cluster::sync();
+                if (cta_rank == 0 && threadIdx.x == 0) {
+                    ++wait_windows;
+                    unsigned int decision = WAIT_SIGNAL;
+                    if (wait_windows >= g.spin_limit) {
+                        atomicExch(
+                            g.worker_failed + worker_cluster, 1u);
+                        atomicAdd(g.progress_timeouts, 1u);
+                        atomicAdd(g.errors, 1u);
+                        decision = FAILED_TICKET;
+                    }
+                    asm volatile(
+                        "{st.release.cluster.global.u32 [%0], %1;}" ::
+                        "l"(g.worker_ticket + worker_cluster), "r"(decision)
+                        : "memory");
+                }
+                everyone::tma::cluster::sync();
+                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
+                             : "=r"(signal)
+                             : "l"(g.worker_ticket + worker_cluster)
+                             : "memory");
+                if (signal == FAILED_TICKET)
+                    return;
+                if (threadIdx.x == 0)
+                    __nanosleep(64);
+                __syncthreads();
             }
-            __syncthreads();
+
+            // dispatch_copy_row uses generic stores while run_w13_task's
+            // rank-0 TMA consumes through the async proxy.
+            if (cta_rank == 0 && threadIdx.x == 0
+                    && (coordinate.stage == terminal::logical_stage::gate
+                        || coordinate.stage == terminal::logical_stage::up))
+                asm volatile("{fence.proxy.async.global;}" ::: "memory");
             everyone::tma::cluster::sync();
-            if (compute::load_acquire_gpu(
-                    g.worker_failed + worker_cluster) != 0u)
-                return;
         }
 
         if (ticket == 0u && coordinate.stage == terminal::logical_stage::gate
@@ -404,8 +537,11 @@ __device__ void compute_and_reduce_role(
             if (dispatched
                     < static_cast<unsigned int>(
                         g.num_tokens[0] / terminal::M_TILE))
-                compute::store_release_gpu(g.overlap_witness, 1u);
+                atomicOr(g.overlap_witness, OVERLAP_COMPUTE_DISPATCH);
         }
+
+        if (reduced_by_this_cta && threadIdx.x == 0)
+            atomicOr(g.overlap_witness, OVERLAP_REDUCE_THEN_COMPUTE);
 
         if (coordinate.stage == terminal::logical_stage::gate
                 || coordinate.stage == terminal::logical_stage::up) {
@@ -423,9 +559,14 @@ __device__ void compute_and_reduce_role(
                 phasebits, ready_phase, a_smem, b_smem, d_smem,
                 inputs_arrived, inputs_finished, inputs_ready);
         }
+
+        // One opportunistic probe at every completed logical task boundary.
+        // A winner completes one token; all other outcomes immediately return
+        // to the cursor without turning reduction into a producer wait.
+        const route::claim_result result = try_reduce_one_ready_token(g);
+        if (result == route::claim_result::claimed)
+            reduced_by_this_cta = true;
     }
-    everyone::tma::cluster::sync();
-    reduce_ready_tokens(g);
 }
 
 template <typename GemmProblem>
