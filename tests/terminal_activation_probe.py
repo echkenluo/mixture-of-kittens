@@ -26,7 +26,10 @@ def build_extension():
     return load(
         name="mok_terminal_activation_probe",
         sources=[str(Path(__file__).with_suffix(".cu"))],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        # Production SGLang and MoK both compile this path with fast math.
+        # It changes the FP32 scale division by one ULP for most groups, so
+        # omitting it would create a false numeric mismatch in this probe.
+        extra_cuda_cflags=["-O3", "-lineinfo", "--use_fast_math"],
         verbose=False,
     )
 
