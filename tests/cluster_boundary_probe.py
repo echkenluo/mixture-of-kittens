@@ -13,7 +13,7 @@ from torch.utils.cpp_extension import load
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--clusters", default="1,8,32,64")
+    parser.add_argument("--clusters", default="1,8,32,64,117")
     parser.add_argument("--tasks", default="1,8,64,256")
     parser.add_argument("--work", default="0,64")
     parser.add_argument("--warmup", type=int, default=20)
@@ -68,7 +68,7 @@ def main() -> int:
                     raise RuntimeError(
                         f"output mismatch clusters={clusters} tasks={tasks} work={work}"
                     )
-                double_ms = elapsed_ms(
+                double_a_ms = elapsed_ms(
                     module, descriptor, output, tasks, work, False,
                     args.warmup, args.repeats,
                 )
@@ -76,11 +76,21 @@ def main() -> int:
                     module, descriptor, output, tasks, work, True,
                     args.warmup, args.repeats,
                 )
+                double_a2_ms = elapsed_ms(
+                    module, descriptor, output, tasks, work, False,
+                    args.warmup, args.repeats,
+                )
+                double_ms = (double_a_ms + double_a2_ms) / 2.0
                 row = {
                     "clusters": clusters,
                     "tasks": tasks,
                     "work_iterations": work,
+                    "double_a_ms": double_a_ms,
                     "double_ms": double_ms,
+                    "double_a2_ms": double_a2_ms,
+                    "aa_drift_pct": (
+                        (double_a2_ms / double_a_ms - 1.0) * 100.0
+                    ),
                     "single_ms": single_ms,
                     "delta_pct": (single_ms / double_ms - 1.0) * 100.0,
                 }
