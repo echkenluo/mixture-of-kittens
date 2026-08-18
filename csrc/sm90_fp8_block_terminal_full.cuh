@@ -441,7 +441,9 @@ __device__ __forceinline__ void run_producer_task_body(
 // cursor and the publication slot remain cluster scoped, but only thread 0 in
 // each CTA loads/decodes them.  A CTA barrier then makes the immutable receipt
 // available to the 127 numerical followers without repeating global loads or
-// the logical decoder in every thread.
+// the logical decoder in every thread.  A final cluster barrier acknowledges
+// that both CTA-local receipts are complete before rank 0 may reuse the same
+// global publication slot for readiness or the next ticket.
 struct producer_control {
     unsigned int ticket;
     unsigned int signal;
@@ -462,6 +464,9 @@ __device__ __forceinline__ void load_cluster_slot_for_cta(
         shared_value = value;
     }
     __syncthreads();
+    // Consumption acknowledgement: a faster CTA must not return and let rank
+    // 0 overwrite ticket_slot before the delayed CTA leader has loaded it.
+    everyone::tma::cluster::sync();
 }
 
 __device__ __forceinline__ void load_decode_producer_control(
@@ -480,6 +485,9 @@ __device__ __forceinline__ void load_decode_producer_control(
             control.coordinate = terminal::decode_logical_cursor(shape, ticket);
     }
     __syncthreads();
+    // The decoder result is CTA-local, but slot reuse is cluster-wide.  Wait
+    // for both CTA leaders and followers to consume this epoch before return.
+    everyone::tma::cluster::sync();
 }
 
 __device__ __forceinline__ unsigned int producer_dependency_expected(
@@ -539,6 +547,9 @@ __device__ __forceinline__ void publish_producer_readiness(
                 signal - READY_EXPERT_BASE);
     }
     __syncthreads();
+    // Readiness shares ticket_slot with the claimed ticket and later wait/
+    // completion decisions.  Acknowledge both CTA receipts before reuse.
+    everyone::tma::cluster::sync();
 }
 
 template <typename GemmProblem>
@@ -703,6 +714,7 @@ __device__ void communication_role(
     // across the resident loop instead of one materialized copy per thread.
     __shared__ terminal::logical_shape shape;
     __shared__ producer_control producer;
+    __shared__ unsigned int comm_slot_receipt;
     // Only CTA-rank-0/thread-0 observes progress history.  Volatile shared
     // storage deliberately breaks these values' live ranges across the
     // owner-help WGMMA call; no other thread consumes them.
@@ -774,16 +786,16 @@ __device__ void communication_role(
                          "l"(ticket_slot), "r"(ticket) : "memory");
         }
         everyone::tma::cluster::sync();
-        unsigned int ticket;
-        asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                     : "=r"(ticket) : "l"(ticket_slot) : "memory");
+        load_cluster_slot_for_cta(ticket_slot, comm_slot_receipt);
+        const unsigned int ticket = comm_slot_receipt;
         if (ticket == STOP_TICKET)
             break;
 
         // The decoder is pure and warp-uniform.  One lane computes it, checks
         // the CTA extent, and broadcasts only two 32-bit scalars.  This removes
         // communication_coordinate from the transport and owner-help live
-        // ranges without adding a CTA or cluster barrier.
+        // ranges.  The preceding cluster consumption ack is required because
+        // owner-help and wait decisions reuse this same publication slot.
         int first_row = -1;
         unsigned int comm_control = 0u;
         if (lane == 0) {
@@ -921,10 +933,8 @@ __device__ void communication_role(
                         : "memory");
                 }
                 everyone::tma::cluster::sync();
-                unsigned int decision;
-                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                             : "=r"(decision)
-                             : "l"(ticket_slot) : "memory");
+                load_cluster_slot_for_cta(ticket_slot, comm_slot_receipt);
+                unsigned int decision = comm_slot_receipt;
                 if (decision == DONE_TICKET)
                     break;
 
@@ -967,9 +977,8 @@ __device__ void communication_role(
                         "l"(ticket_slot), "r"(next) : "memory");
                 }
                 everyone::tma::cluster::sync();
-                asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                             : "=r"(decision)
-                             : "l"(ticket_slot) : "memory");
+                load_cluster_slot_for_cta(ticket_slot, comm_slot_receipt);
+                decision = comm_slot_receipt;
                 if (decision == DONE_TICKET)
                     break;
                 if (threadIdx.x == 0)
@@ -1105,9 +1114,8 @@ __device__ void communication_role(
                              "l"(ticket_slot), "r"(decision) : "memory");
             }
             everyone::tma::cluster::sync();
-            unsigned int decision;
-            asm volatile("{ld.acquire.cluster.global.u32 %0, [%1];}"
-                         : "=r"(decision) : "l"(ticket_slot) : "memory");
+            load_cluster_slot_for_cta(ticket_slot, comm_slot_receipt);
+            const unsigned int decision = comm_slot_receipt;
             if (decision == DONE_TICKET)
                 return;
             if (threadIdx.x == 0)

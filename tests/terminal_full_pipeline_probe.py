@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import os
 import re
@@ -18,6 +19,59 @@ HEADER = ROOT / "csrc" / "sm90_fp8_block_terminal_full.cuh"
 COMPUTE_HEADER = ROOT / "csrc" / "sm90_fp8_block_terminal_compute.cuh"
 PRIMITIVE_HEADER = ROOT / "csrc" / "sm90_fp8_block_pipeline_primitives.cuh"
 DECODER_HEADER = ROOT / "csrc" / "sm90_fp8_block_megakernel.cuh"
+
+
+def check_delayed_cta_slot_reuse_model() -> None:
+    """Enumerate the legal two-CTA schedules around one reused slot epoch."""
+
+    events = ("load0", "load1", "overwrite")
+
+    def replay(order: tuple[str, ...]) -> tuple[str | None, str | None]:
+        slot = "published"
+        receipt: list[str | None] = [None, None]
+        for event in order:
+            if event == "load0":
+                receipt[0] = slot
+            elif event == "load1":
+                receipt[1] = slot
+            else:
+                slot = "next_epoch"
+        return receipt[0], receipt[1]
+
+    # Before the consumption acknowledgement, CTA0 could leave its local
+    # barrier and overwrite after load0 while a delayed CTA1 had not loaded.
+    legacy_legal = [
+        order for order in itertools.permutations(events)
+        if order.index("load0") < order.index("overwrite")
+    ]
+    legacy_bad = [
+        order for order in legacy_legal
+        if replay(order) != ("published", "published")
+    ]
+    expected_counterexample = ("load0", "overwrite", "load1")
+    if expected_counterexample not in legacy_bad:
+        raise RuntimeError("slot model failed to reproduce delayed-CTA race")
+
+    # The final cluster barrier enables the next write only after both CTA
+    # leaders loaded and published their receipts to CTA-local shared memory.
+    ack_legal = [
+        order for order in itertools.permutations(events)
+        if order.index("load0") < order.index("overwrite")
+        and order.index("load1") < order.index("overwrite")
+    ]
+    if not ack_legal or any(
+        replay(order) != ("published", "published") for order in ack_legal
+    ):
+        raise RuntimeError("cluster consumption ack permits premature slot reuse")
+
+    print(
+        "TERMINAL_CONTROL_SLOT_MODEL"
+        "|legacy_counterexample=load0-overwrite-load1"
+        f"|ack_legal_orders={len(ack_legal)}"
+        "|delayed_cta1=PASS|epochs=producer_and_comm_reuse"
+        "|result=PASS",
+        flush=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,6 +301,7 @@ def check_source_contract() -> None:
         "terminal::logical_stage::w2",
         "g.ready.hidden_ready + hidden",
         "g.x_ready + coordinate.global_m",
+        "Consumption acknowledgement",
     )
     missing_control = [item for item in control_required if item not in control]
     if missing_control:
@@ -264,16 +319,38 @@ def check_source_contract() -> None:
             "control.coordinate = terminal::decode_logical_cursor(shape, ticket)"
         )
         < decode_control.find("__syncthreads()")
+        < decode_control.find(
+            "everyone::tma::cluster::sync()",
+            decode_control.find("__syncthreads()"),
+        )
     ):
-        raise RuntimeError("producer ticket decode is not CTA-leader published")
+        raise RuntimeError(
+            "producer ticket decode lacks CTA publish or cluster consumption ack"
+        )
+    slot_loader = control[
+        control.find("load_cluster_slot_for_cta(") :
+        control.find("load_decode_producer_control(")
+    ]
+    if not (
+        slot_loader.find("ld.acquire.cluster.global.u32")
+        < slot_loader.find("__syncthreads()")
+        < slot_loader.find("everyone::tma::cluster::sync()")
+    ):
+        raise RuntimeError("decision load lacks cluster consumption ack")
     readiness_control = control[control.find("publish_producer_readiness(") :]
+    readiness_cta_publish = readiness_control.find("__syncthreads()")
     if not (
         readiness_control.find("st.release.cluster.global.u32")
         < readiness_control.find("everyone::tma::cluster::sync()")
         < readiness_control.find("ld.acquire.cluster.global.u32")
-        < readiness_control.find("__syncthreads()")
+        < readiness_cta_publish
+        < readiness_control.find(
+            "everyone::tma::cluster::sync()", readiness_cta_publish
+        )
     ):
-        raise RuntimeError("producer readiness lost cluster/CTA publication order")
+        raise RuntimeError(
+            "producer readiness lost publication/consumption-ack order"
+        )
     owner_body = header[
         header.find("__device__ unsigned int owner_help_one_producer") :
         header.find("__device__ void communication_role")
@@ -281,6 +358,8 @@ def check_source_contract() -> None:
     if "load_decode_producer_control(" not in owner_body \
             or "publish_producer_readiness(" not in owner_body:
         raise RuntimeError("owner-help bypasses compact producer control")
+    if "ld.acquire.cluster.global.u32" in owner_body:
+        raise RuntimeError("owner-help bypasses acknowledged slot receipts")
     if "terminal::decode_logical_cursor(shape, ticket)" in owner_body \
             or "g.x_ready + coordinate.global_m" in owner_body:
         raise RuntimeError(
@@ -293,6 +372,7 @@ def check_source_contract() -> None:
     native_comm_required = (
         "static_cast<unsigned int>(shape.num_tokens / 4)",
         "__shared__ terminal::logical_shape shape",
+        "__shared__ unsigned int comm_slot_receipt",
         "__shfl_sync(0xffffffffu, comm_control, 0)",
         "decode_communication_cursor(shape, ticket)",
         "communication_stage::dispatch",
@@ -313,6 +393,12 @@ def check_source_contract() -> None:
         or "combine_ticket(" in communication
     ):
         raise RuntimeError("dispatch candidate must retain generic combine payload")
+    if communication.count(
+        "load_cluster_slot_for_cta(ticket_slot, comm_slot_receipt)"
+    ) != 4 or "ld.acquire.cluster.global.u32" in communication:
+        raise RuntimeError(
+            "communication slot reuse bypasses CTA receipt/cluster ack"
+        )
     old_phase_boundary = (
         "claim_bounded(\n                    g.dispatch_tile_cursor, "
         "static_cast<unsigned int>(m_tiles))"
@@ -348,6 +434,13 @@ def check_source_contract() -> None:
     if "load_decode_producer_control(" not in compute \
             or "publish_producer_readiness(" not in compute:
         raise RuntimeError("compute worker bypasses compact producer control")
+    if (
+        compute.count("load_decode_producer_control(") != 1
+        or compute.count("publish_producer_readiness(") != 1
+        or compute.count("load_cluster_slot_for_cta(") != 2
+        or "ld.acquire.cluster.global.u32" in compute
+    ):
+        raise RuntimeError("compute worker bypasses acknowledged slot receipts")
     if "terminal::decode_logical_cursor(shape, ticket)" in compute \
             or "g.x_ready + coordinate.global_m" in compute:
         raise RuntimeError(
@@ -395,6 +488,7 @@ def check_source_contract() -> None:
     missing_scan = [item for item in scan_required if item not in driver]
     if missing_scan:
         raise RuntimeError(f"M1 N-scan/progress contract missing: {missing_scan}")
+    check_delayed_cta_slot_reuse_model()
     print(
         "TERMINAL_FULL_SOURCE"
         "|milestone=M1|comm_clusters=dynamic|compute_clusters=dynamic"
@@ -404,7 +498,8 @@ def check_source_contract() -> None:
         "|dispatch_payload=raw_bulk_tma|combine_payload=generic"
         "|cluster_dim=2|candidate_launches=1|grid_barrier=0"
         "|logical_ticket=M64xN256|n128_subtasks=2|tasks_per_m64=33"
-        "|control_broadcast=cta_shared|w2_dependency=hidden_ready"
+        "|control_broadcast=cta_shared|slot_reuse_ack=cluster"
+        "|w2_dependency=hidden_ready"
         "|legacy_arithmetic=1|split_fallback=0"
         "|core_arithmetic_copy=0|result=PASS",
         flush=True,
