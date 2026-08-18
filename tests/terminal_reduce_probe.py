@@ -14,10 +14,10 @@ from torch.utils.cpp_extension import load
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", default="2,64,256")
+    parser.add_argument("--tokens", default="2,64,4096")
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=6)
-    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
     return parser.parse_args()
@@ -57,8 +57,10 @@ def main() -> int:
     attributes = [int(value) for value in module.attributes()]
     print(
         "TERMINAL_REDUCE_ATTR"
-        f"|regs={attributes[0]}|smem={attributes[1]}"
-        f"|local={attributes[2]}|occupancy_clusters={attributes[3]}",
+        f"|ref_regs={attributes[0]}|ref_smem={attributes[1]}"
+        f"|ref_local={attributes[2]}|cluster_regs={attributes[3]}"
+        f"|cluster_smem={attributes[4]}|cluster_local={attributes[5]}"
+        f"|occupancy_clusters={attributes[6]}",
         flush=True,
     )
     results = []
@@ -87,9 +89,13 @@ def main() -> int:
             reference = torch.empty(
                 (tokens, args.hidden), dtype=torch.bfloat16, device="cuda"
             )
+            production_reference = torch.empty_like(reference)
             candidate = torch.empty_like(reference)
-            routed_epilogue_out(combine, weights, reference)
-            module.run(combine, weights, candidate)
+            module.run(combine, weights, reference, False)
+            module.run(combine, weights, candidate, True)
+            compare_production = tokens >= 256 and tokens % 256 == 0
+            if compare_production:
+                routed_epilogue_out(combine, weights, production_reference)
             torch.cuda.synchronize()
             exact = torch.equal(
                 reference.view(torch.uint16), candidate.view(torch.uint16)
@@ -108,7 +114,8 @@ def main() -> int:
             print(
                 f"TERMINAL_REDUCE_NUMERIC|tokens={tokens}|seed={seed}"
                 f"|exact={int(exact)}|mismatch={mismatch}"
-                f"|relative_l2={relative_l2:.9g}",
+                f"|relative_l2={relative_l2:.9g}"
+                f"|production_reference={int(compare_production)}",
                 flush=True,
             )
             if not exact:
@@ -116,13 +123,34 @@ def main() -> int:
                     f"reduce mismatch tokens={tokens} seed={seed} "
                     f"count={mismatch} relative_l2={relative_l2}"
                 )
+            if compare_production and not torch.equal(
+                production_reference.view(torch.uint16),
+                candidate.view(torch.uint16),
+            ):
+                production_mismatch = int(
+                    (
+                        production_reference.view(torch.uint16)
+                        != candidate.view(torch.uint16)
+                    )
+                    .sum()
+                    .item()
+                )
+                raise RuntimeError(
+                    f"production reduce mismatch tokens={tokens} seed={seed} "
+                    f"count={production_mismatch}"
+                )
+        reference_call = (
+            (lambda: routed_epilogue_out(combine, weights, production_reference))
+            if compare_production
+            else (lambda: module.run(combine, weights, reference, False))
+        )
         reference_p50, reference_p95 = elapsed(
-            lambda: routed_epilogue_out(combine, weights, reference),
+            reference_call,
             args.warmup,
             args.repeats,
         )
         candidate_p50, candidate_p95 = elapsed(
-            lambda: module.run(combine, weights, candidate),
+            lambda: module.run(combine, weights, candidate, True),
             args.warmup,
             args.repeats,
         )

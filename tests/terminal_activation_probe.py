@@ -14,10 +14,11 @@ from torch.utils.cpp_extension import load
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", default="64,128,384")
-    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--rows", default="64,4096,24576")
+    parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
+    parser.add_argument("--require-sglang-reference", action="store_true")
     return parser.parse_args()
 
 
@@ -50,6 +51,13 @@ def main() -> int:
     args = parse_args()
     torch.cuda.set_device(0)
     module = build_extension()
+    sglang_reference = None
+    if args.require_sglang_reference:
+        from sglang.jit_kernel.dsv4 import (
+            silu_and_mul_contig_post_quant_dynamic,
+        )
+
+        sglang_reference = silu_and_mul_contig_post_quant_dynamic
     attributes = [int(value) for value in module.attributes()]
     print(
         "TERMINAL_ACTIVATION_ATTR"
@@ -89,6 +97,23 @@ def main() -> int:
             candidate_scale = torch.empty_like(ref_scale)
             module.run(input_, ref, ref_scale, False, 10.0)
             module.run(input_, candidate, candidate_scale, True, 10.0)
+            if sglang_reference is not None:
+                sglang_output = torch.empty_like(ref)
+                sglang_scale = torch.empty_like(ref_scale)
+                active_tokens = torch.tensor(
+                    [rows], dtype=torch.int32, device="cuda"
+                )
+                sglang_reference(
+                    input=input_,
+                    output=sglang_output,
+                    output_scale=sglang_scale,
+                    active_tokens=active_tokens,
+                    quant_group_size=128,
+                    scale_ue8m0=False,
+                    transposed=False,
+                    swiglu_limit=10.0,
+                    swizzle=False,
+                )
             torch.cuda.synchronize()
             fp8_exact = torch.equal(ref.view(torch.uint8), candidate.view(torch.uint8))
             scale_exact = torch.equal(ref_scale.view(torch.int32), candidate_scale.view(torch.int32))
@@ -103,9 +128,24 @@ def main() -> int:
                     f"activation mismatch rows={rows} seed={seed} "
                     f"fp8={fp8_mismatch} scale={scale_mismatch}"
                 )
+            if sglang_reference is not None:
+                sglang_fp8_exact = torch.equal(
+                    sglang_output.view(torch.uint8), candidate.view(torch.uint8)
+                )
+                sglang_scale_exact = torch.equal(
+                    sglang_scale.view(torch.int32),
+                    candidate_scale.view(torch.int32),
+                )
+                if not sglang_fp8_exact or not sglang_scale_exact:
+                    raise RuntimeError(
+                        f"SGLang activation mismatch rows={rows} seed={seed} "
+                        f"fp8_exact={sglang_fp8_exact} "
+                        f"scale_exact={sglang_scale_exact}"
+                    )
             print(
                 f"TERMINAL_ACTIVATION_EXACT|rows={rows}|seed={seed}"
-                "|fp8=1|scale=1",
+                "|fp8=1|scale=1"
+                f"|sglang={int(sglang_reference is not None)}",
                 flush=True,
             )
         reference_p50, reference_p95 = elapsed(

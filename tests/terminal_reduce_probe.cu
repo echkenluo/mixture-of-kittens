@@ -12,6 +12,36 @@ namespace {
 
 constexpr int kThreads = 128;
 
+__device__ __forceinline__ void reduce_element(
+    const __nv_bfloat16 *combine, const float *weights,
+    __nv_bfloat16 *output, int token, int column, int topk, int hidden) {
+    const size_t route_base = static_cast<size_t>(token) * topk;
+    float accumulator = __fmul_rn(
+        __bfloat162float(combine[route_base * hidden + column]),
+        weights[route_base]);
+    for (int route = 1; route < topk; ++route) {
+        const float term = __fmul_rn(
+            __bfloat162float(
+                combine[(route_base + route) * hidden + column]),
+            weights[route_base + route]);
+        accumulator = __fadd_rn(accumulator, term);
+    }
+    output[static_cast<size_t>(token) * hidden + column] =
+        __float2bfloat16_rn(accumulator);
+}
+
+__global__ __launch_bounds__(2 * kThreads, 1)
+void reference_kernel(const __nv_bfloat16 *combine, const float *weights,
+                      __nv_bfloat16 *output, int tokens, int topk,
+                      int hidden) {
+    const int token = blockIdx.x;
+    if (token >= tokens) return;
+    for (int column = threadIdx.x; column < hidden;
+         column += 2 * kThreads)
+        reduce_element(
+            combine, weights, output, token, column, topk, hidden);
+}
+
 // Numeric core of the ready-token terminal epilogue.  One cluster owns one
 // token; its two CTAs form a 256-thread column group and loop over H7168.
 // Route slots are accumulated in the same fixed order as routed_epilogue.
@@ -24,25 +54,13 @@ __global__ void reduce_kernel(const __nv_bfloat16 *combine,
     const int cta_rank = blockIdx.x & 1;
     const int worker = cta_rank * kThreads + threadIdx.x;
     if (token >= tokens) return;
-    const size_t route_base = static_cast<size_t>(token) * topk;
-    for (int column = worker; column < hidden; column += 2 * kThreads) {
-        float accumulator = __fmul_rn(
-            __bfloat162float(combine[route_base * hidden + column]),
-            weights[route_base]);
-        for (int route = 1; route < topk; ++route) {
-            const float term = __fmul_rn(
-                __bfloat162float(
-                    combine[(route_base + route) * hidden + column]),
-                weights[route_base + route]);
-            accumulator = __fadd_rn(accumulator, term);
-        }
-        output[static_cast<size_t>(token) * hidden + column] =
-            __float2bfloat16_rn(accumulator);
-    }
+    for (int column = worker; column < hidden; column += 2 * kThreads)
+        reduce_element(
+            combine, weights, output, token, column, topk, hidden);
 }
 
 void run(const at::Tensor &combine, const at::Tensor &weights,
-         const at::Tensor &output) {
+         const at::Tensor &output, bool clustered) {
     TORCH_CHECK(combine.is_cuda()
                     && combine.scalar_type() == at::kBFloat16
                     && combine.is_contiguous() && combine.dim() == 2,
@@ -70,19 +88,31 @@ void run(const at::Tensor &combine, const at::Tensor &weights,
 
     c10::cuda::CUDAGuard guard(output.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(output.get_device());
-    reduce_kernel<<<static_cast<int>(tokens) * 2, kThreads, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16 *>(combine.data_ptr()),
-        weights.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16 *>(output.data_ptr()),
-        static_cast<int>(tokens), static_cast<int>(topk),
-        static_cast<int>(hidden));
+    const auto *combine_ptr =
+        reinterpret_cast<const __nv_bfloat16 *>(combine.data_ptr());
+    auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.data_ptr());
+    if (clustered) {
+        reduce_kernel<<<static_cast<int>(tokens) * 2, kThreads, 0, stream>>>(
+            combine_ptr, weights.data_ptr<float>(), output_ptr,
+            static_cast<int>(tokens), static_cast<int>(topk),
+            static_cast<int>(hidden));
+    } else {
+        reference_kernel<<<static_cast<int>(tokens), 2 * kThreads, 0, stream>>>(
+            combine_ptr, weights.data_ptr<float>(), output_ptr,
+            static_cast<int>(tokens), static_cast<int>(topk),
+            static_cast<int>(hidden));
+    }
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "terminal reduce probe launch failed");
 }
 
 std::vector<int64_t> attributes() {
-    cudaFuncAttributes attributes{};
-    TORCH_CHECK(cudaFuncGetAttributes(&attributes, reduce_kernel)
+    cudaFuncAttributes reference{};
+    cudaFuncAttributes clustered{};
+    TORCH_CHECK(cudaFuncGetAttributes(&reference, reference_kernel)
+                    == cudaSuccess,
+                "reference attribute query failed");
+    TORCH_CHECK(cudaFuncGetAttributes(&clustered, reduce_kernel)
                     == cudaSuccess,
                 "reduce attribute query failed");
     cudaLaunchConfig_t config{};
@@ -100,9 +130,12 @@ std::vector<int64_t> attributes() {
                     &occupancy, reduce_kernel, &config) == cudaSuccess,
                 "reduce occupancy query failed");
     return {
-        static_cast<int64_t>(attributes.numRegs),
-        static_cast<int64_t>(attributes.sharedSizeBytes),
-        static_cast<int64_t>(attributes.localSizeBytes),
+        static_cast<int64_t>(reference.numRegs),
+        static_cast<int64_t>(reference.sharedSizeBytes),
+        static_cast<int64_t>(reference.localSizeBytes),
+        static_cast<int64_t>(clustered.numRegs),
+        static_cast<int64_t>(clustered.sharedSizeBytes),
+        static_cast<int64_t>(clustered.localSizeBytes),
         static_cast<int64_t>(occupancy),
     };
 }
