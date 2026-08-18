@@ -124,14 +124,13 @@ struct ordered_minibatch_range {
 
 struct logical_coordinate {
     bool valid;
-    int64_t cursor_ordinal;
-    int ordered_minibatch;
-    int macrobatch;
-    int minibatch;
+    logical_stage stage;
     int global_m;
     int n128;
-    logical_stage stage;
 };
+
+static_assert(sizeof(logical_coordinate) == 16,
+              "logical coordinate unexpectedly regained hot state");
 
 // One dense communication ticket represents the lockstep pair of native
 // four-row CTA tasks.  The two CTAs execute the same stage and adjacent task
@@ -451,7 +450,6 @@ MOK_TERMINAL_HD ordinal_range stage_range(
 MOK_TERMINAL_HD logical_coordinate decode_logical_cursor(
         const logical_shape &shape, int64_t cursor_ordinal) {
     logical_coordinate result{};
-    result.cursor_ordinal = cursor_ordinal;
     if (!shape.valid || cursor_ordinal < 0
             || cursor_ordinal >= shape.total_tasks)
         return result;
@@ -511,9 +509,6 @@ MOK_TERMINAL_HD logical_coordinate decode_logical_cursor(
     }
 
     result.valid = m_in_minibatch >= 0 && m_in_minibatch < r;
-    result.ordered_minibatch = ordered_minibatch;
-    result.macrobatch = range.macrobatch;
-    result.minibatch = range.minibatch;
     result.global_m = range.first_m_tile + m_in_minibatch;
     return result;
 }

@@ -101,10 +101,14 @@ void check_golden_set(const probe_case &test,
         const auto &expected = golden[index];
         const auto actual =
             terminal::decode_logical_cursor(shape, expected.ordinal);
+        const auto minibatch = terminal::decode_ordered_minibatch(
+            shape, expected.ordered_minibatch);
         require(actual.valid
-                    && actual.ordered_minibatch == expected.ordered_minibatch
-                    && actual.macrobatch == expected.macrobatch
-                    && actual.minibatch == expected.minibatch
+                    && minibatch.valid
+                    && minibatch.ordered_minibatch
+                        == expected.ordered_minibatch
+                    && minibatch.macrobatch == expected.macrobatch
+                    && minibatch.minibatch == expected.minibatch
                     && actual.global_m == expected.global_m
                     && actual.stage == expected.stage
                     && actual.n128 == expected.n128,
@@ -153,10 +157,6 @@ void check_stage_decode_interlock(
                 local % terminal::W2_CLUSTER_TASKS);
         }
         require(coordinate.valid && coordinate.stage == stage
-                    && coordinate.ordered_minibatch
-                        == minibatch.ordered_minibatch
-                    && coordinate.macrobatch == minibatch.macrobatch
-                    && coordinate.minibatch == minibatch.minibatch
                     && coordinate.global_m == expected_m
                     && coordinate.n128 == expected_n128,
                 std::string(test.name) + ": stage/decode interlock at "

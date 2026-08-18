@@ -831,7 +831,7 @@ __device__ void communication_role(
                             leader_last_producer = produced;
                             leader_idle_windows = 0;
                         } else {
-                            ++leader_idle_windows;
+                            leader_idle_windows = leader_idle_windows + 1ull;
                         }
                         if (leader_idle_windows >= g.spin_limit)
                             trap_commit(
@@ -969,7 +969,7 @@ __device__ void communication_role(
                         leader_last_dispatch = dispatched;
                         leader_idle_windows = 0;
                     } else {
-                        ++leader_idle_windows;
+                        leader_idle_windows = leader_idle_windows + 1ull;
                     }
                     if (leader_idle_windows >= g.spin_limit)
                         trap_commit(
@@ -1083,17 +1083,33 @@ __device__ void compute_and_reduce_role(
         semaphore (&inputs_arrived)[compute::PIPE_DEPTH],
         semaphore (&inputs_finished)[compute::PIPE_DEPTH],
         semaphore (&inputs_ready)[compute::PIPE_DEPTH]) {
+    // All threads in both CTAs decode the same immutable schedule shape.  Keep
+    // one copy per CTA rather than four int64 fields plus metadata live in
+    // every producer thread across WGMMA/TMA task bodies.
+    __shared__ terminal::logical_shape shape;
+    // These values are consumed only by CTA thread 0.  Shared placement keeps
+    // timeout/debug history out of the resident producer's register live set.
+    __shared__ volatile unsigned long long leader_wait_windows;
+    __shared__ volatile unsigned int leader_last_reduce_done;
+    __shared__ volatile unsigned int leader_last_comm_closed;
+    __shared__ volatile unsigned int leader_last_producer_done;
+    __shared__ volatile unsigned int leader_last_push_done;
+    __shared__ volatile unsigned int reduced_before_compute;
+    if (threadIdx.x == 0) {
+        shape = terminal::make_logical_shape(
+            g.num_tokens[0], g.schedule_capacity,
+            g.minibatch_rows, g.macrobatch_rows);
+        leader_wait_windows = 0;
+        leader_last_reduce_done = 0u;
+        leader_last_comm_closed = 0u;
+        leader_last_producer_done = 0u;
+        leader_last_push_done = 0u;
+        reduced_before_compute = 0u;
+    }
+    __syncthreads();
+
     uint32_t phasebits = 0xFFFF0000u;
     uint32_t ready_phase = 0u;
-    bool reduced_by_this_cta = false;
-    unsigned long long idle_windows = 0;
-    unsigned int last_reduce_done = 0u;
-    unsigned int last_comm_closed = 0u;
-    unsigned int last_producer_done = 0u;
-    unsigned int last_push_done = 0u;
-    const terminal::logical_shape shape = terminal::make_logical_shape(
-        g.num_tokens[0], g.schedule_capacity,
-        g.minibatch_rows, g.macrobatch_rows);
     if (!shape.valid) {
         if (cta_rank == 0 && threadIdx.x == 0) {
             if (g.trap_record != nullptr)
@@ -1131,8 +1147,9 @@ __device__ void compute_and_reduce_role(
             // whether global progress closed or another poll window is due.
             const route::claim_result result =
                 try_reduce_one_ready_token(g);
-            if (result == route::claim_result::claimed)
-                reduced_by_this_cta = true;
+            if (threadIdx.x == 0
+                    && result == route::claim_result::claimed)
+                reduced_before_compute = 1u;
             everyone::tma::cluster::sync();
 
             if (cta_rank == 0 && threadIdx.x == 0) {
@@ -1157,24 +1174,24 @@ __device__ void compute_and_reduce_role(
                     const unsigned int pushed = g.push_done != nullptr
                         ? compute::load_acquire_gpu(g.push_done)
                         : 0u;
-                    if (reduced != last_reduce_done
-                            || closed != last_comm_closed
-                            || produced != last_producer_done
-                            || pushed != last_push_done) {
-                        idle_windows = 0;
-                        last_reduce_done = reduced;
-                        last_comm_closed = closed;
-                        last_producer_done = produced;
-                        last_push_done = pushed;
+                    if (reduced != leader_last_reduce_done
+                            || closed != leader_last_comm_closed
+                            || produced != leader_last_producer_done
+                            || pushed != leader_last_push_done) {
+                        leader_wait_windows = 0;
+                        leader_last_reduce_done = reduced;
+                        leader_last_comm_closed = closed;
+                        leader_last_producer_done = produced;
+                        leader_last_push_done = pushed;
                     } else {
-                        ++idle_windows;
+                        leader_wait_windows = leader_wait_windows + 1ull;
                     }
-                    if (idle_windows >= g.spin_limit) {
+                    if (leader_wait_windows >= g.spin_limit) {
                         if (g.trap_record != nullptr)
                             trap_commit(
                                 g, ERR_TIMEOUT, SITE_TERMINAL_CONTRACT,
                                 worker_cluster, total_tokens, reduced,
-                                STOP_TICKET, idle_windows);
+                                STOP_TICKET, leader_wait_windows);
                         if (g.worker_failed != nullptr)
                             atomicExch(
                                 g.worker_failed + worker_cluster, 1u);
@@ -1223,7 +1240,8 @@ __device__ void compute_and_reduce_role(
 
         int current_expert = -1;
         if (coordinate.stage != terminal::logical_stage::activation) {
-            unsigned long long wait_windows = 0;
+            if (cta_rank == 0 && threadIdx.x == 0)
+                leader_wait_windows = 0;
             while (true) {
                 if (cta_rank == 0 && threadIdx.x == 0) {
                     unsigned int signal = WAIT_SIGNAL;
@@ -1277,13 +1295,14 @@ __device__ void compute_and_reduce_role(
                 // no producer dependency is waited on by the reducer.
                 const route::claim_result result =
                     try_reduce_one_ready_token(g);
-                if (result == route::claim_result::claimed)
-                    reduced_by_this_cta = true;
+                if (threadIdx.x == 0
+                        && result == route::claim_result::claimed)
+                    reduced_before_compute = 1u;
                 everyone::tma::cluster::sync();
                 if (cta_rank == 0 && threadIdx.x == 0) {
-                    ++wait_windows;
+                    leader_wait_windows = leader_wait_windows + 1ull;
                     unsigned int decision = WAIT_SIGNAL;
-                    if (wait_windows >= g.spin_limit) {
+                    if (leader_wait_windows >= g.spin_limit) {
                         if (g.trap_record != nullptr)
                             trap_commit(
                                 g, ERR_TIMEOUT,
@@ -1291,7 +1310,7 @@ __device__ void compute_and_reduce_role(
                                 coordinate.global_m, terminal::M_TILE,
                                 compute::load_acquire_gpu(
                                     g.x_ready + coordinate.global_m),
-                                ticket, wait_windows);
+                                ticket, leader_wait_windows);
                         if (g.worker_failed != nullptr)
                             atomicExch(
                                 g.worker_failed + worker_cluster, 1u);
@@ -1341,7 +1360,7 @@ __device__ void compute_and_reduce_role(
                 atomicOr(g.overlap_witness, OVERLAP_COMPUTE_DISPATCH);
         }
 
-        if (reduced_by_this_cta && threadIdx.x == 0
+        if (reduced_before_compute != 0u && threadIdx.x == 0
                 && g.overlap_witness != nullptr)
             atomicOr(g.overlap_witness, OVERLAP_REDUCE_THEN_COMPUTE);
 
