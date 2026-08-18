@@ -219,7 +219,9 @@ __device__ __forceinline__ void try_publish_terminate(
     unsigned int old;
     const unsigned int compare = 0u;
     const unsigned int value = 1u;
-    asm volatile("{atom.cas.release.gpu.global.u32 %0, [%1], %2, %3;}"
+    // PTX CAS uses the bit type spelling; acq_rel is the accepted stronger
+    // form of the required release publication on SM90.
+    asm volatile("{atom.cas.acq_rel.gpu.global.b32 %0, [%1], %2, %3;}"
                  : "=r"(old)
                  : "l"(g.terminate), "r"(compare), "r"(value)
                  : "memory");

@@ -92,7 +92,7 @@ def check_source_contract() -> None:
         "production_completion_epilogue(g, cta_rank)",
         "multimem.red.release.sys.global.add.u32",
         "atom.add.acq_rel.gpu.global.u32",
-        "atom.cas.release.gpu.global.u32",
+        "atom.cas.acq_rel.gpu.global.b32",
         "st.release.gpu.global.u32",
         "st.release.sys.global.u64",
         "TRAP_CLAIMED = ~0ull",
