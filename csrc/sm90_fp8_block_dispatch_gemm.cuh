@@ -26,6 +26,7 @@
 
 #include <array>
 
+#include "sm90_fp8_block_gemm_core.cuh"
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 
@@ -279,13 +280,9 @@ __device__ __forceinline__ void gemm_task(
     a_st (&a_smem)[2], b_st (&b_smem)[2], d_st &d_smem,
     semaphore (&inputs_arrived)[2], semaphore (&inputs_finished)[2],
     semaphore (&inputs_ready)[2]) {
-    constexpr int PIPE_DEPTH = 2;
-    const int n_pairs = g.n_tiles / 2;
-    const int n_tile_base = 2 * (gemm_cluster_idx % n_pairs);
-    const int n_tile = n_tile_base + cta_rank;
-    const int m_tile = gemm_cluster_idx / n_pairs;
-    const int global_row_base = m_tile * 64;
-    if (global_row_base >= g.num_tokens[0])
+    const auto coord = fp8_block_gemm_core::decode_tile(
+        g, gemm_cluster_idx, cta_rank);
+    if (coord.global_row_base >= g.num_tokens[0])
         return;
 
     // Consume as soon as this tile's own rows have been dispatched.  The
@@ -297,93 +294,20 @@ __device__ __forceinline__ void gemm_task(
         do {
             asm volatile("{ld.acquire.gpu.global.u32 %0, [%1];}"
                          : "=r"(done)
-                         : "l"(g.tile_ready + m_tile) : "memory");
+                         : "l"(g.tile_ready + coord.m_tile) : "memory");
             if (done >= 64u) break;
             __nanosleep(256);
             if (++iters >= g.spin_trap_iters)
                 trap_commit(g, ERR_TIMEOUT, SITE_K1_TILE_READY,
-                            m_tile, 64, done, ticket, iters);
+                            coord.m_tile, 64, done, ticket, iters);
         } while (true);
     }
     __syncthreads();
 
-    const int expert = g.m_indices[global_row_base];
-
-    acc_rt total;
-    if (threadIdx.x == 0) {
-        wait(inputs_finished[0], get_phasebit<1>(phasebits, 0));
-        update_phasebit<1>(phasebits, 0);
-        tma::cluster::expect_bytes(
-            inputs_arrived[0], sizeof(a_st) + sizeof(b_st));
-        tma::cluster::load_async(
-            b_smem[0], g.B, {expert, n_tile, 0}, inputs_arrived[0],
-            static_cast<uint16_t>(1 << cta_rank));
-        tma::cluster::arrive(inputs_ready[0], 0);
-        if (cta_rank == 0) {
-            wait(inputs_ready[0], get_phasebit<0>(ready_phase, 0));
-            update_phasebit<0>(ready_phase, 0);
-            tma::cluster::load_async(
-                a_smem[0], g.A, {m_tile, 0}, inputs_arrived[0], 0b11);
-        }
-    }
-    for (int kb = 0; kb < g.k_blocks; ++kb) {
-        const int stage = kb % PIPE_DEPTH;
-        wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-        update_phasebit<0>(phasebits, stage);
-
-        acc_rt partial;
-        warpgroup::mm_ABt(partial, a_smem[stage], b_smem[stage]);
-        if (kb + 1 < g.k_blocks) {
-            const int next_stage = (kb + 1) % PIPE_DEPTH;
-            if (threadIdx.x == 0) {
-                wait(inputs_finished[next_stage],
-                     get_phasebit<1>(phasebits, next_stage));
-                update_phasebit<1>(phasebits, next_stage);
-                tma::cluster::expect_bytes(
-                    inputs_arrived[next_stage],
-                    sizeof(a_st) + sizeof(b_st));
-                tma::cluster::load_async(
-                    b_smem[next_stage], g.B,
-                    {expert, n_tile, kb + 1}, inputs_arrived[next_stage],
-                    static_cast<uint16_t>(1 << cta_rank));
-                tma::cluster::arrive(inputs_ready[next_stage], 0);
-                if (cta_rank == 0) {
-                    wait(inputs_ready[next_stage],
-                         get_phasebit<0>(ready_phase, next_stage));
-                    update_phasebit<0>(ready_phase, next_stage);
-                    tma::cluster::load_async(
-                        a_smem[next_stage], g.A, {m_tile, kb + 1},
-                        inputs_arrived[next_stage], 0b11);
-                }
-            }
-        }
-        warpgroup::mma_async_wait<0>();
-
-        typename acc_rt::col_vec row_scale;
-        const int local_row = warpid() * 16 + laneid() / 4;
-        const int global_row = global_row_base + local_row;
-        const float b_scale =
-            g.B_scale[(expert * (g.n / 128) + n_tile / 2) * g.k_blocks + kb];
-        row_scale[0][0].x =
-            g.A_scale[global_row * g.k_blocks + kb] * b_scale;
-        row_scale[0][0].y =
-            g.A_scale[(global_row + 8) * g.k_blocks + kb] * b_scale;
-        warpgroup::mul_row(partial, partial, row_scale);
-
-        if (kb == 0)
-            warp::copy(total, partial);
-        else
-            warpgroup::add(total, total, partial);
-        warpgroup::sync(0);
-        if (threadIdx.x == 0)
-            tma::cluster::arrive(inputs_finished[stage], cta_rank);
-    }
-
-    rt_bf<16, 64> out;
-    warp::copy(out, total);
-    warpgroup::store(d_smem, out);
-    warpgroup::sync(0);
-    warpgroup::store(g.D, d_smem, {m_tile, n_tile});
+    fp8_block_gemm_core::run_tile(
+        g, coord, cta_rank, phasebits, ready_phase,
+        a_smem, b_smem, d_smem,
+        inputs_arrived, inputs_finished, inputs_ready);
     // Task-boundary drain: the direct global store above is synchronous per
     // thread; this sync keeps slow storers ahead of the next task's d_smem
     // writes.  The boundary cluster barrier in the worker loop covers the
