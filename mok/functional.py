@@ -1301,6 +1301,31 @@ def format_trap_record(
     )
 
 
+def format_terminal_transaction_failure(
+    workspace: MoKFP8TerminalWorkspace,
+    phase: str,
+    error: BaseException,
+) -> str:
+    """Format a CPU-only fatal receipt after a terminal lease was attempted.
+
+    Once terminal acquire is enqueued, callers cannot know whether a later
+    exception left a usable CUDA context or an acquired workspace.  They must
+    not issue a release kernel or continue serving.  This helper only reads the
+    host-mapped trap record and formats a receipt for an immediate process
+    exit; it deliberately performs no CUDA operation.
+    """
+    try:
+        trap = format_trap_record(workspace)
+    except BaseException:
+        trap = None
+    if trap is not None:
+        return trap
+    return (
+        "MOK_TERMINAL_TRANSACTION_FATAL"
+        f"|phase={phase}|error_type={type(error).__name__}"
+    )
+
+
 def clear_workspace_cache() -> None:
     """Clears cached workspaces after all participating ranks synchronize.
 
@@ -2300,8 +2325,10 @@ def acquire_megakernel_fp8_block_from_topk_lease(
     This is the first half of the preloaded from-topk transaction.  It
     validates the complete terminal call against ``workspace.x_buffer`` and
     ``workspace.x_scale_buffer`` without writing either tensor, then launches
-    the normal graph-safe lease acquire.  After success, the caller must write
-    both buffers on the same stream and invoke
+    the normal graph-safe lease acquire.  After acquire is attempted, every
+    exception is process-fatal: callers must not issue a release kernel or
+    continue with a possibly acquired/poisoned workspace.  On success, the
+    caller must write both buffers on the same stream and invoke
     :func:`megakernel_fp8_block_from_topk_preloaded_leased`.
     """
     _validate_and_acquire_terminal_from_topk(
