@@ -869,7 +869,9 @@ def benchmark_cell(
         if rank == 0:
             print(
                 f"TERMINAL_PRODUCTION_BENCH_STAGE|tokens="
-                f"{cell.effective_tokens}|stage={name}",
+                f"{cell.effective_tokens}"
+                f"|Q={(cell.active_rows + args.macrobatch_rows - 1) // args.macrobatch_rows}"
+                f"|stage={name}",
                 flush=True,
             )
 
@@ -914,7 +916,9 @@ def benchmark_cell(
             comparison = comparisons[baseline]
             print(
                 "TERMINAL_PRODUCTION_BENCH_COMPARISON"
-                f"|tokens={cell.effective_tokens}|baseline={baseline}"
+                f"|tokens={cell.effective_tokens}"
+                f"|Q={(cell.active_rows + args.macrobatch_rows - 1) // args.macrobatch_rows}"
+                f"|baseline={baseline}"
                 f"|terminal_ms="
                 f"{comparison['terminal_midpoint_p50_ms']:.6f}"
                 f"|baseline_ms={comparison[baseline]['p50_ms']:.6f}"
@@ -935,6 +939,13 @@ def benchmark_cell(
         "compute_clusters": terminal_workspace.compute_clusters,
         "max_compute_clusters": terminal_workspace.max_compute_clusters,
         "copy_clusters": args.copy_clusters,
+        "pipeline": {
+            "minibatch_rows": args.minibatch_rows,
+            "macrobatch_rows": args.macrobatch_rows,
+            "num_macrobatches": (
+                cell.active_rows + args.macrobatch_rows - 1
+            ) // args.macrobatch_rows,
+        },
         "correctness": {
             "terminal_vs_split": "bitwise_exact",
             "k1k2_vs_split": "bitwise_exact",
@@ -993,6 +1004,7 @@ def main() -> int:
                         "TERMINAL_PRODUCTION_BENCH"
                         f"|tokens={cell.effective_tokens}"
                         f"|bucket={cell.graph_tokens}"
+                        f"|Q={(cell.active_rows + args.macrobatch_rows - 1) // args.macrobatch_rows}"
                         f"|baseline={baseline}"
                         f"|terminal_ms={comparison['terminal_midpoint_p50_ms']:.6f}"
                         f"|baseline_ms={comparison[baseline]['p50_ms']:.6f}"
