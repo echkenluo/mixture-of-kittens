@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import statistics
 from pathlib import Path
 
 import torch
@@ -97,14 +98,20 @@ def main() -> int:
                 )
                 for delay_cycles in csv_ints(args.delay_cycles):
                     digest = hashlib.sha256()
+                    elapsed_ms = []
                     for repeat in range(args.repeats):
                         for tensor in tensors:
                             tensor.zero_()
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
                         module.run(
                             *tensors, w13_per_m, act_per_m, w2_per_m,
                             delay_cycles,
                         )
+                        end.record()
                         torch.cuda.synchronize()
+                        elapsed_ms.append(start.elapsed_time(end))
                         if int(copy_head.item()) != m_tiles:
                             raise RuntimeError("copy head did not close")
                         if int(terminal_count.item()) != m_tiles:
@@ -147,6 +154,13 @@ def main() -> int:
                         "act_per_m": act_per_m,
                         "delay_cycles": delay_cycles,
                         "repeats": args.repeats,
+                        "p50_ms": round(statistics.median(elapsed_ms), 6),
+                        "p95_ms": round(
+                            sorted(elapsed_ms)[
+                                max(0, int(len(elapsed_ms) * 0.95) - 1)
+                            ],
+                            6,
+                        ),
                         "sha16": digest.hexdigest()[:16],
                     }
                     rows.append(row)
