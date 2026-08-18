@@ -773,12 +773,25 @@ def measure_aba(
     baseline_name: str,
     device: torch.device,
 ) -> dict:
+    def receipt(phase: str) -> None:
+        if dist.get_rank() == 0:
+            print(
+                f"TERMINAL_PRODUCTION_BENCH_ABA|tokens="
+                f"{cell.effective_tokens}|baseline={baseline_name}"
+                f"|phase={phase}",
+                flush=True,
+            )
+
     baseline = getattr(runners, baseline_name)
     before = dict(runners.calls)
     warm_aba(runners.terminal, baseline, args.warmup, device)
+    receipt("warmup_end")
     a1 = rank_max_event_samples(runners.terminal, args.iters, device)
+    receipt("terminal_a1_end")
     b = rank_max_event_samples(baseline, args.iters, device)
+    receipt("baseline_end")
     a2 = rank_max_event_samples(runners.terminal, args.iters, device)
+    receipt("terminal_a2_end")
     expected_delta = {
         "terminal": 2 * (args.warmup + args.iters),
         baseline_name: args.warmup + args.iters,
@@ -799,7 +812,10 @@ def measure_aba(
     if drift > args.aba_drift_limit:
         raise RuntimeError(
             f"terminal A/A drift {drift:.3%} exceeds "
-            f"{args.aba_drift_limit:.3%} for {baseline_name}"
+            f"{args.aba_drift_limit:.3%} for {baseline_name}: "
+            f"a1={a1_summary['p50_ms']:.6f} ms, "
+            f"baseline={baseline_summary['p50_ms']:.6f} ms, "
+            f"a2={a2_summary['p50_ms']:.6f} ms"
         )
     terminal_p50 = midpoint
     return {
