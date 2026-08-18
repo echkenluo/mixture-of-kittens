@@ -792,7 +792,11 @@ def run_device(args: argparse.Namespace) -> None:
                     }
                     if owner_only:
                         scalar_expected.update(
-                            comm_owner=0,
+                            # The owner-only probe intentionally exercises the
+                            # fixed-role compatibility path: role_cursor and
+                            # cluster_role are null, so runtime election does
+                            # not publish comm_owner.
+                            comm_owner=-1,
                             comm_worker_ticket=-2,
                             producer_done=total_tasks,
                             push_done=rows,
