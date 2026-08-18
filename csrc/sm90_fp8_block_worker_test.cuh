@@ -18,17 +18,19 @@
 #if defined(KITTENS_SM90)
 #include <ATen/ATen.h>
 
+#include "sm90_fp8_block_pipeline_primitives.cuh"
+
 namespace mok_sm90 {
 using namespace kittens;
 
 namespace fp8_block_test {
-using a_st = st_fp8e4m3<64, 128>;
-using b_st = st_fp8e4m3<64, 128>;
-using d_st = st_bf<64, 64>;
+using fp8_block_pipeline::a_st;
+using fp8_block_pipeline::b_st;
+using fp8_block_pipeline::d_st;
+using fp8_block_pipeline::acc_rt;
 using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_st>;
 using b_gl = gl<fp8e4m3, 1, 1, -1, -1, b_st>;
 using d_gl = gl<bf16, 1, 1, -1, -1, d_st>;
-using acc_rt = rt_fl<16, 64>;
 
 struct globals {
     a_gl A;

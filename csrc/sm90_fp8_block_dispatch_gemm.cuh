@@ -304,8 +304,9 @@ __device__ __forceinline__ void gemm_task(
     }
     __syncthreads();
 
+    const int expert = g.m_indices[coord.global_row_base];
     fp8_block_gemm_core::run_tile(
-        g, coord, cta_rank, phasebits, ready_phase,
+        g, coord, expert, cta_rank, phasebits, ready_phase,
         a_smem, b_smem, d_smem,
         inputs_arrived, inputs_finished, inputs_ready);
     // Task-boundary drain: the direct global store above is synchronous per

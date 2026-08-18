@@ -163,8 +163,9 @@ __device__ __forceinline__ void gemm_role(const globals &g,
 
     uint32_t phasebits = 0xFFFF0000;
     uint32_t ready_phase = 0;
+    const int expert = g.m_indices[coord.global_row_base];
     fp8_block_gemm_core::run_tile(
-        g, coord, cta_rank, phasebits, ready_phase,
+        g, coord, expert, cta_rank, phasebits, ready_phase,
         a_smem, b_smem, d_smem,
         inputs_arrived, inputs_finished, inputs_ready);
     // Join this M64 block's completion count.  The syncthreads gathers every
