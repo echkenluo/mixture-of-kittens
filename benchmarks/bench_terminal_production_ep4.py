@@ -155,15 +155,19 @@ def sha256(path: pathlib.Path) -> str:
 
 def repository_state() -> tuple[pathlib.Path, str, list[str]]:
     repo = pathlib.Path(__file__).resolve().parents[1]
+    # The benchmark runs as container root against a host-owned bind mount.
+    # Scope the ownership exception to this exact repository and invocation;
+    # do not inherit or mutate a global Git configuration.
+    git = ["git", "-c", f"safe.directory={repo}"]
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [*git, "rev-parse", "HEAD"],
         cwd=repo,
         check=False,
         capture_output=True,
         text=True,
     )
     status = subprocess.run(
-        ["git", "status", "--porcelain"],
+        [*git, "status", "--porcelain"],
         cwd=repo,
         check=False,
         capture_output=True,
