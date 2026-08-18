@@ -33,7 +33,7 @@ __device__ __forceinline__ void store_release(unsigned int *address,
 __device__ __forceinline__ unsigned int cas_acq_rel(
     unsigned int *address, unsigned int expected, unsigned int desired) {
     unsigned int prior;
-    asm volatile("{atom.cas.acq_rel.gpu.global.u32 %0, [%1], %2, %3;}"
+    asm volatile("{atom.cas.acq_rel.gpu.global.b32 %0, [%1], %2, %3;}"
                  : "=r"(prior)
                  : "l"(address), "r"(expected), "r"(desired)
                  : "memory");
