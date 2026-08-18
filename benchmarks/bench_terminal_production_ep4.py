@@ -941,8 +941,23 @@ def benchmark_cell(
             "scope": "effective_token_prefix",
         },
         "closure": "PASS",
+        # These counters are sampled only after every timed path and closure
+        # check has completed.  They therefore add no work to the measured
+        # region, while making scheduler overhead (especially bounded reducer
+        # probes that found no ready token) directly observable.
+        "scheduler_diagnostics": {
+            "logical_tasks": cell.active_rows // M_TILE * 65,
+            "reduce_probes": int(
+                terminal_workspace.next_reduce_probe.item()
+            ),
+            "reduced_tokens": int(terminal_workspace.reduce_done.item()),
+        },
         "comparisons": comparisons,
     }
+    result["scheduler_diagnostics"]["probes_per_reduced_token"] = (
+        result["scheduler_diagnostics"]["reduce_probes"]
+        / max(1, result["scheduler_diagnostics"]["reduced_tokens"])
+    )
     del split_output, terminal_output, k1k2_output
     del runners, terminal_workspace, route_workspace, tensors
     gc.collect()
