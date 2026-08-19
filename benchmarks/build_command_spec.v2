@@ -1,0 +1,68 @@
+BUILD_COMMAND_SPEC=2
+NAME=mok-sm90-make-v2
+# SCHEMA 2, and the file is build_command_spec.v2: schema 1 meant ENV_PASS
+# (an allowlist of caller values) with no TOOLCHAIN_ROOT. That is not the same
+# contract, so it does not get to keep the same version number - a parser
+# reading a v1 spec under v2 rules would silently mean something different.
+# The production build command as an argv array, the output it must produce,
+# the EXACT environment it runs in, and the tools whose versions must be
+# probed. All TRACKED and read from the commit being built.
+#
+# ENV_SET replaces the earlier ENV_PASS allowlist, which was a complete
+# bypass rather than a closure: passing the CALLER's PATH means make, nvcc and
+# python3 are resolved under a path the caller controls, so a fake `make` can
+# copy an old .so and a fake `nvcc`/`python3` can print whatever versions and
+# ext-suffix the record expects. HOME likewise enables python user-site and
+# tool config. These values are fixed here; the wrapper passes nothing from
+# the caller's environment.
+#
+# HOME is set by the wrapper to an EMPTY directory it creates inside the
+# artifact directory - the literal below is a placeholder that the wrapper
+# replaces, and it is recorded verbatim in the env manifest.
+ENV_SET=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV_SET=HOME=@ARTIFACT_HOME@
+# Keep compiler temporaries on the caller-selected artifact filesystem. The
+# H20 build container's overlay can be much smaller than the mounted evidence
+# volume; inheriting /tmp would make disk pressure, not the tracked contract,
+# decide whether nvcc can finish. The wrapper creates and records this exact
+# empty directory after validating that artifact_dir is a real directory.
+ENV_SET=TMPDIR=@ARTIFACT_TMP@
+ENV_SET=PYTHONNOUSERSITE=1
+ENV_SET=PYTHONPATH=
+ENV_SET=LANG=C.UTF-8
+ENV_SET=LC_ALL=C.UTF-8
+# Absolute roots the derived python/torch include and library paths must
+# resolve under, checked after realpath so a symlink cannot escape. These are
+# IMAGE FILESYSTEM boundaries, not part of the source closure - they say
+# "this path belongs to the toolchain image", nothing about the source.
+# (/usr already contains /usr/local; both are listed for clarity.)
+TOOLCHAIN_ROOT=/usr
+TOOLCHAIN_ROOT=/usr/local
+OUTPUT=mok/_C.cpython-312-x86_64-linux-gnu.so
+HOST_COMPILER=/usr/bin/g++
+ARGV=/usr/bin/make
+ARGV=-f
+ARGV=Makefile
+ARGV=ARCH=SM90
+ARGV=SRC=csrc/bindings.cu
+ARGV=THUNDERKITTENS_ROOT=./third_party/ThunderKittens
+ARGV=NVCC=/usr/local/cuda/bin/nvcc -ccbin /usr/bin/g++
+ARGV=PYTHON=/usr/bin/python3
+ARGV=OUT=mok/_C.cpython-312-x86_64-linux-gnu.so
+ARGV=PYTHON_INCLUDES=-I/usr/include/python3.12
+ARGV=PYTORCH_INCLUDES=-I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include
+ARGV=PYTORCH_LIBDIR=-L/usr/local/lib/python3.12/dist-packages/torch/lib
+# label|argv0|argv1|... - pipe-delimited, no shell. Labels are fixed:
+# nvcc, hostcc, python, torch, ext_suffix, py_include, torch_include,
+# torch_libdir. The last three are not decoration: the wrapper compares them
+# against the PYTHON_INCLUDES / PYTORCH_INCLUDES / PYTORCH_LIBDIR pinned above
+# and refuses to publish if a pinned path is not what this interpreter and
+# this torch actually report.
+PROBE=nvcc|/usr/local/cuda/bin/nvcc|--version
+PROBE=hostcc|/usr/bin/g++|--version
+PROBE=python|/usr/bin/python3|--version
+PROBE=torch|/usr/bin/python3|-c|import torch; print(torch.__version__); print(torch.version.cuda)
+PROBE=ext_suffix|/usr/bin/python3|-c|import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))
+PROBE=py_include|/usr/bin/python3|-c|import sysconfig; print("-I" + sysconfig.get_path("include"))
+PROBE=torch_include|/usr/bin/python3|-c|from torch.utils.cpp_extension import include_paths; print(" ".join("-I" + p for p in include_paths()))
+PROBE=torch_libdir|/usr/bin/python3|-c|from torch.utils.cpp_extension import library_paths; print(" ".join("-L" + p for p in library_paths()))

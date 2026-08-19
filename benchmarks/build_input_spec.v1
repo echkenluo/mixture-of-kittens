@@ -1,0 +1,17 @@
+BUILD_INPUT_SPEC=1
+NAME=mok-sm90-v1
+# The build closure this repository actually compiles from, read off the
+# Makefile: SRC=csrc/bindings.cu, HEADERS=csrc/*.cuh, headers come from the
+# ThunderKittens submodule, and the extension lands in mok/. The packaging
+# files are included because they define the extension name and layout.
+#
+# This file is TRACKED and its sha256 is recorded in every build record. The
+# wrapper reads the closure from here and offers NO way for a caller to
+# narrow it - a caller-chosen input list would let a record describe less
+# than what was really compiled.
+PATH=Makefile
+PATH=setup.py
+PATH=pyproject.toml
+PATH=MANIFEST.in
+PATH=csrc
+SUBMODULE=third_party/ThunderKittens
