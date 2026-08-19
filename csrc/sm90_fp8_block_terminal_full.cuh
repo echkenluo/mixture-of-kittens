@@ -83,6 +83,13 @@ constexpr unsigned long long SITE_TERMINAL_COMM_OWNER = 23ull;
 
 using namespace kittens;
 
+// --- lcc profiling: device cycle accounting, printed once by the last cluster ---
+__device__ unsigned long long g_prof_total = 0ull;   // whole compute-role residency
+__device__ unsigned long long g_prof_body = 0ull;    // time inside run_producer_task_body (GEMM/act)
+__device__ unsigned long long g_prof_wait = 0ull;    // time in the dependency wait loop
+__device__ unsigned long long g_prof_comm_total = 0ull; // whole comm-role residency
+__device__ unsigned long long g_prof_comm_body = 0ull;  // time doing dispatch/combine copies
+
 template <typename GemmProblem>
 struct globals {
     GemmProblem w13;
@@ -394,6 +401,10 @@ __device__ void production_completion_epilogue(
             const unsigned int released = 0u;
             asm volatile("{st.release.gpu.global.u32 [%0], %1;}" ::
                          "l"(g.in_use), "r"(released) : "memory");
+            printf("LCC_PROF body=%llu total=%llu comm_total=%llu "
+                   "ncomp=%d ncomm=%d\n",
+                   g_prof_body, g_prof_total, g_prof_comm_total,
+                   g.compute_clusters, g.comm_clusters);
         }
     }
     everyone::tma::cluster::sync();
@@ -1470,10 +1481,14 @@ __device__ void compute_and_reduce_role(
                 && g.overlap_witness != nullptr)
             atomicOr(g.overlap_witness, OVERLAP_REDUCE_THEN_COMPUTE);
 
+        long long lcc_tb = (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
         run_producer_task_body(
             g, coordinate, current_expert, cta_rank, phasebits, ready_phase,
             a_smem, b_smem, d_smem,
             inputs_arrived, inputs_finished, inputs_ready);
+        if (cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(&g_prof_body,
+                      (unsigned long long)(clock64() - lcc_tb));
 
         // Every producer body returns through its own final cluster sync after
         // draining WGMMA/TMA output and publishing the stage-ready counter.
@@ -1577,16 +1592,24 @@ __global__ void kernel(const __grid_constant__ globals<GemmProblem> g) {
     everyone::tma::cluster::sync();
 
     if (role < g.comm_clusters) {
+        long long lcc_tc = (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
         communication_role(
             g, cta_rank, role, g.comm_worker_ticket + role,
             a_smem, b_smem, d_smem,
             inputs_arrived, inputs_finished, inputs_ready);
+        if (cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(&g_prof_comm_total,
+                      (unsigned long long)(clock64() - lcc_tc));
     } else {
         const int worker_cluster = role - g.comm_clusters;
+        long long lcc_tp = (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
         compute_and_reduce_role(
             g, cta_rank, worker_cluster,
             a_smem, b_smem, d_smem,
             inputs_arrived, inputs_finished, inputs_ready);
+        if (cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(&g_prof_total,
+                      (unsigned long long)(clock64() - lcc_tp));
     }
     production_completion_epilogue(g, cta_rank);
 }
