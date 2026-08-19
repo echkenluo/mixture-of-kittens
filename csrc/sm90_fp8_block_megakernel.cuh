@@ -15,10 +15,10 @@ constexpr int EP_SIZE = 4;
 constexpr int CLUSTER_CTAS = 2;
 constexpr int THREADS_PER_CTA = 128;
 constexpr int M_TILE = 64;
-constexpr int N_TILE = 256;
+constexpr int N_TILE = 512;
 constexpr int N128_SUBTASK_TILE = 128;
 constexpr int N64_WGMMA_TILE = 64;
-constexpr int N128_SUBTASKS_PER_N256 = 2;
+constexpr int N128_SUBTASKS_PER_N256 = N_TILE / N128_SUBTASK_TILE;
 constexpr int W13_N128_COUNTERS = INTERMEDIATE_SIZE / N128_SUBTASK_TILE;
 constexpr int W2_N128_EQUIVALENTS = HIDDEN_SIZE / N128_SUBTASK_TILE;
 constexpr int W13_CLUSTER_TASKS = INTERMEDIATE_SIZE / N_TILE;
@@ -43,18 +43,18 @@ static_assert(EP_SIZE == 4, "terminal specialization freezes EP4");
 static_assert(CLUSTER_CTAS == 2, "terminal specialization freezes cluster2");
 static_assert(THREADS_PER_CTA == 128,
               "terminal specialization freezes 128 threads per CTA");
-static_assert(M_TILE == 64 && N_TILE == 256,
-              "terminal specialization freezes M64/N256 logical tasks");
-static_assert(N128_SUBTASKS_PER_N256 == 2,
-              "each N256 ticket must execute two sequential N128 subtiles");
+static_assert(M_TILE == 64 && N_TILE == 512,
+              "terminal specialization freezes M64/N512 logical tasks (lcc coarsen)");
+static_assert(N128_SUBTASKS_PER_N256 == 4,
+              "each N512 ticket must execute four sequential N128 subtiles");
 static_assert(W13_N128_COUNTERS == 16 && W2_N128_EQUIVALENTS == 32,
               "legacy N128 readiness cardinality changed");
-static_assert(W13_CLUSTER_TASKS == 8 && W2_CLUSTER_TASKS == 16,
-              "cluster-level N256 ticket counts changed");
+static_assert(W13_CLUSTER_TASKS == 4 && W2_CLUSTER_TASKS == 8,
+              "cluster-level N512 ticket counts changed");
 static_assert(W13_N64_SUBTILES == 32 && W2_N64_SUBTILES == 64,
               "CTA-level N64 subtile counts changed");
-static_assert(TASKS_PER_M64 == 33,
-              "terminal specialization must expose 33 cluster tasks/M64");
+static_assert(TASKS_PER_M64 == 17,
+              "terminal specialization must expose 17 cluster tasks/M64 (lcc coarsen)");
 static_assert(N64_SUBTILES_PER_M64 == 128,
               "expanded CTA N64 subtile cardinality changed");
 static_assert(COMM_ROWS_PER_CTA_TASK == 4
