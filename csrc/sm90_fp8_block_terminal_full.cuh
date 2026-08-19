@@ -65,7 +65,7 @@ constexpr unsigned int COMM_CONTROL_CLOSES_M64 = 1u << 31;
 // work cadence; otherwise ticket compression would accidentally halve reduce
 // overlap in addition to removing cursor/task boundaries.  Cursor exhaustion
 // and the communication-role drain remain exhaustive.
-constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 1u;
+constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 4u;
 
 // Production fatal record uses the same two-phase host-mapped protocol as
 // K1: slot 0 is first claimed with ~0ull, slots 1..7 are populated, then the
@@ -401,9 +401,9 @@ __device__ void production_completion_epilogue(
             const unsigned int released = 0u;
             asm volatile("{st.release.gpu.global.u32 [%0], %1;}" ::
                          "l"(g.in_use), "r"(released) : "memory");
-            printf("LCC_PROF body=%llu total=%llu comm_total=%llu "
+            printf("LCC_PROF body=%llu wait=%llu total=%llu comm_total=%llu "
                    "ncomp=%d ncomm=%d\n",
-                   g_prof_body, g_prof_total, g_prof_comm_total,
+                   g_prof_body, g_prof_wait, g_prof_total, g_prof_comm_total,
                    g.compute_clusters, g.comm_clusters);
         }
     }
@@ -1382,6 +1382,8 @@ __device__ void compute_and_reduce_role(
         if (coordinate.stage != terminal::logical_stage::activation) {
             if (cta_rank == 0 && threadIdx.x == 0)
                 leader_wait_windows = 0;
+            long long lcc_tw =
+                (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
             while (true) {
                 publish_producer_readiness(
                     g, coordinate, cta_rank,
@@ -1405,6 +1407,9 @@ __device__ void compute_and_reduce_role(
                         }
                         return;
                     }
+                    if (cta_rank == 0 && threadIdx.x == 0)
+                        atomicAdd(&g_prof_wait,
+                                  (unsigned long long)(clock64() - lcc_tw));
                     current_expert = producer.expert;
                     break;
                 }
