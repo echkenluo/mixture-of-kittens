@@ -65,7 +65,7 @@ constexpr unsigned int COMM_CONTROL_CLOSES_M64 = 1u << 31;
 // work cadence; otherwise ticket compression would accidentally halve reduce
 // overlap in addition to removing cursor/task boundaries.  Cursor exhaustion
 // and the communication-role drain remain exhaustive.
-constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 4u;
+constexpr unsigned int REDUCE_TASK_PROBE_STRIDE = 1u;
 
 // Production fatal record uses the same two-phase host-mapped protocol as
 // K1: slot 0 is first claimed with ~0ull, slots 1..7 are populated, then the
