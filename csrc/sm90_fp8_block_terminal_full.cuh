@@ -89,7 +89,8 @@ __device__ unsigned long long g_prof_total = 0ull;   // whole compute-role resid
 __device__ unsigned long long g_prof_body = 0ull;    // time inside run_producer_task_body (GEMM/act)
 __device__ unsigned long long g_prof_wait = 0ull;    // time in the dependency wait loop
 __device__ unsigned long long g_prof_comm_total = 0ull; // whole comm-role residency
-__device__ unsigned long long g_prof_comm_body = 0ull;  // time doing dispatch/combine copies
+__device__ unsigned long long g_prof_comm_dispatch = 0ull; // comm time in dispatch copy
+__device__ unsigned long long g_prof_comm_combine = 0ull;  // comm time in combine push
 #endif
 
 template <typename GemmProblem>
@@ -405,8 +406,9 @@ __device__ void production_completion_epilogue(
                          "l"(g.in_use), "r"(released) : "memory");
 #ifdef LCC_PROF
             printf("LCC_PROF body=%llu wait=%llu total=%llu comm_total=%llu "
-                   "ncomp=%d ncomm=%d\n",
+                   "comm_disp=%llu comm_comb=%llu ncomp=%d ncomm=%d\n",
                    g_prof_body, g_prof_wait, g_prof_total, g_prof_comm_total,
+                   g_prof_comm_dispatch, g_prof_comm_combine,
                    g.compute_clusters, g.comm_clusters);
 #endif
         }
@@ -850,10 +852,19 @@ __device__ void communication_role(
             comm_control & COMM_CONTROL_STAGE_MASK;
         if (comm_stage == static_cast<unsigned int>(
                 terminal::communication_stage::dispatch)) {
+#ifdef LCC_PROF
+            long long lcc_td =
+                (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
+#endif
             dispatch_tma::dispatch_ticket(
                 g, expert_row_end, first_row,
                 dispatch_tma_inputs_arrived, dispatch_tma_phasebits,
                 dispatch_tma_smem_base);
+#ifdef LCC_PROF
+            if (cta_rank == 0 && threadIdx.x == 0)
+                atomicAdd(&g_prof_comm_dispatch,
+                          (unsigned long long)(clock64() - lcc_td));
+#endif
             // Each warp's lane zero issued and fully drained one complete row.
             // Its following device-release arrival publishes FP8, scale, and
             // m_indices together without changing the existing x_ready count.
@@ -1026,6 +1037,9 @@ __device__ void communication_role(
                 return;
         }
 
+#ifdef LCC_PROF
+        long long lcc_tk = (cta_rank == 0 && threadIdx.x == 0) ? clock64() : 0;
+#endif
         for (int local = warp;
              local < terminal::COMM_ROWS_PER_CTA_TASK;
              local += WARPS_PER_CTA) {
@@ -1055,6 +1069,11 @@ __device__ void communication_role(
                 && g.push_tile_cursor != nullptr)
             compute::add_release_gpu(g.push_tile_cursor, 1u);
         everyone::tma::cluster::sync();
+#ifdef LCC_PROF
+        if (cta_rank == 0 && threadIdx.x == 0)
+            atomicAdd(&g_prof_comm_combine,
+                      (unsigned long long)(clock64() - lcc_tk));
+#endif
         const bool closes_m64 =
             (comm_control & COMM_CONTROL_CLOSES_M64) != 0u;
         if (owner_help_enabled && closes_m64) {
