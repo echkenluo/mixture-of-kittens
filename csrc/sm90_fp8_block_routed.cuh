@@ -7,23 +7,59 @@
 // expert results back to the source rank/route slot.
 //
 // These kernels deliberately preserve the device-resident MoK schedule: they
-// never read num_tokens on the host.  Dispatch keeps its one-CTA-per-row launch
-// shape, but exits at the device-resident active-row count before touching the
-// unused capacity tail.  This preserves CUDA Graph replay and the copy kernel's
-// row parallelism without paying for unnecessary tail writes.
+// never read num_tokens on the host.  The default keeps the original
+// one-CTA-per-capacity-row launch.  The opt-in grid-stride path launches a
+// bounded multiple of one rank's route rows and lets each CTA consume more
+// than one scheduled row.  It preserves CUDA Graph replay and full-capacity
+// correctness without launching a CTA for every conservative tail row.
 #if defined(KITTENS_SM90)
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace mok_sm90::fp8_block_routed {
 
 constexpr int MAX_EP_SIZE = 64;
 constexpr int THREADS = 256;
+
+inline int route_grid_factor() {
+    static const int factor = [] {
+        const char *raw = std::getenv("MOK_SM90_ROUTE_GRID_FACTOR");
+        if (raw == nullptr || raw[0] == '\0')
+            return 0;
+        errno = 0;
+        char *end = nullptr;
+        const long value = std::strtol(raw, &end, 10);
+        TORCH_CHECK(
+            errno == 0 && end != raw && *end == '\0'
+                && value >= 1 && value <= MAX_EP_SIZE,
+            "MOK_SM90_ROUTE_GRID_FACTOR must be an integer in [1,64]");
+        return static_cast<int>(value);
+    }();
+    return factor;
+}
+
+inline int route_grid_blocks(int64_t schedule_capacity, int64_t base_rows) {
+    const int factor = route_grid_factor();
+    if (factor == 0)
+        return static_cast<int>(schedule_capacity);
+    TORCH_CHECK(base_rows > 0, "route-grid base rows must be positive");
+    const int64_t blocks = std::min(
+        schedule_capacity,
+        base_rows * static_cast<int64_t>(factor));
+    TORCH_CHECK(
+        blocks > 0 && blocks <= std::numeric_limits<int>::max(),
+        "route-grid block count is out of range");
+    return static_cast<int>(blocks);
+}
 
 struct dispatch_globals {
     const uint8_t *x_peer[MAX_EP_SIZE];
@@ -46,70 +82,68 @@ struct dispatch_globals {
 
 __global__ __launch_bounds__(THREADS, 1)
 void dispatch_kernel(const __grid_constant__ dispatch_globals g) {
-    const int row = blockIdx.x;
-    if (row >= g.schedule_capacity)
-        return;
     const int device_rows = g.num_tokens[0];
     const int valid_rows =
         device_rows < g.schedule_capacity ? device_rows : g.schedule_capacity;
-    if (row >= valid_rows)
-        return;
-    const int peer_rank = g.schedule_peer_rank[row];
-    const int peer_token_idx = g.schedule_peer_token_idx[row];
-    const bool valid = peer_rank >= 0 && peer_rank < g.ep_size
-                       && peer_token_idx >= 0
-                       && peer_token_idx < g.num_local_tokens * g.topk;
+    for (int row = blockIdx.x; row < valid_rows; row += gridDim.x) {
+        const int peer_rank = g.schedule_peer_rank[row];
+        const int peer_token_idx = g.schedule_peer_token_idx[row];
+        const bool valid = peer_rank >= 0 && peer_rank < g.ep_size
+                           && peer_token_idx >= 0
+                           && peer_token_idx < g.num_local_tokens * g.topk;
 
-    // hidden_size is K128 aligned, so every FP8 row is uint4 aligned.
-    const int fp8_vectors = g.hidden_size / static_cast<int>(sizeof(uint4));
-    auto *dst_vectors = reinterpret_cast<uint4 *>(g.routed_x)
-                        + static_cast<size_t>(row) * fp8_vectors;
-    const uint4 zero{0, 0, 0, 0};
-    if (valid) {
-        const int source_row = peer_token_idx / g.topk;
-        const auto *src_vectors =
-            reinterpret_cast<const uint4 *>(g.x_peer[peer_rank])
-            + static_cast<size_t>(source_row) * fp8_vectors;
-        for (int index = threadIdx.x; index < fp8_vectors;
-             index += blockDim.x)
-            dst_vectors[index] = src_vectors[index];
-    } else {
-        for (int index = threadIdx.x; index < fp8_vectors;
-             index += blockDim.x)
-            dst_vectors[index] = zero;
-    }
-
-    float *dst_scale = g.routed_x_scale
-                       + static_cast<size_t>(row) * g.scale_columns;
-    if (valid) {
-        const int source_row = peer_token_idx / g.topk;
-        const float *src_scale = g.x_scale_peer[peer_rank]
-                                 + static_cast<size_t>(source_row)
-                                       * g.scale_columns;
-        for (int index = threadIdx.x; index < g.scale_columns;
-             index += blockDim.x)
-            dst_scale[index] = src_scale[index];
-    } else {
-        for (int index = threadIdx.x; index < g.scale_columns;
-             index += blockDim.x)
-            dst_scale[index] = 0.0f;
-    }
-
-    if (threadIdx.x == 0) {
-        int expert = 0;
-        int offset = 0;
-        for (int candidate = 0; candidate < g.num_local_experts;
-             ++candidate) {
-            const int next = offset + g.tokens_per_expert[candidate];
-            if (row < next) {
-                expert = candidate;
-                break;
-            }
-            offset = next;
+        // hidden_size is K128 aligned, so every FP8 row is uint4 aligned.
+        const int fp8_vectors =
+            g.hidden_size / static_cast<int>(sizeof(uint4));
+        auto *dst_vectors = reinterpret_cast<uint4 *>(g.routed_x)
+                            + static_cast<size_t>(row) * fp8_vectors;
+        const uint4 zero{0, 0, 0, 0};
+        if (valid) {
+            const int source_row = peer_token_idx / g.topk;
+            const auto *src_vectors =
+                reinterpret_cast<const uint4 *>(g.x_peer[peer_rank])
+                + static_cast<size_t>(source_row) * fp8_vectors;
+            for (int index = threadIdx.x; index < fp8_vectors;
+                 index += blockDim.x)
+                dst_vectors[index] = src_vectors[index];
+        } else {
+            for (int index = threadIdx.x; index < fp8_vectors;
+                 index += blockDim.x)
+                dst_vectors[index] = zero;
         }
-        // Expert segments and active-row count are M64 aligned. Rows past
-        // valid_rows are never consumed by the dynamic grouped GEMM.
-        g.m_indices[row] = expert;
+
+        float *dst_scale = g.routed_x_scale
+                           + static_cast<size_t>(row) * g.scale_columns;
+        if (valid) {
+            const int source_row = peer_token_idx / g.topk;
+            const float *src_scale = g.x_scale_peer[peer_rank]
+                                     + static_cast<size_t>(source_row)
+                                           * g.scale_columns;
+            for (int index = threadIdx.x; index < g.scale_columns;
+                 index += blockDim.x)
+                dst_scale[index] = src_scale[index];
+        } else {
+            for (int index = threadIdx.x; index < g.scale_columns;
+                 index += blockDim.x)
+                dst_scale[index] = 0.0f;
+        }
+
+        if (threadIdx.x == 0) {
+            int expert = 0;
+            int offset = 0;
+            for (int candidate = 0; candidate < g.num_local_experts;
+                 ++candidate) {
+                const int next = offset + g.tokens_per_expert[candidate];
+                if (row < next) {
+                    expert = candidate;
+                    break;
+                }
+                offset = next;
+            }
+            // Expert segments and active-row count are M64 aligned. Rows past
+            // valid_rows are never consumed by the dynamic grouped GEMM.
+            g.m_indices[row] = expert;
+        }
     }
 }
 
@@ -135,10 +169,11 @@ struct combine_globals {
 
 __global__ __launch_bounds__(THREADS, 1)
 void combine_kernel(const __grid_constant__ combine_globals g) {
-    const int row = blockIdx.x;
-    const bool in_range = row < g.schedule_capacity && row < g.num_tokens[0];
     bool wrote_peer = false;
-    if (in_range) {
+    const int device_rows = g.num_tokens[0];
+    const int valid_rows =
+        device_rows < g.schedule_capacity ? device_rows : g.schedule_capacity;
+    for (int row = blockIdx.x; row < valid_rows; row += gridDim.x) {
         const int peer_rank = g.schedule_peer_rank[row];
         const int peer_token_idx = g.schedule_peer_token_idx[row];
         if (peer_rank >= 0 && peer_rank < g.ep_size && peer_token_idx >= 0
@@ -341,7 +376,9 @@ inline void dispatch_out(
     globals.schedule_capacity = static_cast<int>(schedule_capacity);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
-    dispatch_kernel<<<schedule_capacity, THREADS, 0, stream>>>(globals);
+    const int grid_blocks = route_grid_blocks(
+        schedule_capacity, num_local_tokens * topk);
+    dispatch_kernel<<<grid_blocks, THREADS, 0, stream>>>(globals);
     CUDACHECK(cudaGetLastError());
 }
 
@@ -410,7 +447,9 @@ inline void combine_out(
     c10::cuda::CUDAGuard device_guard(routed_y.device());
     cudaStream_t stream =
         at::cuda::getCurrentCUDAStream(routed_y.get_device());
-    combine_kernel<<<schedule_capacity, THREADS, 0, stream>>>(globals);
+    const int grid_blocks = route_grid_blocks(
+        schedule_capacity, combine_buffer.size(0));
+    combine_kernel<<<grid_blocks, THREADS, 0, stream>>>(globals);
     CUDACHECK(cudaGetLastError());
 }
 
