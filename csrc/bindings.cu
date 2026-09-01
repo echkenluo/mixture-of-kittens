@@ -3,6 +3,7 @@
 #include "scheduler.cuh"
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
+#include "sm90_fp8_block_tail_test.cuh"
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
@@ -81,6 +82,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     #if defined(KITTENS_SM90)
     m.def("sm90_worker_test", &mok_sm90::wtest::entry, "");
     m.def("sm90_fp8_block_test", &mok_sm90::fp8_block_test::entry, "");
+    m.def("sm90_fp8_block_tail_test",
+          &mok_sm90::fp8_block_tail_test::entry, "");
     m.def("sm90_fp8_block_grouped_test",
           &mok_sm90::fp8_block_test::grouped::entry, "");
     m.def("sm90_fp8_block_grouped_pipelined_test",

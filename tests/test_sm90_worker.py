@@ -15,6 +15,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "sm90_fp8_block_test"), (
         "SM90 build did not register sm90_fp8_block_test"
     )
+    assert hasattr(_C, "sm90_fp8_block_tail_test"), (
+        "SM90 build did not register sm90_fp8_block_tail_test"
+    )
     assert hasattr(_C, "sm90_fp8_block_grouped_test"), (
         "SM90 build did not register sm90_fp8_block_grouped_test"
     )
@@ -741,6 +744,85 @@ def test_sm90_fp8_block_rejects_invalid_inputs(
         _C.sm90_fp8_block_test(a, b, a_scale, b_scale.view(1, 1))
     with pytest.raises(RuntimeError, match="float32"):
         _C.sm90_fp8_block_test(a, b, a_scale.bfloat16(), b_scale)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(16, 128, 128), (32, 256, 4096)])
+@pytest.mark.parametrize("scaled", [False, True], ids=["unit-scale", "block-scale"])
+def test_sm90_fp8_block_tail_numeric(
+    context: tuple[int, int, torch.device],
+    m: int,
+    n: int,
+    k: int,
+    scaled: bool,
+) -> None:
+    rank, _, device = context
+    require_sm90(device)
+
+    stream = torch.cuda.Stream(device=device)
+    generator = torch.Generator(device=device).manual_seed(
+        20260901 + 100 * rank + m + n + k + int(scaled)
+    )
+    k_blocks = k // 128
+    with torch.cuda.stream(stream):
+        a = torch.randn((m, k), generator=generator, device=device).clamp(-3, 3)
+        b = torch.randn((n, k), generator=generator, device=device).clamp(-3, 3)
+        a = a.to(torch.float8_e4m3fn)
+        b = b.to(torch.float8_e4m3fn)
+        if scaled:
+            a_scale = (
+                torch.rand((m, k_blocks), generator=generator, device=device)
+                * 0.09
+                + 0.01
+            )
+            b_scale = (
+                torch.rand(
+                    (n // 128, k_blocks), generator=generator, device=device
+                )
+                * 0.09
+                + 0.01
+            )
+        else:
+            a_scale = torch.ones((m, k_blocks), device=device)
+            b_scale = torch.ones((n // 128, k_blocks), device=device)
+
+        actual = _C.sm90_fp8_block_tail_test(a, b, a_scale, b_scale)
+        reference = torch.zeros((m, n), device=device, dtype=torch.float32)
+        for kb in range(k_blocks):
+            sl = slice(kb * 128, (kb + 1) * 128)
+            partial = a[:, sl].float() @ b[:, sl].float().T
+            n_scale = b_scale[:, kb].repeat_interleave(128)
+            reference.add_(partial * a_scale[:, kb, None] * n_scale[None, :])
+        reference = reference.to(torch.bfloat16)
+    stream.synchronize()
+
+    assert actual.dtype == torch.bfloat16
+    assert actual.shape == (m, n)
+    assert torch.isfinite(actual).all()
+    abs_error = (actual.float() - reference.float()).abs()
+    max_rel = abs_error.max() / reference.float().abs().max().clamp_min(1e-6)
+    assert max_rel.item() < 0.025, f"max_rel={max_rel.item():.6f}"
+
+
+def test_sm90_fp8_block_tail_rejects_invalid_inputs(
+    context: tuple[int, int, torch.device]
+) -> None:
+    _, _, device = context
+    require_sm90(device)
+    a = torch.ones((16, 128), device=device).to(torch.float8_e4m3fn)
+    b = torch.ones((128, 128), device=device).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((16, 1), device=device)
+    b_scale = torch.ones((1, 1), device=device)
+
+    with pytest.raises(RuntimeError, match="M in"):
+        _C.sm90_fp8_block_tail_test(a[:8], b, a_scale[:8], b_scale)
+    with pytest.raises(RuntimeError, match="B N"):
+        _C.sm90_fp8_block_tail_test(a, b[:64].contiguous(), a_scale, b_scale)
+    with pytest.raises(RuntimeError, match="K must"):
+        _C.sm90_fp8_block_tail_test(
+            a[:, :64].contiguous(), b[:, :64].contiguous(), a_scale, b_scale
+        )
+    with pytest.raises(RuntimeError, match="B_scale must have shape"):
+        _C.sm90_fp8_block_tail_test(a, b, a_scale, b_scale[:, :0])
 
 
 @pytest.mark.parametrize(
