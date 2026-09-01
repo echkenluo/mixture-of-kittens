@@ -7,6 +7,7 @@
 // contract.
 #if defined(KITTENS_SM90)
 #include "pyutils/torchutils.cuh"
+#include <ATen/ops/empty.h>
 
 namespace mok_sm90::fp8_block_tail_test {
 using namespace kittens;
