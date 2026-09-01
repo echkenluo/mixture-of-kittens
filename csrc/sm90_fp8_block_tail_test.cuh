@@ -6,7 +6,7 @@
 // before accumulation so the arithmetic matches DeepSeek's block-scaled FP8
 // contract.
 #if defined(KITTENS_SM90)
-#include <ATen/ATen.h>
+#include "pyutils/torchutils.cuh"
 
 namespace mok_sm90::fp8_block_tail_test {
 using namespace kittens;
