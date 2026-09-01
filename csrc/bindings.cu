@@ -84,6 +84,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sm90_fp8_block_test", &mok_sm90::fp8_block_test::entry, "");
     m.def("sm90_fp8_block_tail_test",
           &mok_sm90::fp8_block_tail_test::entry, "");
+    m.def("sm90_fp8_block_tail_out_test",
+          &mok_sm90::fp8_block_tail_test::entry_out, "");
     m.def("sm90_fp8_block_grouped_test",
           &mok_sm90::fp8_block_test::grouped::entry, "");
     m.def("sm90_fp8_block_grouped_pipelined_test",

@@ -84,8 +84,9 @@ void kernel(const __grid_constant__ globals g) {
     warp::store(g.D, d_smem, {m_tile, n_tile});
 }
 
-inline at::Tensor entry(at::Tensor A, at::Tensor B,
-                        at::Tensor A_scale, at::Tensor B_scale) {
+inline void entry_out(at::Tensor A, at::Tensor B,
+                      at::Tensor A_scale, at::Tensor B_scale,
+                      at::Tensor D) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
                 "A and B must be rank-2 tensors");
     kittens::py::tensor_check<a_gl>(A);
@@ -118,9 +119,13 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B,
     TORCH_CHECK(B_scale.dim() == 2 && B_scale.size(0) == n / 128
                     && B_scale.size(1) == k_blocks,
                 "B_scale must have shape [N/128,K/128]");
+    TORCH_CHECK(D.is_cuda() && D.device() == A.device()
+                    && D.scalar_type() == at::ScalarType::BFloat16
+                    && D.is_contiguous() && D.dim() == 2
+                    && D.size(0) == m && D.size(1) == n,
+                "D must be contiguous CUDA bfloat16 [M,N]");
 
     c10::cuda::CUDAGuard device_guard(A.device());
-    auto D = at::empty({m, n}, A.options().dtype(at::ScalarType::BFloat16));
     const int n_tiles = n / 64;
     globals g{
         kittens::py::tensor_to_gl<a_gl>(A),
@@ -135,6 +140,14 @@ inline at::Tensor entry(at::Tensor A, at::Tensor B,
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
     kernel<<<m / 16 * n_tiles, 32, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());
+}
+
+inline at::Tensor entry(at::Tensor A, at::Tensor B,
+                        at::Tensor A_scale, at::Tensor B_scale) {
+    auto D = at::empty(
+        {A.size(0), B.size(0)},
+        A.options().dtype(at::ScalarType::BFloat16));
+    entry_out(A, B, A_scale, B_scale, D);
     return D;
 }
 

@@ -18,6 +18,9 @@ def require_sm90(device: torch.device) -> None:
     assert hasattr(_C, "sm90_fp8_block_tail_test"), (
         "SM90 build did not register sm90_fp8_block_tail_test"
     )
+    assert hasattr(_C, "sm90_fp8_block_tail_out_test"), (
+        "SM90 build did not register sm90_fp8_block_tail_out_test"
+    )
     assert hasattr(_C, "sm90_fp8_block_grouped_test"), (
         "SM90 build did not register sm90_fp8_block_grouped_test"
     )
@@ -786,6 +789,8 @@ def test_sm90_fp8_block_tail_numeric(
             b_scale = torch.ones((n // 128, k_blocks), device=device)
 
         actual = _C.sm90_fp8_block_tail_test(a, b, a_scale, b_scale)
+        actual_out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+        _C.sm90_fp8_block_tail_out_test(a, b, a_scale, b_scale, actual_out)
         reference = torch.zeros((m, n), device=device, dtype=torch.float32)
         for kb in range(k_blocks):
             sl = slice(kb * 128, (kb + 1) * 128)
@@ -797,6 +802,7 @@ def test_sm90_fp8_block_tail_numeric(
 
     assert actual.dtype == torch.bfloat16
     assert actual.shape == (m, n)
+    torch.testing.assert_close(actual_out, actual, rtol=0, atol=0)
     assert torch.isfinite(actual).all()
     abs_error = (actual.float() - reference.float()).abs()
     max_rel = abs_error.max() / reference.float().abs().max().clamp_min(1e-6)
