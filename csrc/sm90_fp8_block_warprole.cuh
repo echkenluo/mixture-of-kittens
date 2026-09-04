@@ -12,6 +12,7 @@
 // three counters plus the ring barriers inside the CTA.  Every wait is bounded
 // by spin_limit and traps through the shared trap record.
 #if defined(KITTENS_SM90)
+#include <cstdlib>
 #include <ATen/ATen.h>
 
 #include <vector>
@@ -61,6 +62,12 @@ struct globals {
     unsigned int *input_expected_scratch = nullptr;
     unsigned long long *trap_record = nullptr;
     unsigned long long spin_limit = 0;
+    // Benchmark-only knobs (MOK_WARPROLE_NO_DEPS / MOK_WARPROLE_COMM_OFF /
+    // MOK_WARPROLE_REDUCE_OFF): skip every dependency wait, make the comm warpgroup
+    // idle, skip the phase-5 weighted reduce.  Output is garbage when any is set.
+    int skip_waits = 0;
+    int comm_off = 0;
+    int reduce_off = 0;
 
     // kittens::gl has no default constructor: the five TMA-described tensors come first.
     __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13, const gemm::b_gl &w2_,
@@ -78,6 +85,7 @@ __device__ __forceinline__ void trap(const globals &g, unsigned long long code, 
 template <bool SYS>
 __device__ __forceinline__ void wait_geq_or_trap(const globals &g, const unsigned int *ctr, unsigned int target,
                                                  unsigned long long site, unsigned long long slot) {
+    if (g.skip_waits) return;   // MOK_WARPROLE_NO_DEPS: benchmark-only, no ordering guarantee
     unsigned long long iters = 0;
     while (true) {
         const unsigned int v = SYS ? comm::load_acquire_sys(ctr) : comm::load_acquire_gpu(ctr);
@@ -140,16 +148,18 @@ void kernel(const __grid_constant__ globals g) {
     if (role == NC + 1) {
         // ------------------------------------------------ comm warpgroup
         warpgroup::decrease_registers<gemm::comm_regs<1>()>();
-        rank_barrier(g);
-        for (int q = 0; q < minibatches(s); ++q) comm::dispatch_minibatch(g.c, s, q, expert_row_end);
-        for (int m = blockIdx.x; m < m_tiles; m += gridDim.x) {
-            if (warpgroup::laneid() == 0)
-                wait_geq_or_trap<false>(g, g.c.y_ready + m, static_cast<unsigned int>(y_ready_target<NC>()),
-                                        SITE_WARPROLE_Y_READY, m);
-            warpgroup::sync(7);
-            comm::combine_tile(g.c, m);
+        if (!g.comm_off) {   // MOK_WARPROLE_COMM_OFF: benchmark-only, the warpgroup idles
+            rank_barrier(g);
+            for (int q = 0; q < minibatches(s); ++q) comm::dispatch_minibatch(g.c, s, q, expert_row_end);
+            for (int m = blockIdx.x; m < m_tiles; m += gridDim.x) {
+                if (warpgroup::laneid() == 0)
+                    wait_geq_or_trap<false>(g, g.c.y_ready + m, static_cast<unsigned int>(y_ready_target<NC>()),
+                                            SITE_WARPROLE_Y_READY, m);
+                warpgroup::sync(7);
+                comm::combine_tile(g.c, m);
+            }
+            comm::combine_finish(g.c);
         }
-        comm::combine_finish(g.c);
     } else if (role == NC) {
         // ------------------------------------------------ producer warpgroup
         warpgroup::decrease_registers<gemm::producer_regs<1>()>();
@@ -233,10 +243,11 @@ void kernel(const __grid_constant__ globals g) {
     if (threadIdx.x == 0)
         wait_geq_or_trap<true>(g, g.c.push_done, static_cast<unsigned int>(g.c.ep_size), SITE_WARPROLE_PUSH_DONE, 0);
     asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
+    if (!g.reduce_off)   // MOK_WARPROLE_REDUCE_OFF: benchmark-only
     for (int token = blockIdx.x; token < g.c.num_local_tokens; token += gridDim.x)
         route_flags::reduce_claimed_token(g.combine_local, g.weights, g.topk_ids, g.output, token, HIDDEN,
                                           threadIdx.x, 128 * NC);
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && !g.skip_waits) {
         // Contract closure: every counter must have landed exactly on its target.
         for (int q = 0; q < minibatches(s); ++q) {
             const unsigned int v = comm::load_acquire_gpu(g.c.x_ready + q);
@@ -305,6 +316,12 @@ inline void entry_prepare_out(at::Tensor x_ready, at::Tensor hidden_ready, at::T
 // ---------------------------------------------------------------------------
 // forward entry
 // ---------------------------------------------------------------------------
+// "1" enables a benchmark-only knob; anything else (including unset) leaves it off.
+inline int env_flag(const char *name) {
+    const char *v = std::getenv(name);
+    return (v != nullptr && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+}
+
 template <int NC, int STAGES>
 inline void entry_out(
         at::Tensor x, std::vector<int64_t> x_ptrs, at::Tensor x_scale, std::vector<int64_t> x_scale_ptrs,
@@ -392,6 +409,13 @@ inline void entry_out(
     g.input_expected_scratch = u32_ptr(input_expected_scratch);
     g.trap_record = utils::mok_resolve_trap_record(trap_record_ptr);
     g.spin_limit = static_cast<unsigned long long>(spin_limit);
+    g.skip_waits = env_flag("MOK_WARPROLE_NO_DEPS");
+    g.comm_off = env_flag("MOK_WARPROLE_COMM_OFF");
+    g.reduce_off = env_flag("MOK_WARPROLE_REDUCE_OFF");
+    TORCH_CHECK(!g.comm_off || g.skip_waits,
+                "MOK_WARPROLE_COMM_OFF=1 requires MOK_WARPROLE_NO_DEPS=1: without dispatch the GEMM roles would wait forever");
+    TORCH_CHECK(!g.reduce_off || g.skip_waits,
+                "MOK_WARPROLE_REDUCE_OFF=1 requires MOK_WARPROLE_NO_DEPS=1: it is a benchmark-only knob");
 
     constexpr int SMEM = sizeof(gemm::smem_layout<NC, STAGES>) + 1024;
     constexpr int THREADS = gemm::num_threads<NC>();
