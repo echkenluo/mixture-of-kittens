@@ -10,6 +10,13 @@ reported as a performance result.
 The 766-token cell uses a 768-token graph bucket but keeps exactly 766*6 valid
 routes.  Both counts are emitted so bucket work is never mislabeled as useful
 token throughput.
+
+``--candidate warprole`` swaps the measured arm for the warp-role megakernel
+(``mok.warprole.warprole_forward``) and leaves everything else -- the split and
+K1/K2 baselines, the A/B/A order, the bitwise gate, the A/A drift limit, the
+timing method and the frozen provenance -- exactly as it is for terminal.  The
+default is ``terminal``, so an invocation that does not pass the flag runs the
+benchmark it has always run.
 """
 
 from __future__ import annotations
@@ -47,6 +54,11 @@ from mok.functional import (
     megakernel_fp8_block,
     release_workspace_lease,
 )
+from mok.warprole import (
+    clear_warprole_state_cache,
+    get_warprole_state,
+    warprole_forward,
+)
 from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
 
 
@@ -59,6 +71,17 @@ M_TILE = 64
 LOGICAL_TASKS_PER_M64 = 33
 DEFAULT_TOKENS = (128, 766, 2048)
 DEFAULT_BASELINES = ("split", "k1k2")
+CANDIDATES = ("terminal", "warprole")
+WARPROLE_VARIANTS = ("c1s6", "c2s4")
+# Benchmark-only knobs read by csrc/sm90_fp8_block_warprole.cuh on every call.
+# NO_DEPS skips every dependency wait, COMM_OFF idles the comm warpgroup and
+# REDUCE_OFF skips the weighted reduce; each of the latter two requires the
+# first.  Any of them makes the megakernel output garbage.
+WARPROLE_KNOB_NAMES = (
+    "MOK_WARPROLE_NO_DEPS",
+    "MOK_WARPROLE_COMM_OFF",
+    "MOK_WARPROLE_REDUCE_OFF",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +98,10 @@ class PipelineRunners:
     terminal: Callable[[], torch.Tensor]
     split: Callable[[], torch.Tensor]
     k1k2: Callable[[], torch.Tensor]
+    # Present on every run so the candidate can be resolved with one getattr,
+    # but its launch state is only built when --candidate warprole asked for
+    # it; calling it otherwise raises instead of measuring something else.
+    warprole: Callable[[], torch.Tensor]
     calls: dict[str, int]
 
 
@@ -82,6 +109,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", default="128,766,2048")
     parser.add_argument("--baselines", default="split,k1k2")
+    parser.add_argument(
+        "--candidate",
+        default="terminal",
+        choices=CANDIDATES,
+        help="which arm is measured against the baselines",
+    )
+    parser.add_argument(
+        "--warprole-variant",
+        default="c2s4",
+        choices=WARPROLE_VARIANTS,
+        help="consumer/stage shape of the warp-role megakernel",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--aba-drift-limit", type=float, default=0.05)
@@ -172,6 +211,25 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def warprole_knobs() -> dict[str, str]:
+    """The three benchmark-only environment knobs, as this process sees them."""
+    return {
+        name: os.environ.get(name, "unset") for name in WARPROLE_KNOB_NAMES
+    }
+
+
+def warprole_output_is_garbage() -> bool:
+    """True when a knob is on and the megakernel output must not be gated.
+
+    ``MOK_WARPROLE_NO_DEPS`` is the one that matters: the other two knobs are
+    refused by the C++ entry unless it is set, so it is on whenever any of them
+    is.  The comparison against "1" is the same one ``env_flag`` makes in
+    csrc/sm90_fp8_block_warprole.cuh, so this cannot disable the gate for a
+    value the kernel would have ignored.
+    """
+    return os.environ.get("MOK_WARPROLE_NO_DEPS") == "1"
+
+
 def repository_state() -> tuple[pathlib.Path, str, list[str]]:
     repo = pathlib.Path(__file__).resolve().parents[1]
     # The benchmark runs as container root against a host-owned bind mount.
@@ -243,6 +301,11 @@ def validate_provenance(args: argparse.Namespace) -> dict:
         "fp8_block_grouped_contiguous_dynamic_out",
         "fp8_block_routed_combine_reduce_out",
     )
+    if args.candidate == "warprole":
+        required_apis += (
+            "fp8_block_warprole_prepare_out",
+            f"fp8_block_warprole_{args.warprole_variant}_out",
+        )
     missing = [name for name in required_apis if not hasattr(_C, name)]
     if missing:
         raise RuntimeError(f"loaded extension lacks benchmark paths: {missing}")
@@ -547,7 +610,22 @@ def make_runners(
         )
         for name in ("terminal", "split", "k1k2")
     }
-    calls = {name: 0 for name in outputs}
+    # The warp-role arm writes into the output its own launch state owns, so it
+    # has no entry in `outputs`; it still needs a call counter for the receipt.
+    calls = {name: 0 for name in (*outputs, "warprole")}
+    # Built here, once per token case, because creating it rendezvouses
+    # symmetric memory and barriers across the four ranks -- work that must
+    # never land inside a timed region.
+    warprole_state = (
+        get_warprole_state(
+            route_workspace,
+            dist.group.WORLD,
+            device=device,
+            capacity=route_workspace.schedule_capacity,
+        )
+        if args.candidate == "warprole"
+        else None
+    )
 
     def run_terminal() -> torch.Tensor:
         calls["terminal"] += 1
@@ -636,6 +714,26 @@ def make_runners(
             output=outputs["k1k2"],
         )
 
+    def run_warprole() -> torch.Tensor:
+        calls["warprole"] += 1
+        return warprole_forward(
+            route_workspace,
+            warprole_state,
+            schedule,
+            x,
+            x_scale,
+            topk_weights,
+            topk_ids,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            variant=args.warprole_variant,
+            # The limit activate() passes to the split arm's SGLang kernel.
+            swiglu_limit=10.0,
+            spin_limit=args.spin_limit,
+        )
+
     tensors = {
         "x": x,
         "x_scale": x_scale,
@@ -648,7 +746,9 @@ def make_runners(
         **outputs,
     }
     return (
-        PipelineRunners(run_terminal, run_split, run_k1k2, calls),
+        PipelineRunners(
+            run_terminal, run_split, run_k1k2, run_warprole, calls
+        ),
         terminal_workspace,
         route_workspace,
         tensors,
@@ -781,15 +881,15 @@ def summarize(samples: list[float], cell: Cell) -> dict:
 
 
 def warm_aba(
-    terminal: Callable[[], torch.Tensor],
+    candidate: Callable[[], torch.Tensor],
     baseline: Callable[[], torch.Tensor],
     iterations: int,
     device: torch.device,
 ) -> None:
     for _ in range(iterations):
-        terminal()
+        candidate()
         baseline()
-        terminal()
+        candidate()
     torch.cuda.synchronize(device)
 
 
@@ -809,18 +909,22 @@ def measure_aba(
                 flush=True,
             )
 
+    # The candidate arm keeps the "terminal" key names when it is terminal, so
+    # a default run writes exactly the JSON it wrote before the switch existed.
+    candidate_name = args.candidate
+    candidate = getattr(runners, candidate_name)
     baseline = getattr(runners, baseline_name)
     before = dict(runners.calls)
-    warm_aba(runners.terminal, baseline, args.warmup, device)
+    warm_aba(candidate, baseline, args.warmup, device)
     receipt("warmup_end")
-    a1 = rank_max_event_samples(runners.terminal, args.iters, device)
-    receipt("terminal_a1_end")
+    a1 = rank_max_event_samples(candidate, args.iters, device)
+    receipt(f"{candidate_name}_a1_end")
     b = rank_max_event_samples(baseline, args.iters, device)
     receipt("baseline_end")
-    a2 = rank_max_event_samples(runners.terminal, args.iters, device)
-    receipt("terminal_a2_end")
+    a2 = rank_max_event_samples(candidate, args.iters, device)
+    receipt(f"{candidate_name}_a2_end")
     expected_delta = {
-        "terminal": 2 * (args.warmup + args.iters),
+        candidate_name: 2 * (args.warmup + args.iters),
         baseline_name: args.warmup + args.iters,
     }
     observed_delta = {
@@ -838,23 +942,25 @@ def measure_aba(
     drift = abs(a2_summary["p50_ms"] - a1_summary["p50_ms"]) / midpoint
     if drift > args.aba_drift_limit:
         raise RuntimeError(
-            f"terminal A/A drift {drift:.3%} exceeds "
+            f"{candidate_name} A/A drift {drift:.3%} exceeds "
             f"{args.aba_drift_limit:.3%} for {baseline_name}: "
             f"a1={a1_summary['p50_ms']:.6f} ms, "
             f"baseline={baseline_summary['p50_ms']:.6f} ms, "
             f"a2={a2_summary['p50_ms']:.6f} ms"
         )
-    terminal_p50 = midpoint
+    candidate_p50 = midpoint
     return {
-        "order": ["terminal_a1", baseline_name, "terminal_a2"],
+        "order": [
+            f"{candidate_name}_a1", baseline_name, f"{candidate_name}_a2"
+        ],
         "path_receipt": observed_delta,
-        "terminal_a1": a1_summary,
+        f"{candidate_name}_a1": a1_summary,
         baseline_name: baseline_summary,
-        "terminal_a2": a2_summary,
-        "terminal_aa_drift": drift,
-        "terminal_midpoint_p50_ms": terminal_p50,
-        "baseline_over_terminal_speedup": (
-            baseline_summary["p50_ms"] / terminal_p50
+        f"{candidate_name}_a2": a2_summary,
+        f"{candidate_name}_aa_drift": drift,
+        f"{candidate_name}_midpoint_p50_ms": candidate_p50,
+        f"baseline_over_{candidate_name}_speedup": (
+            baseline_summary["p50_ms"] / candidate_p50
         ),
     }
 
@@ -876,20 +982,31 @@ def benchmark_cell(
                 flush=True,
             )
 
+    candidate_name = args.candidate
     runners, terminal_workspace, route_workspace, tensors = make_runners(
         args, cell, rank, device, weights
     )
+
+    def assert_candidate_closed() -> None:
+        if candidate_name == "warprole":
+            # The warp-role path runs under the route workspace's lease and
+            # owns no counter block of its own; the terminal closure contract
+            # does not apply to it and the terminal arm never ran.
+            assert_route_closed(route_workspace, "warprole")
+        else:
+            assert_terminal_closed(terminal_workspace, cell)
+
     dist.barrier()
     stage("correctness_split_begin")
     split_output = runners.split()
     torch.cuda.synchronize(device)
     stage("correctness_split_end")
     assert_route_closed(route_workspace, "split")
-    stage("correctness_terminal_begin")
-    terminal_output = runners.terminal()
+    stage(f"correctness_{candidate_name}_begin")
+    candidate_output = getattr(runners, candidate_name)()
     torch.cuda.synchronize(device)
-    stage("correctness_terminal_end")
-    assert_terminal_closed(terminal_workspace, cell)
+    stage(f"correctness_{candidate_name}_end")
+    assert_candidate_closed()
     stage("correctness_k1k2_begin")
     k1k2_output = runners.k1k2()
     torch.cuda.synchronize(device)
@@ -899,9 +1016,30 @@ def benchmark_cell(
     # and its weights are zero, so backing combine rows may remain unspecified.
     # Exactness therefore applies to the effective token prefix only.
     effective = slice(0, cell.effective_tokens)
-    require_exact(
-        "terminal_vs_split", split_output[effective], terminal_output[effective]
-    )
+    if candidate_name == "warprole" and warprole_output_is_garbage():
+        # The knobs make the megakernel skip its dependency waits, so the
+        # output it produces is not the result of the pipeline and gating on it
+        # would fail for a reason that has nothing to do with the kernel.
+        candidate_correctness = "skipped (MOK_WARPROLE_NO_DEPS=1)"
+        if rank == 0:
+            print(
+                "TERMINAL_PRODUCTION_BENCH_GATE_SKIPPED|"
+                f"tokens={cell.effective_tokens}|warprole_vs_split=SKIPPED|"
+                + "|".join(
+                    f"{name}={value}"
+                    for name, value in warprole_knobs().items()
+                )
+                + "|the warprole output is garbage under these knobs and was "
+                "NOT compared against split",
+                flush=True,
+            )
+    else:
+        require_exact(
+            f"{candidate_name}_vs_split",
+            split_output[effective],
+            candidate_output[effective],
+        )
+        candidate_correctness = "bitwise_exact"
     require_exact(
         "k1k2_vs_split", split_output[effective], k1k2_output[effective]
     )
@@ -920,15 +1058,15 @@ def benchmark_cell(
                 f"|tokens={cell.effective_tokens}"
                 f"|Q={(cell.active_rows + args.macrobatch_rows - 1) // args.macrobatch_rows}"
                 f"|baseline={baseline}"
-                f"|terminal_ms="
-                f"{comparison['terminal_midpoint_p50_ms']:.6f}"
+                f"|{candidate_name}_ms="
+                f"{comparison[f'{candidate_name}_midpoint_p50_ms']:.6f}"
                 f"|baseline_ms={comparison[baseline]['p50_ms']:.6f}"
                 f"|speedup="
-                f"{comparison['baseline_over_terminal_speedup']:.6f}"
-                f"|aa_drift={comparison['terminal_aa_drift']:.6f}",
+                f"{comparison[f'baseline_over_{candidate_name}_speedup']:.6f}"
+                f"|aa_drift={comparison[f'{candidate_name}_aa_drift']:.6f}",
                 flush=True,
             )
-        assert_terminal_closed(terminal_workspace, cell)
+        assert_candidate_closed()
         assert_route_closed(route_workspace, baseline)
     result = {
         "effective_tokens": cell.effective_tokens,
@@ -948,16 +1086,20 @@ def benchmark_cell(
             ) // args.macrobatch_rows,
         },
         "correctness": {
-            "terminal_vs_split": "bitwise_exact",
+            f"{candidate_name}_vs_split": candidate_correctness,
             "k1k2_vs_split": "bitwise_exact",
             "scope": "effective_token_prefix",
         },
         "closure": "PASS",
+        "comparisons": comparisons,
+    }
+    if candidate_name == "terminal":
         # These counters are sampled only after every timed path and closure
         # check has completed.  They therefore add no work to the measured
         # region, while making scheduler overhead (especially bounded reducer
-        # probes that found no ready token) directly observable.
-        "scheduler_diagnostics": {
+        # probes that found no ready token) directly observable.  They describe
+        # the terminal megakernel, so a warp-role run does not report them.
+        result["scheduler_diagnostics"] = {
             "logical_tasks": (
                 cell.active_rows // M_TILE * LOGICAL_TASKS_PER_M64
             ),
@@ -965,14 +1107,19 @@ def benchmark_cell(
                 terminal_workspace.next_reduce_probe.item()
             ),
             "reduced_tokens": int(terminal_workspace.reduce_done.item()),
-        },
-        "comparisons": comparisons,
-    }
-    result["scheduler_diagnostics"]["probes_per_reduced_token"] = (
-        result["scheduler_diagnostics"]["reduce_probes"]
-        / max(1, result["scheduler_diagnostics"]["reduced_tokens"])
-    )
-    del split_output, terminal_output, k1k2_output
+        }
+        result["scheduler_diagnostics"]["probes_per_reduced_token"] = (
+            result["scheduler_diagnostics"]["reduce_probes"]
+            / max(1, result["scheduler_diagnostics"]["reduced_tokens"])
+        )
+    if candidate_name == "warprole":
+        # The state cache holds a strong reference to this cell's route
+        # workspace, so dropping it is what lets the cell's buffers and the
+        # interleaved W13 copy be freed below.  Every rank has finished its
+        # launches: the closure checks above each synchronized the device.
+        dist.barrier()
+        clear_warprole_state_cache()
+    del split_output, candidate_output, k1k2_output
     del runners, terminal_workspace, route_workspace, tensors
     gc.collect()
     torch.cuda.empty_cache()
@@ -1001,6 +1148,15 @@ def main() -> int:
             result = benchmark_cell(args, cell, rank, device, weights)
             cells.append(result)
             if rank == 0:
+                candidate_name = args.candidate
+                # The receipt carries a single bare token; the JSON keeps the
+                # full verdict string, including why a gate was skipped.
+                correctness = (
+                    "bitwise_exact"
+                    if result["correctness"][f"{candidate_name}_vs_split"]
+                    == "bitwise_exact"
+                    else "gate_skipped"
+                )
                 for baseline in args.baselines:
                     comparison = result["comparisons"][baseline]
                     print(
@@ -1009,17 +1165,20 @@ def main() -> int:
                         f"|bucket={cell.graph_tokens}"
                         f"|Q={(cell.active_rows + args.macrobatch_rows - 1) // args.macrobatch_rows}"
                         f"|baseline={baseline}"
-                        f"|terminal_ms={comparison['terminal_midpoint_p50_ms']:.6f}"
+                        f"|{candidate_name}_ms={comparison[f'{candidate_name}_midpoint_p50_ms']:.6f}"
                         f"|baseline_ms={comparison[baseline]['p50_ms']:.6f}"
-                        f"|speedup={comparison['baseline_over_terminal_speedup']:.6f}"
-                        f"|aa_drift={comparison['terminal_aa_drift']:.6f}"
-                        "|correctness=bitwise_exact|closure=PASS",
+                        f"|speedup={comparison[f'baseline_over_{candidate_name}_speedup']:.6f}"
+                        f"|aa_drift={comparison[f'{candidate_name}_aa_drift']:.6f}"
+                        f"|correctness={correctness}|closure=PASS",
                         flush=True,
                     )
         record = {
             "schema": "mok-terminal-production-benchmark-v1",
             "formal": not args.smoke,
             "hardware": "H20-SM90",
+            "candidate": args.candidate,
+            "warprole_variant": args.warprole_variant,
+            "warprole_knobs": warprole_knobs(),
             "shape": {
                 "ep_size": EP_SIZE,
                 "hidden": HIDDEN,
