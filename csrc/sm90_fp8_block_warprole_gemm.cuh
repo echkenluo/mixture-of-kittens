@@ -90,6 +90,27 @@ __device__ __forceinline__ void producer_task(
     }
 }
 
+// total += partial with the FP32 adds spelled as __fadd_rn.  The split GEMM
+// (fp8_block_pipeline::run_tile) compiles its per-row scale multiply and the
+// accumulate to FMUL then FADD; with a plain `warpgroup::add` here ptxas fused
+// this loop's pair into FFMA (SASS: 64 FFMA, 0 FADD) and the outputs differed
+// from split in ~0.008% of bf16 elements.  _rn intrinsics are never contracted.
+__device__ __forceinline__ void accumulate_rn(acc_rt &total, const acc_rt &partial) {
+#pragma unroll
+    for (int i = 0; i < acc_rt::height; ++i) {
+#pragma unroll
+        for (int j = 0; j < acc_rt::width; ++j) {
+#pragma unroll
+            for (int k = 0; k < acc_rt::packed_per_tile; ++k) {
+                float2 &t = total.tiles[i][j].data[k];
+                const float2 &q = partial.tiles[i][j].data[k];
+                t.x = __fadd_rn(t.x, q.x);
+                t.y = __fadd_rn(t.y, q.y);
+            }
+        }
+    }
+}
+
 // Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
 // in `total`, scaled per K128 block exactly like fp8_block_pipeline::run_tile.
 // `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
@@ -122,7 +143,7 @@ __device__ __forceinline__ void consumer_task(
     for (int kb = 1; kb < k_blocks; ++kb) {
         acc_rt partial;
         block(kb, partial);
-        warpgroup::add(total, total, partial);
+        accumulate_rn(total, partial);
     }
 }
 
