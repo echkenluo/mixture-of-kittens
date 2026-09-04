@@ -3,6 +3,7 @@
 #include "scheduler.cuh"
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
+#include "sm90_fp8_block_warprole_gemm.cuh"
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
@@ -102,6 +103,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("m_indices"), pybind11::arg("output"));
     m.def("fp8_block_grouped_contiguous_dynamic_out",
           &mok_sm90::fp8_block_test::contiguous::entry_pipelined_dynamic_out,
+          "", pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("output"));
+    m.def("fp8_block_warprole_gemm_c1s6_out",
+          &mok_sm90::warprole::gemm::standalone::entry_out<1, 6, 1>,
+          "", pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("output"));
+    m.def("fp8_block_warprole_gemm_c2s4_out",
+          &mok_sm90::warprole::gemm::standalone::entry_out<2, 4, 1>,
+          "", pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("output"));
+    m.def("fp8_block_warprole_gemm_c1s3x2_out",
+          &mok_sm90::warprole::gemm::standalone::entry_out<1, 3, 2>,
           "", pybind11::arg("input"), pybind11::arg("weight"),
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
