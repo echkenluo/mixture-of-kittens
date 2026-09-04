@@ -37,6 +37,12 @@ def _sglang_activation():
     except ImportError:
         pass
     try:
+        # SGLang 0.5.17 (image a8-base-cu130): no token count, so pass row slices.
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
+        return silu_and_mul_contig_post_quant, "contig"
+    except ImportError:
+        pass
+    try:
         from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
         return silu_and_mul_contig_post_quant, "static"
     except ImportError:
@@ -70,6 +76,9 @@ def reference(device, a, w13, a_scale, w13_scale, m_indices, total_m, num_tokens
         activation(input=gate_up, output=hidden, output_scale=scale, active_tokens=num_tokens,
                    quant_group_size=128, scale_ue8m0=False, transposed=False,
                    swiglu_limit=SWIGLU_LIMIT, swizzle=False)
+    elif kind == "contig":
+        n = int(num_tokens.item())
+        activation(gate_up[:n], hidden[:n], scale[:n], 128, False, False, SWIGLU_LIMIT, False)
     else:
         activation(gate_up, hidden, scale, int(num_tokens.item()), 128, False, False,
                    SWIGLU_LIMIT, False)
