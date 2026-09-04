@@ -139,15 +139,20 @@ namespace bench {
 constexpr int NC = 1, STAGES = 6, CTAS_PER_SM = 1;
 using gemm_smem = gemm::smem_layout<NC, STAGES>;
 
-struct globals {
+// kittens::gl has no default constructor, so the GEMM problem only travels in
+// the mode-2 parameter struct and is built in place from tensors.
+struct globals_plain {
     comm::globals c;
-    gemm::standalone::globals g;   // only read in MODE 2
-    int mode;
+};
+struct globals_with_gemm {
+    comm::globals c;
+    gemm::standalone::globals g;
+    __host__ globals_with_gemm(const comm::globals &cc, const gemm::standalone::globals &gg) : c(cc), g(gg) {}
 };
 
-template <int MODE>
+template <int MODE, typename P>
 __global__ __launch_bounds__(gemm::num_threads<NC>(), CTAS_PER_SM)
-void comm_bench_kernel(const __grid_constant__ globals p) {
+void comm_bench_kernel(const __grid_constant__ P p) {
     extern __shared__ int __shm[];
     auto &smem = *reinterpret_cast<gemm_smem *>(
         ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
@@ -263,11 +268,11 @@ inline void fill_comm_globals(
     c.push_done = c.push_done_peer[ep_rank];
 }
 
-template <int MODE>
-inline void launch(const globals &p, const at::Device &device) {
+template <int MODE, typename P>
+inline void launch(const P &p, const at::Device &device) {
     constexpr int SMEM = sizeof(gemm_smem) + 1024;
     constexpr int THREADS = gemm::num_threads<NC>();
-    auto *kernel_ptr = comm_bench_kernel<MODE>;
+    auto *kernel_ptr = comm_bench_kernel<MODE, P>;
     CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     int num_sms = 0;
     CUDACHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device.index()));
@@ -289,12 +294,11 @@ inline void entry_comm_bench_out(
         at::Tensor x_ready, at::Tensor y_ready, at::Tensor push_done_local) {
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 (dispatch) or 1 (combine)");
     c10::cuda::CUDAGuard device_guard(x.device());
-    globals p{};
+    globals_plain p{};
     fill_comm_globals(p.c, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
                       schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk,
                       routed_y, combine_ptrs, push_done_ptrs, ep_rank, x_ready, y_ready, push_done_local);
-    p.mode = static_cast<int>(mode);
-    if (mode == 0) launch<0>(p, x.device()); else launch<1>(p, x.device());
+    if (mode == 0) launch<0, globals_plain>(p, x.device()); else launch<1, globals_plain>(p, x.device());
 }
 
 // mode 2: dispatch by the comm warpgroup while producer/consumer run the grouped GEMM (A,B,...,D).
@@ -308,8 +312,8 @@ inline void entry_comm_gemm_bench_out(
         at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale, at::Tensor gemm_m_indices,
         at::Tensor gemm_num_tokens, at::Tensor D) {
     c10::cuda::CUDAGuard device_guard(x.device());
-    globals p{};
-    fill_comm_globals(p.c, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
+    comm::globals c{};
+    fill_comm_globals(c, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
                       schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk,
                       routed_y, combine_ptrs, push_done_ptrs, ep_rank, x_ready, y_ready, push_done_local);
     TORCH_CHECK(A.dim() == 2 && B.dim() == 3 && D.dim() == 2 && A.is_cuda() && B.is_cuda() && D.is_cuda(),
@@ -333,7 +337,7 @@ inline void entry_comm_gemm_bench_out(
                     && gemm_m_indices.numel() == A.size(0), "gemm_m_indices must be int32 [M]");
     TORCH_CHECK(gemm_num_tokens.is_cuda() && gemm_num_tokens.scalar_type() == at::kInt && gemm_num_tokens.numel() == 1,
                 "gemm_num_tokens must be int32 [1]");
-    p.g = gemm::standalone::globals{
+    const gemm::standalone::globals gg{
         kittens::py::tensor_to_gl<gemm::a_gl>(A),
         kittens::py::tensor_to_gl<gemm::b_gl>(B),
         kittens::py::tensor_to_gl<gemm::d_gl>(D),
@@ -345,8 +349,8 @@ inline void entry_comm_gemm_bench_out(
         k / 128,
         static_cast<int>(A.size(0) / 64),
     };
-    p.mode = 2;
-    launch<2>(p, x.device());
+    const globals_with_gemm p(c, gg);
+    launch<2, globals_with_gemm>(p, x.device());
 }
 
 }  // namespace bench

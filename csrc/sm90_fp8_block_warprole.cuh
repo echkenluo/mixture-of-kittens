@@ -39,28 +39,33 @@ constexpr int W2_N_TILES_128 = HIDDEN / N_TILE;     // 32
 constexpr int W13_N_TILES_128 = 2 * INTER / N_TILE; // 32 (interleaved gate/up)
 
 struct globals {
-    comm::globals c;
+    comm::globals c{};
     gemm::a_gl routed_x_gl;    // [capacity, 4096] fp8
     gemm::a_gl hidden_gl;      // [capacity, 2048] fp8
     gemm::b_gl w13i;           // [E, 4096, 4096] fp8, interleaved gate/up
     gemm::b_gl w2;             // [E, 4096, 2048] fp8
     gemm::d_gl routed_y_gl;    // [capacity, 4096] bf16
-    const float *w13i_scale;   // [E, 32, 32]
-    const float *w2_scale;     // [E, 32, 16]
-    uint8_t *hidden;           // [capacity, 2048] fp8
-    float *hidden_scale;       // [capacity, 16]
-    unsigned int *hidden_ready;   // [m_tiles]
-    float limit;
-    const __nv_bfloat16 *combine_local;   // [num_local_tokens * topk, 4096]
-    const float *weights;                 // [num_local_tokens * topk]
-    const int *topk_ids;                  // [num_local_tokens * topk]
-    __nv_bfloat16 *output;                // [num_local_tokens, 4096]
-    unsigned int *barrier_flag;
-    unsigned int *barrier_target;
-    unsigned int *barrier_multicast_ptr;
-    unsigned int *input_expected_scratch;
-    unsigned long long *trap_record;
-    unsigned long long spin_limit;
+    const float *w13i_scale = nullptr;   // [E, 32, 32]
+    const float *w2_scale = nullptr;     // [E, 32, 16]
+    uint8_t *hidden = nullptr;           // [capacity, 2048] fp8
+    float *hidden_scale = nullptr;       // [capacity, 16]
+    unsigned int *hidden_ready = nullptr;   // [m_tiles]
+    float limit = 0.0f;
+    const __nv_bfloat16 *combine_local = nullptr;   // [num_local_tokens * topk, 4096]
+    const float *weights = nullptr;                 // [num_local_tokens * topk]
+    const int *topk_ids = nullptr;                  // [num_local_tokens * topk]
+    __nv_bfloat16 *output = nullptr;                // [num_local_tokens, 4096]
+    unsigned int *barrier_flag = nullptr;
+    unsigned int *barrier_target = nullptr;
+    unsigned int *barrier_multicast_ptr = nullptr;
+    unsigned int *input_expected_scratch = nullptr;
+    unsigned long long *trap_record = nullptr;
+    unsigned long long spin_limit = 0;
+
+    // kittens::gl has no default constructor: the five TMA-described tensors come first.
+    __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13, const gemm::b_gl &w2_,
+                     const gemm::d_gl &ry)
+        : routed_x_gl(rx), hidden_gl(h), w13i(w13), w2(w2_), routed_y_gl(ry) {}
 };
 
 __device__ __forceinline__ void trap(const globals &g, unsigned long long code, unsigned long long site,
@@ -314,13 +319,13 @@ inline void entry_out(
         at::Tensor barrier_buffer, at::Tensor barrier_target, int64_t barrier_multicast_ptr,
         at::Tensor input_expected_scratch, int64_t trap_record_ptr, double swiglu_limit, int64_t spin_limit) {
     c10::cuda::CUDAGuard device_guard(x.device());
-    globals g{};
-    comm::bench::fill_comm_globals(g.c, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
+    comm::globals cg{};
+    comm::bench::fill_comm_globals(cg, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
                                    schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk,
                                    routed_y, combine_ptrs, push_done_ptrs, ep_rank, x_ready, y_ready, push_done_local);
     const int64_t capacity = routed_x.size(0);
     const int64_t experts = w13i.size(0);
-    TORCH_CHECK(g.c.topk == TOPK, "warprole is specialized for top-6 routing");
+    TORCH_CHECK(cg.topk == TOPK, "warprole is specialized for top-6 routing");
     TORCH_CHECK(w13i.dim() == 3 && w13i.size(1) == 2 * INTER && w13i.size(2) == HIDDEN
                     && w13i.scalar_type() == at::kFloat8_e4m3fn && w13i.is_contiguous() && w13i.is_cuda(),
                 "w13i must be contiguous CUDA fp8 [E,4096,4096] (interleaved gate/up)");
@@ -335,14 +340,14 @@ inline void entry_out(
                     && w2_scale.dim() == 3 && w2_scale.size(0) == experts && w2_scale.size(1) == W2_N_TILES_128
                     && w2_scale.size(2) == W2_K_BLOCKS,
                 "w2_scale must be float32 [E,32,16]");
-    TORCH_CHECK(experts == g.c.num_local_experts, "weights must cover exactly the local experts");
+    TORCH_CHECK(experts == cg.num_local_experts, "weights must cover exactly the local experts");
     TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::kFloat8_e4m3fn && hidden.is_contiguous()
                     && hidden.dim() == 2 && hidden.size(0) == capacity && hidden.size(1) == INTER,
                 "hidden must be contiguous CUDA fp8 [capacity,2048]");
     TORCH_CHECK(hidden_scale.is_cuda() && hidden_scale.scalar_type() == at::kFloat && hidden_scale.is_contiguous()
                     && hidden_scale.dim() == 2 && hidden_scale.size(0) == capacity && hidden_scale.size(1) == INTER / 128,
                 "hidden_scale must be float32 [capacity,16]");
-    const int64_t routes = static_cast<int64_t>(g.c.num_local_tokens) * TOPK;
+    const int64_t routes = static_cast<int64_t>(cg.num_local_tokens) * TOPK;
     TORCH_CHECK(combine_local.is_cuda() && combine_local.scalar_type() == at::kBFloat16 && combine_local.is_contiguous()
                     && combine_local.dim() == 2 && combine_local.size(0) == routes && combine_local.size(1) == HIDDEN,
                 "combine_local must be bf16 [tokens*topk,4096]");
@@ -351,7 +356,7 @@ inline void entry_out(
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() && topk_ids.numel() == routes,
                 "topk_ids must be int32 [tokens*topk]");
     TORCH_CHECK(output.is_cuda() && output.scalar_type() == at::kBFloat16 && output.is_contiguous() && output.dim() == 2
-                    && output.size(0) == g.c.num_local_tokens && output.size(1) == HIDDEN,
+                    && output.size(0) == cg.num_local_tokens && output.size(1) == HIDDEN,
                 "output must be bf16 [tokens,4096]");
     TORCH_CHECK(hidden_ready.is_cuda() && hidden_ready.scalar_type() == at::kInt && hidden_ready.is_contiguous()
                     && hidden_ready.numel() >= capacity / 64, "hidden_ready must be int32 [m_tiles]");
@@ -367,11 +372,10 @@ inline void entry_out(
     kittens::py::tensor_check<gemm::d_gl>(routed_y);
     kittens::py::device_check(x, w13i, w2, hidden, routed_y, combine_local, weights, topk_ids, output);
 
-    g.routed_x_gl = kittens::py::tensor_to_gl<gemm::a_gl>(routed_x);
-    g.hidden_gl = kittens::py::tensor_to_gl<gemm::a_gl>(hidden);
-    g.w13i = kittens::py::tensor_to_gl<gemm::b_gl>(w13i);
-    g.w2 = kittens::py::tensor_to_gl<gemm::b_gl>(w2);
-    g.routed_y_gl = kittens::py::tensor_to_gl<gemm::d_gl>(routed_y);
+    globals g(kittens::py::tensor_to_gl<gemm::a_gl>(routed_x), kittens::py::tensor_to_gl<gemm::a_gl>(hidden),
+              kittens::py::tensor_to_gl<gemm::b_gl>(w13i), kittens::py::tensor_to_gl<gemm::b_gl>(w2),
+              kittens::py::tensor_to_gl<gemm::d_gl>(routed_y));
+    g.c = cg;
     g.w13i_scale = w13i_scale.data_ptr<float>();
     g.w2_scale = w2_scale.data_ptr<float>();
     g.hidden = static_cast<uint8_t *>(hidden.data_ptr());
