@@ -28,6 +28,7 @@ import os
 import pathlib
 import statistics
 import subprocess
+import time
 
 # Imported defensively so that `--help` still works on a machine without the
 # CUDA build; main() turns a missing import into a loud error before any work.
@@ -83,7 +84,19 @@ def parse_args() -> argparse.Namespace:
         "--warmup", type=int, default=10, help="untimed calls before each timed block"
     )
     parser.add_argument(
-        "--iters", type=int, default=30, help="timed calls per entry and shape"
+        "--iters", type=int, default=30, help="timed samples per entry and shape"
+    )
+    parser.add_argument(
+        "--calls-per-sample",
+        type=int,
+        default=5,
+        help="back-to-back calls inside one CUDA-event pair; a sample is the mean per call",
+    )
+    parser.add_argument(
+        "--burn-in-seconds",
+        type=float,
+        default=2.0,
+        help="run the reference untimed for this long before the first timed block of a shape",
     )
     parser.add_argument(
         "--shapes",
@@ -101,6 +114,8 @@ def parse_args() -> argparse.Namespace:
     args.candidates = _subset(args.candidates, CANDIDATE_ENTRIES, "--candidates")
     if args.warmup < 0 or args.iters < 1:
         raise ValueError("--warmup must be >= 0 and --iters must be >= 1")
+    if args.calls_per_sample < 1 or args.burn_in_seconds < 0:
+        raise ValueError("--calls-per-sample must be >= 1 and --burn-in-seconds must be >= 0")
     return args
 
 
@@ -204,8 +219,15 @@ def make_inputs(device, n: int, k: int, seed: int = SEED):
     return a, b, a_scale, b_scale, m_indices, total_m
 
 
-def time_calls(fn, warmup: int, iters: int) -> list[float]:
-    """One CUDA-event pair per call, with a synchronize between calls."""
+def time_calls(fn, warmup: int, iters: int, calls_per_sample: int) -> list[float]:
+    """One CUDA-event pair around `calls_per_sample` back-to-back calls, a
+    synchronize after each pair; the sample is the mean time per call.
+
+    Queuing several launches keeps the GPU busy across the host-side launch
+    gap.  With one call per event pair on GPU9 (load average ~35) the two
+    reference blocks of a shape differed by 0.6-0.8% in two consecutive runs,
+    in slow plateaus rather than jitter, while the candidates were stable.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -214,11 +236,23 @@ def time_calls(fn, warmup: int, iters: int) -> list[float]:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn()
+        for _ in range(calls_per_sample):
+            fn()
         end.record()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end))
+        samples.append(start.elapsed_time(end) / calls_per_sample)
     return samples
+
+
+def burn_in(fn, seconds: float) -> None:
+    """Run `fn` untimed for `seconds` of wall clock so the first timed block does
+    not see the start-up transient (the first reference block was the slowest
+    one in every run so far)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for _ in range(20):
+            fn()
+        torch.cuda.synchronize()
 
 
 def summarize(samples: list[float], effective_flops: int) -> dict:
@@ -249,8 +283,12 @@ def run_shape(name: str, reference, candidates: dict, args) -> dict:
     if not bool(torch.isfinite(ref_out.float()).all()):
         raise RuntimeError(f"{name}: the reference GEMM produced non-finite values")
 
+    if args.burn_in_seconds > 0:
+        burn_in(lambda: reference(*inputs, ref_out), args.burn_in_seconds)
     a1 = summarize(
-        time_calls(lambda: reference(*inputs, ref_out), args.warmup, args.iters),
+        time_calls(
+            lambda: reference(*inputs, ref_out), args.warmup, args.iters, args.calls_per_sample
+        ),
         effective_flops,
     )
 
@@ -262,7 +300,12 @@ def run_shape(name: str, reference, candidates: dict, args) -> dict:
         torch.cuda.synchronize()
         bitwise = bool(torch.equal(out, ref_out))
         row = summarize(
-            time_calls(lambda fn=entry, o=out: fn(*inputs, o), args.warmup, args.iters),
+            time_calls(
+                lambda fn=entry, o=out: fn(*inputs, o),
+                args.warmup,
+                args.iters,
+                args.calls_per_sample,
+            ),
             effective_flops,
         )
         row["bitwise"] = bitwise
@@ -272,7 +315,9 @@ def run_shape(name: str, reference, candidates: dict, args) -> dict:
         del out
 
     a2 = summarize(
-        time_calls(lambda: reference(*inputs, ref_out), args.warmup, args.iters),
+        time_calls(
+            lambda: reference(*inputs, ref_out), args.warmup, args.iters, args.calls_per_sample
+        ),
         effective_flops,
     )
     drift = abs(a1["p50_ms"] - a2["p50_ms"]) / a1["p50_ms"]
@@ -383,16 +428,21 @@ def main() -> None:
     shapes = {name: run_shape(name, reference, candidates, args) for name in args.shapes}
     verdict = build_verdict(shapes, args.candidates)
     record = {
-        "schema": "bench-warprole-gemm.v1",
+        "schema": "bench-warprole-gemm.v2",
         "config": {
             "warmup": args.warmup,
             "iters": args.iters,
+            "calls_per_sample": args.calls_per_sample,
+            "burn_in_seconds": args.burn_in_seconds,
             "shapes": list(args.shapes),
             "candidates": list(args.candidates),
             "reference_entry": REFERENCE_ENTRY,
             "candidate_entries": {name: CANDIDATE_ENTRIES[name] for name in args.candidates},
             "seed": SEED,
-            "timing_boundary": "binding + kernel into a preallocated output",
+            "timing_boundary": (
+                "binding + kernel into a preallocated output; one CUDA-event pair around "
+                "calls_per_sample back-to-back calls, sample = elapsed / calls_per_sample"
+            ),
         },
         "provenance": provenance(device),
         "shapes": shapes,
