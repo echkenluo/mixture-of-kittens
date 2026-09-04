@@ -52,7 +52,6 @@ REFERENCE_ENTRY = "fp8_block_grouped_contiguous_dynamic_out"
 CANDIDATE_ENTRIES = {
     "c1s6": "fp8_block_warprole_gemm_c1s6_out",
     "c2s4": "fp8_block_warprole_gemm_c2s4_out",
-    "c1s3x2": "fp8_block_warprole_gemm_c1s3x2_out",
 }
 EXPERTS = 64
 ROW_PATTERN = [320, 336, 352, 368, 400, 416, 432, 448]   # mean 384 rows/expert, 24576 rows
@@ -93,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidates",
-        default="c1s6,c2s4,c1s3x2",
+        default="c1s6,c2s4",
         help="comma-separated subset of " + ",".join(CANDIDATE_ENTRIES),
     )
     parser.add_argument("--device", default="cuda:0", help="CUDA device to time on")
