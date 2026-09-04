@@ -527,6 +527,37 @@ def test_warprole_matches_split(
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_warprole_first_on_fresh_workspace(
+    context: tuple[int, int, torch.device], variant: str
+) -> None:
+    """The megakernel must be correct when nothing ran on the workspace before.
+
+    SGLang reaches ``warprole_forward`` without ever running the split path
+    on that workspace, so nothing has pre-cleared the combine buffer or
+    touched the barrier state.  Every other test runs split first, which
+    would hide a dependence on that history.
+    """
+    rank, world_size, device = context
+    require_warprole(device)
+    assert world_size == EP_SIZE, "the warprole contract under test is EP4"
+    harness = build_harness(CASES["uniform_2048"], rank, device)
+
+    warprole_output = run_warprole(harness, variant).clone()
+    torch.cuda.synchronize()
+    dist.barrier()
+    assert_trap_clear(harness, f"fresh/{variant}")
+
+    split_output = run_split(harness)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    effective = harness.case.effective_tokens
+    assert_bitwise(
+        f"fresh/{variant}", split_output[:effective], warprole_output[:effective]
+    )
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_warprole_repeated_forward(
     context: tuple[int, int, torch.device], variant: str
 ) -> None:

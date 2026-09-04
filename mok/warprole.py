@@ -301,7 +301,8 @@ def warprole_forward(
     The trap check afterwards is a non-blocking read of the host-mapped record:
     it reports a trap from an earlier launch immediately and one from this
     launch only after the caller synchronizes.  Callers that need a verdict for
-    this launch must synchronize first.
+    this launch must synchronize first.  While a CUDA graph is being captured
+    the check is skipped, because a host read cannot be captured.
     """
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
@@ -423,6 +424,12 @@ def warprole_forward(
     )
     release_workspace_lease(workspace)
 
+    # The trap record is host-mapped, so this read is a host access: it
+    # cannot be captured into a CUDA graph.  During capture the launch is
+    # recorded, not run, and the check is left to the caller's next eager
+    # call (the record is sticky until the workspace is recreated).
+    if torch.cuda.is_current_stream_capturing():
+        return state.output
     if int(workspace.trap_record[0].item()) != 0:
         raise RuntimeError(
             format_trap_record(workspace)
