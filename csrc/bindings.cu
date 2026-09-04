@@ -4,6 +4,7 @@
 #include "sm90_fp8_block_routed.cuh"
 #include "sm90_fp8_block_worker_test.cuh"
 #include "sm90_fp8_block_warprole_gemm.cuh"
+#include "sm90_fp8_block_warprole_epilogue.cuh"
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
@@ -125,6 +126,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
           pybind11::arg("output"));
+    m.def("fp8_block_warprole_w13_c1s6_out",
+          &mok_sm90::warprole::epilogue::standalone::entry_w13_out<1, 6, 1>,
+          "", pybind11::arg("input"), pybind11::arg("input_scale"),
+          pybind11::arg("w13_interleaved"), pybind11::arg("w13_interleaved_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("hidden"), pybind11::arg("hidden_scale"),
+          pybind11::arg("swiglu_limit"));
+    m.def("fp8_block_warprole_w13_c2s4_out",
+          &mok_sm90::warprole::epilogue::standalone::entry_w13_out<2, 4, 1>,
+          "", pybind11::arg("input"), pybind11::arg("input_scale"),
+          pybind11::arg("w13_interleaved"), pybind11::arg("w13_interleaved_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("hidden"), pybind11::arg("hidden_scale"),
+          pybind11::arg("swiglu_limit"));
+    m.def("fp8_block_warprole_w13_c1s3x2_out",
+          &mok_sm90::warprole::epilogue::standalone::entry_w13_out<1, 3, 2>,
+          "", pybind11::arg("input"), pybind11::arg("input_scale"),
+          pybind11::arg("w13_interleaved"), pybind11::arg("w13_interleaved_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("hidden"), pybind11::arg("hidden_scale"),
+          pybind11::arg("swiglu_limit"));
     m.def("fp8_block_build_schedule_out",
           &mok_sm90::fp8_block_route_fused::build_schedule_out, "",
           pybind11::arg("top_experts"),

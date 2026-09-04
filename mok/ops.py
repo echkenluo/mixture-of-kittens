@@ -2781,3 +2781,30 @@ def bwd_epilogue(
                          "(num_local_tokens * topk, hidden_size)")
 
     return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer)
+
+
+def interleave_w13(
+    w13: torch.Tensor, w13_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder a [E, 2I, K] gate/up weight so that gate block j and up block j
+    are adjacent N128 tiles: rows become [gate 0:128, up 0:128, gate 128:256,
+    up 128:256, ...].  The warprole W13 task for intermediate tile j then reads
+    N tiles 2j (gate) and 2j+1 (up) from one weight tensor.  Scales
+    [E, 2I/128, K/128] are permuted the same way.  Values are untouched, so the
+    GEMM stays bitwise identical to the split path."""
+    if w13.dim() != 3 or w13_scale.dim() != 3:
+        raise ValueError("w13 must be [E, 2I, K] and w13_scale [E, 2I/128, K/128]")
+    experts, n2, k = w13.shape
+    if n2 % 256 != 0 or k % 128 != 0:
+        raise ValueError("2I must be a multiple of 256 and K a multiple of 128")
+    if tuple(w13_scale.shape) != (experts, n2 // 128, k // 128):
+        raise ValueError("w13_scale shape must be [E, 2I/128, K/128]")
+    inter = n2 // 2
+    blocks = inter // 128
+    gate = w13[:, :inter].reshape(experts, blocks, 128, k)
+    up = w13[:, inter:].reshape(experts, blocks, 128, k)
+    weight = torch.stack([gate, up], dim=2).reshape(experts, n2, k).contiguous()
+    gate_scale = w13_scale[:, :blocks]
+    up_scale = w13_scale[:, blocks:]
+    scale = torch.stack([gate_scale, up_scale], dim=2).reshape(experts, n2 // 128, k // 128).contiguous()
+    return weight, scale

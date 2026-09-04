@@ -39,8 +39,8 @@ template <int NC> struct stage_smem {
 };
 template <int NC, int STAGES> struct smem_layout {
     stage_smem<NC> stage[STAGES];
-    d_st d[NC];
-    float b_scale[NC][W13_K_BLOCKS];   // one task's row of weight block scales (K/128 <= 32)
+    d_st d[2];                        // per-consumer staging (GEMM) or gate/up pair (fused W13)
+    float b_scale[2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
 };
 
 constexpr int PRODUCER_REGS = 40;
@@ -92,20 +92,21 @@ __device__ __forceinline__ void producer_task(
 
 // Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
 // in `total`, scaled per K128 block exactly like fp8_block_pipeline::run_tile.
+// `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
 template <int NC, int STAGES>
 __device__ __forceinline__ void consumer_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
-        int64_t &stage_counter, int c, int k_blocks, acc_rt &total) {
+        int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
     const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
     for (int kb = 0; kb < k_blocks; ++kb, ++stage_counter) {
         const int s = static_cast<int>(stage_counter % STAGES);
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(full[s], phase);
         acc_rt partial;
-        warpgroup::mm_ABt(partial, smem.stage[s].a, smem.stage[s].b[c]);
+        warpgroup::mm_ABt(partial, smem.stage[s].a, smem.stage[s].b[b_slot]);
         warpgroup::mma_async_wait<0>();
         typename acc_rt::col_vec row_scale;
-        const float b_scale = smem.b_scale[c][kb];
+        const float b_scale = b_scale_row[kb];
         row_scale[0][0].x = smem.stage[s].a_scale[local_row] * b_scale;
         row_scale[0][0].y = smem.stage[s].a_scale[local_row + 8] * b_scale;
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
@@ -116,14 +117,14 @@ __device__ __forceinline__ void consumer_task(
 }
 
 // Stage the B block-scale row of one (expert, n_tile) task into shared memory.
-// Called by all 128 threads of consumer `c`; followed by a warpgroup barrier by the caller.
+// Called by all 128 threads of one consumer; followed by a warpgroup barrier by the caller.
 template <int NC, int STAGES>
 __device__ __forceinline__ void stage_b_scale_row(
-        smem_layout<NC, STAGES> &smem, int c, const float *B_scale, int expert, int n_tiles_128,
+        smem_layout<NC, STAGES> &smem, int slot, const float *B_scale, int expert, int n_tiles_128,
         int n_tile, int k_blocks) {
     const int t = warpgroup::laneid();
     if (t < k_blocks)
-        smem.b_scale[c][t] = B_scale[(static_cast<size_t>(expert) * n_tiles_128 + n_tile) * k_blocks + t];
+        smem.b_scale[slot][t] = B_scale[(static_cast<size_t>(expert) * n_tiles_128 + n_tile) * k_blocks + t];
 }
 
 // Write a finished M64 x N128 tile to global memory through the consumer's own
@@ -214,7 +215,7 @@ void grouped_kernel(const __grid_constant__ globals g) {
         stage_b_scale_row<NC, STAGES>(smem, role, g.B_scale, expert, n_tiles_128, n_tile, g.k_blocks);
         warpgroup::sync(barrier_id);
         acc_rt total_acc;
-        consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, g.k_blocks, total_acc);
+        consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], g.k_blocks, total_acc);
         store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.D, total_acc, m_tile, n_tile);
     }
     if (warpgroup::laneid() == 0) tma::store_async_wait();
