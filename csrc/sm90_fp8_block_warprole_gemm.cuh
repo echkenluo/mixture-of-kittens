@@ -98,21 +98,31 @@ __device__ __forceinline__ void consumer_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
         int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
     const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
-    for (int kb = 0; kb < k_blocks; ++kb, ++stage_counter) {
+    // One K128 block: WGMMA partial into `dst`, then scale by A_scale[row] * B_scale[block].
+    // The first block is peeled so that `total` is never the target of a copy-or-add
+    // join inside the loop: with `if (kb == 0) copy else add` in the loop body ptxas
+    // coalesced `total` with the WGMMA accumulator in one of the two inlined loops of
+    // the fused kernel and shuffled/spilled 27 to 64 registers per iteration.
+    auto block = [&](int kb, acc_rt &dst) {
         const int s = static_cast<int>(stage_counter % STAGES);
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(full[s], phase);
-        acc_rt partial;
-        warpgroup::mm_ABt(partial, smem.stage[s].a, smem.stage[s].b[b_slot]);
+        warpgroup::mm_ABt(dst, smem.stage[s].a, smem.stage[s].b[b_slot]);
         warpgroup::mma_async_wait<0>();
         typename acc_rt::col_vec row_scale;
         const float b_scale = b_scale_row[kb];
         row_scale[0][0].x = smem.stage[s].a_scale[local_row] * b_scale;
         row_scale[0][0].y = smem.stage[s].a_scale[local_row + 8] * b_scale;
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
-        warpgroup::mul_row(partial, partial, row_scale);
-        if (kb == 0) warp::copy(total, partial);
-        else warpgroup::add(total, total, partial);
+        warpgroup::mul_row(dst, dst, row_scale);
+        ++stage_counter;
+    };
+    block(0, total);   // block 0 lands directly in `total` (same values as copy-after-scale)
+#pragma unroll 1
+    for (int kb = 1; kb < k_blocks; ++kb) {
+        acc_rt partial;
+        block(kb, partial);
+        warpgroup::add(total, total, partial);
     }
 }
 
