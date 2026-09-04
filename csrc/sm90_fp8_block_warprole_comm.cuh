@@ -155,7 +155,7 @@ void comm_bench_kernel(const __grid_constant__ globals p) {
     __shared__ semaphore empty[STAGES];
     __shared__ int expert_row_end[256];
     if (threadIdx.x == 0) tc::build_expert_row_ends(p.c, expert_row_end);
-    gemm::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
+    gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
     const int role = warpgroup::groupid();
     if (role == NC + 1) {
         warpgroup::decrease_registers<gemm::comm_regs<CTAS_PER_SM>()>();
@@ -173,7 +173,7 @@ void comm_bench_kernel(const __grid_constant__ globals p) {
         return;
     }
     if constexpr (MODE == 2) {
-        gemm::run_gemm_roles<NC, STAGES, CTAS_PER_SM>(p.g, smem, full, empty, role);
+        gemm::standalone::run_gemm_roles<NC, STAGES, CTAS_PER_SM>(p.g, smem, full, empty, role);
     } else {
         if (role == NC) warpgroup::decrease_registers<gemm::producer_regs<CTAS_PER_SM>()>();
         else warpgroup::increase_registers<gemm::consumer_regs<NC, CTAS_PER_SM>()>();
