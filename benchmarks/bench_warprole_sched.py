@@ -173,11 +173,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--knobs",
         default="all",
-        choices=("all", "nodeps"),
+        choices=("all", "nodeps", "comm", "reduce"),
         help=(
             "all: NO_DEPS + COMM_OFF + REDUCE_OFF (scheduling overhead only); "
             "nodeps: NO_DEPS alone, so the comm warpgroup and the final reduce run "
-            "(the difference to 'all' is their contribution)"
+            "(the difference to 'all' is their contribution); "
+            "comm: NO_DEPS + REDUCE_OFF (comm warpgroup on, reduce off); "
+            "reduce: NO_DEPS + COMM_OFF (reduce on, comm warpgroup off)"
         ),
     )
     parser.add_argument(
@@ -758,10 +760,11 @@ def require_warprole(device: torch.device, variants: tuple[str, ...]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.knobs == "nodeps":
-        # The entry reads the knobs with getenv on every call, so flipping them
-        # here (before any entry call) is enough; NO_DEPS stays on.
+    # The entry reads the knobs with getenv on every call, so flipping them
+    # here (before any entry call) is enough; NO_DEPS stays on in every mode.
+    if args.knobs in ("nodeps", "comm"):
         os.environ["MOK_WARPROLE_COMM_OFF"] = "0"
+    if args.knobs in ("nodeps", "reduce"):
         os.environ["MOK_WARPROLE_REDUCE_OFF"] = "0"
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA device is required; this benchmark times kernels")
