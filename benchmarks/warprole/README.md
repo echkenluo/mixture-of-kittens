@@ -68,8 +68,11 @@ mkdir -p /home/lenovo/luocc/mok-warprole && docker cp $id:/opt/mok-warprole /hom
 docker run --rm --network host --gpus all -e CUDA_VISIBLE_DEVICES=1 \
   -v /home/lenovo/luocc/mok-warprole/src:/mok/src -v /home/lenovo/luocc/mok-warprole/runtime-logs:/mok/runtime-logs \
   --entrypoint bash harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head> \
-  -c "cd /mok/src && python3 -m benchmarks.bench_warprole_gemm"
+  -c "git config --global --add safe.directory /mok/src && cd /mok/src && python3 -m benchmarks.bench_warprole_gemm"
 ```
 
-`--network host` is required on GPU9 (no docker0). The provenance gate of the production bench needs
-the host copy's `git status --porcelain` to be empty, so edit only through commits.
+`--network host` is required on GPU9 (no docker0). The `safe.directory` line is not optional: the host
+copy is owned by another uid than the container's root, so without it git refuses to read the tree and
+the harnesses record `git_head: unavailable` with an empty (clean-looking) `source_state`. The
+provenance gate of the production bench needs the host copy's `git status --porcelain` to be empty, so
+edit only through commits.
