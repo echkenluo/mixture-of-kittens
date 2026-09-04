@@ -14,7 +14,6 @@ from mok import _C, ops
 ENTRIES = {
     "c1s6": "fp8_block_warprole_w13_c1s6_out",
     "c2s4": "fp8_block_warprole_w13_c2s4_out",
-    "c1s3x2": "fp8_block_warprole_w13_c1s3x2_out",
 }
 EXPERTS = 64
 ROW_PATTERN = [320, 336, 352, 368, 400, 416, 432, 448]

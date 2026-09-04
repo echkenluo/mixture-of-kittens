@@ -19,3 +19,11 @@ bash benchmarks/warprole/build_sm90.sh --report-only   # only regenerate the cuo
 Baseline numbers on `4e925b2` (2026-09-04): `fp8_block_test::contiguous::kernel` 101 reg / 0 stack,
 `fp8_block_terminal_full::kernel` 168 reg / 392 stack, routed `dispatch_kernel` 25 reg,
 `combine_kernel` 20 reg. Any new `warprole` kernel must report 0 stack and no spill line.
+
+## ptxas finding (2026-09-04)
+
+The two-CTA-per-SM retreat form (`<NC=1, STAGES=3, CTAS_PER_SM=2>`, `__launch_bounds__(384, 2)`) does not
+compile: ptxas stops with `C7602 Insufficient registers (80)` on the N128 WGMMA even though the consumer
+warpgroup executes `setmaxnreg.inc 184` first. The 80-register launch budget (65536 / (384 x 2)) is a hard
+compile-time cap for that variant, so its entries are commented out in `csrc/bindings.cu`. If a retreat form is
+ever needed it has to use N64 accumulators (M64 x N64 per consumer) rather than a second CTA per SM.
