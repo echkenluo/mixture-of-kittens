@@ -117,6 +117,13 @@ def sglang_activation():
     except ImportError:
         pass
     try:
+        # SGLang 0.5.17 (image a8-base-cu130): same keyword interface, no row count.
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
+
+        return silu_and_mul_contig_post_quant, "static"
+    except ImportError:
+        pass
+    try:
         from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
 
         return silu_and_mul_contig_post_quant, "static"

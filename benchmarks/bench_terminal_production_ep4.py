@@ -59,7 +59,10 @@ from mok.warprole import (
     get_warprole_state,
     warprole_forward,
 )
-from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+try:
+    from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+except ImportError:  # SGLang 0.5.17 (image a8-base-cu130) exposes it here
+    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
 
 
 EP_SIZE = 4
