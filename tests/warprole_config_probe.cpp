@@ -61,7 +61,7 @@ int main() {
     task g = decode_task<2>(total_tasks<2>(t) - 1, t);   // tail minibatch, single tile
     assert(g.kind == task_kind::w2 && g.m_tile == 192 && g.n_index == 15);
     assert(dispatch_tickets(s, 0) == 128 && ticket_first_row(s, 1, 3) == 1024 + 24);
-    assert(x_ready_target(s, 0) == 1024 && hidden_ready_target<2>() == 16 && y_ready_target<2>() == 16);
+    assert(x_ready_target(s, 0) == 1024 && hidden_ready_target<2>() == 16 && y_ready_target<2>() == 32);
 
     // A negative index is out of range just like an index past the end.
     assert(decode_task<2>(-1, s).kind == task_kind::none);

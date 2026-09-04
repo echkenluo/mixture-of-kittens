@@ -70,5 +70,7 @@ MOK_WARPROLE_HD int ticket_first_row(shape s, int q, int t) {
 }
 MOK_WARPROLE_HD int x_ready_target(shape s, int q) { return rows_in_minibatch(s, q); }
 template <int NC> MOK_WARPROLE_HD int hidden_ready_target() { return geometry<NC>::W13_TASKS_PER_TILE; }
-template <int NC> MOK_WARPROLE_HD int y_ready_target() { return geometry<NC>::W2_TASKS_PER_TILE; }
+// Each consumer publishes one increment per finished N128 tile of routed_y, so the
+// target is the N128 tile count of a row block regardless of the consumer count.
+template <int NC> MOK_WARPROLE_HD int y_ready_target() { return HIDDEN / N_TILE; }
 }  // namespace mok_sm90::warprole
