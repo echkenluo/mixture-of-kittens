@@ -50,6 +50,7 @@ import os
 import pathlib
 import statistics
 import subprocess
+import time
 from dataclasses import dataclass
 
 os.environ.setdefault("MOK_SM90_EXPERIMENTAL", "1")
@@ -155,7 +156,29 @@ def parse_args() -> argparse.Namespace:
         "--warmup", type=int, default=10, help="untimed calls before each timed block"
     )
     parser.add_argument(
-        "--iters", type=int, default=30, help="timed calls per arm, shape and variant"
+        "--iters", type=int, default=30, help="timed samples per arm, shape and variant"
+    )
+    parser.add_argument(
+        "--calls-per-sample",
+        type=int,
+        default=5,
+        help="back-to-back calls inside one CUDA-event pair; a sample is the mean per call",
+    )
+    parser.add_argument(
+        "--burn-in-seconds",
+        type=float,
+        default=2.0,
+        help="run the fused arm untimed for this long before the first timed block of a case",
+    )
+    parser.add_argument(
+        "--knobs",
+        default="all",
+        choices=("all", "nodeps"),
+        help=(
+            "all: NO_DEPS + COMM_OFF + REDUCE_OFF (scheduling overhead only); "
+            "nodeps: NO_DEPS alone, so the comm warpgroup and the final reduce run "
+            "(the difference to 'all' is their contribution)"
+        ),
     )
     parser.add_argument(
         "--cases",
@@ -544,8 +567,12 @@ def w2_kwargs(harness: Harness) -> dict:
     }
 
 
-def time_calls(function, warmup: int, iters: int) -> list[float]:
-    """One CUDA-event pair per call, with a device synchronize between calls."""
+def time_calls(function, warmup: int, iters: int, calls_per_sample: int) -> list[float]:
+    """One CUDA-event pair around `calls_per_sample` back-to-back calls, a device
+    synchronize after each pair; the sample is the mean time per call.  Same
+    reasoning as bench_warprole_gemm: with one call per pair the host-side launch
+    gap sits inside every sample, and on GPU9 (load average ~35) that alone moved
+    the two fused blocks of a case apart by 0.3-0.8%."""
     for _ in range(warmup):
         function()
     torch.cuda.synchronize()
@@ -554,11 +581,21 @@ def time_calls(function, warmup: int, iters: int) -> list[float]:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        function()
+        for _ in range(calls_per_sample):
+            function()
         end.record()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end))
+        samples.append(start.elapsed_time(end) / calls_per_sample)
     return samples
+
+
+def burn_in(function, seconds: float) -> None:
+    """Run `function` untimed for `seconds` of wall clock before the first timed block."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for _ in range(10):
+            function()
+        torch.cuda.synchronize()
 
 
 def percentile(samples: list[float], quantile: float) -> float:
@@ -615,13 +652,16 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     torch.cuda.synchronize()
     dist.barrier()
 
-    a1 = summarize(time_calls(run_fused, args.warmup, args.iters))
+    if args.burn_in_seconds > 0:
+        burn_in(run_fused, args.burn_in_seconds)
     dist.barrier()
-    w13_row = summarize(time_calls(run_w13, args.warmup, args.iters))
+    a1 = summarize(time_calls(run_fused, args.warmup, args.iters, args.calls_per_sample))
     dist.barrier()
-    w2_row = summarize(time_calls(run_w2, args.warmup, args.iters))
+    w13_row = summarize(time_calls(run_w13, args.warmup, args.iters, args.calls_per_sample))
     dist.barrier()
-    a2 = summarize(time_calls(run_fused, args.warmup, args.iters))
+    w2_row = summarize(time_calls(run_w2, args.warmup, args.iters, args.calls_per_sample))
+    dist.barrier()
+    a2 = summarize(time_calls(run_fused, args.warmup, args.iters, args.calls_per_sample))
     dist.barrier()
 
     if int(harness.workspace.trap_record[0].item()) != 0:
@@ -718,6 +758,11 @@ def require_warprole(device: torch.device, variants: tuple[str, ...]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.knobs == "nodeps":
+        # The entry reads the knobs with getenv on every call, so flipping them
+        # here (before any entry call) is enough; NO_DEPS stays on.
+        os.environ["MOK_WARPROLE_COMM_OFF"] = "0"
+        os.environ["MOK_WARPROLE_REDUCE_OFF"] = "0"
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA device is required; this benchmark times kernels")
     rank = int(os.environ["RANK"])
@@ -770,11 +815,14 @@ def main() -> None:
             ),
         }
         record = {
-            "schema": "bench-warprole-sched.v1",
+            "schema": "bench-warprole-sched.v2",
             "output": args.out,
             "config": {
                 "warmup": args.warmup,
                 "iters": args.iters,
+                "calls_per_sample": args.calls_per_sample,
+                "burn_in_seconds": args.burn_in_seconds,
+                "knobs": args.knobs,
                 "ep_size": world_size,
                 "cases": list(args.cases),
                 "variants": list(args.variants),
