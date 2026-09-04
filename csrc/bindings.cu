@@ -5,6 +5,7 @@
 #include "sm90_fp8_block_worker_test.cuh"
 #include "sm90_fp8_block_warprole_gemm.cuh"
 #include "sm90_fp8_block_warprole_epilogue.cuh"
+#include "sm90_fp8_block_warprole_comm.cuh"
 #include "utils.cuh"
 #include "sm90_fp8_block_route_fused.cuh"
 #include "sm90_fp8_block_dispatch_gemm.cuh"
@@ -147,6 +148,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
           pybind11::arg("hidden"), pybind11::arg("hidden_scale"),
           pybind11::arg("swiglu_limit"));
+    m.def("fp8_block_warprole_comm_bench_out",
+          &mok_sm90::warprole::comm::bench::entry_comm_bench_out, "",
+          pybind11::arg("mode"), pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("x_scale"), pybind11::arg("x_scale_ptrs"),
+          pybind11::arg("routed_x"), pybind11::arg("routed_x_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"), pybind11::arg("num_tokens"),
+          pybind11::arg("tokens_per_expert"), pybind11::arg("topk"),
+          pybind11::arg("routed_y"), pybind11::arg("combine_ptrs"),
+          pybind11::arg("push_done_ptrs"), pybind11::arg("ep_rank"),
+          pybind11::arg("x_ready"), pybind11::arg("y_ready"),
+          pybind11::arg("push_done_local"));
+    m.def("fp8_block_warprole_comm_gemm_bench_out",
+          &mok_sm90::warprole::comm::bench::entry_comm_gemm_bench_out, "",
+          pybind11::arg("x"), pybind11::arg("x_ptrs"),
+          pybind11::arg("x_scale"), pybind11::arg("x_scale_ptrs"),
+          pybind11::arg("routed_x"), pybind11::arg("routed_x_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("schedule_peer_rank"),
+          pybind11::arg("schedule_peer_token_idx"), pybind11::arg("num_tokens"),
+          pybind11::arg("tokens_per_expert"), pybind11::arg("topk"),
+          pybind11::arg("routed_y"), pybind11::arg("combine_ptrs"),
+          pybind11::arg("push_done_ptrs"), pybind11::arg("ep_rank"),
+          pybind11::arg("x_ready"), pybind11::arg("y_ready"),
+          pybind11::arg("push_done_local"),
+          pybind11::arg("gemm_input"), pybind11::arg("gemm_weight"),
+          pybind11::arg("gemm_input_scale"), pybind11::arg("gemm_weight_scale"),
+          pybind11::arg("gemm_m_indices"), pybind11::arg("gemm_num_tokens"),
+          pybind11::arg("gemm_output"));
     m.def("fp8_block_build_schedule_out",
           &mok_sm90::fp8_block_route_fused::build_schedule_out, "",
           pybind11::arg("top_experts"),

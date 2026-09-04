@@ -165,31 +165,16 @@ struct globals {
     int m_tiles;
 };
 
+// Producer + consumer roles of the standalone grouped GEMM over the static
+// task stream (m_tile, n_group).  `role` is the caller's warpgroup index; the
+// comm slot (role NC+1) must not call this.
 template <int NC, int STAGES, int CTAS_PER_SM>
-__global__ __launch_bounds__(num_threads<NC>(), CTAS_PER_SM)
-void grouped_kernel(const __grid_constant__ globals g) {
-    extern __shared__ int __shm[];
-    auto &smem = *reinterpret_cast<smem_layout<NC, STAGES> *>(
-        ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
-    __shared__ semaphore full[STAGES];
-    __shared__ semaphore empty[STAGES];
-    if (threadIdx.x == 0) {
-        for (int s = 0; s < STAGES; ++s) {
-            init_semaphore(full[s], 1, 1);       // one producer arrive + one TMA transaction group
-            init_semaphore(empty[s], NC * 4, 0); // one arrive per consumer warp
-        }
-    }
-    __syncthreads();
-
-    const int role = warpgroup::groupid();   // 0..NC-1 consumers, NC producer, NC+1 comm slot
+__device__ __forceinline__ void run_gemm_roles(
+        const globals &g, smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES],
+        semaphore (&empty)[STAGES], int role) {
     const int n_tasks_per_m = g.n / (N_TILE * NC);
     const int64_t total = static_cast<int64_t>(g.m_tiles) * n_tasks_per_m;
     int64_t stage_counter = 0;
-
-    if (role == NC + 1) {
-        warpgroup::decrease_registers<comm_regs<CTAS_PER_SM>()>();
-        return;   // standalone GEMM: the comm slot only gives its registers back
-    }
     if (role == NC) {
         warpgroup::decrease_registers<producer_regs<CTAS_PER_SM>()>();
         if (warpgroup::warpid() != 0) return;
@@ -203,7 +188,6 @@ void grouped_kernel(const __grid_constant__ globals g) {
         }
         return;
     }
-
     warpgroup::increase_registers<consumer_regs<NC, CTAS_PER_SM>()>();
     const int barrier_id = role + 1;
     const int n_tiles_128 = g.n / N_TILE;
@@ -219,6 +203,34 @@ void grouped_kernel(const __grid_constant__ globals g) {
         store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.D, total_acc, m_tile, n_tile);
     }
     if (warpgroup::laneid() == 0) tma::store_async_wait();
+}
+
+template <int NC, int STAGES>
+__device__ __forceinline__ void init_ring(semaphore (&full)[STAGES], semaphore (&empty)[STAGES]) {
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < STAGES; ++s) {
+            init_semaphore(full[s], 1, 1);       // one producer arrive + one TMA transaction group
+            init_semaphore(empty[s], NC * 4, 0); // one arrive per consumer warp
+        }
+    }
+    __syncthreads();
+}
+
+template <int NC, int STAGES, int CTAS_PER_SM>
+__global__ __launch_bounds__(num_threads<NC>(), CTAS_PER_SM)
+void grouped_kernel(const __grid_constant__ globals g) {
+    extern __shared__ int __shm[];
+    auto &smem = *reinterpret_cast<smem_layout<NC, STAGES> *>(
+        ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
+    __shared__ semaphore full[STAGES];
+    __shared__ semaphore empty[STAGES];
+    init_ring<NC, STAGES>(full, empty);
+    const int role = warpgroup::groupid();   // 0..NC-1 consumers, NC producer, NC+1 comm slot
+    if (role == NC + 1) {
+        warpgroup::decrease_registers<comm_regs<CTAS_PER_SM>()>();
+        return;   // standalone GEMM: the comm slot only gives its registers back
+    }
+    run_gemm_roles<NC, STAGES, CTAS_PER_SM>(g, smem, full, empty, role);
 }
 
 template <int NC, int STAGES, int CTAS_PER_SM>
