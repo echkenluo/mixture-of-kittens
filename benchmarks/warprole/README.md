@@ -43,3 +43,33 @@ first K block (`block(0, total)` then an add-only loop) removed it. The remainin
 bytes of spill stores) is scalar reloads of `blockIdx`, `num_rows` and similar at task-loop heads inside
 the 40- and 64-register producer/comm regions plus the frames of the non-inlined trap calls; no `STL`/`LDL`
 sits between the `QGMMA` groups of either loop. Accepted.
+
+## Getting the built tree onto GPU9
+
+GPU9 cannot be reached from node 18 by ssh and the JumpServer command channel is limited to ~128 KB per
+call, so the built tree travels as an image layer instead: node 18 bakes `src/` (git tree at the branch
+head plus the untracked `mok/_C*.so`) on top of the build image and pushes it to harbor:
+
+```bash
+# node 18, after build_sm90.sh on the wanted head
+cd /home/lenovo/luocc/mok-warprole/src
+printf 'FROM harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130\nCOPY . /opt/mok-warprole\n' > ../Dockerfile.tree
+docker build -f ../Dockerfile.tree -t harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head> .
+docker push harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head>
+```
+
+On GPU9 pull that tag, copy the tree out to the host so logs and edits persist, and run the harnesses
+from the host copy with the same image (the toolchain the `.so` was built with):
+
+```bash
+docker pull harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head>
+id=$(docker create harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head> true)
+mkdir -p /home/lenovo/luocc/mok-warprole && docker cp $id:/opt/mok-warprole /home/lenovo/luocc/mok-warprole/src && docker rm $id
+docker run --rm --network host --gpus all -e CUDA_VISIBLE_DEVICES=1 \
+  -v /home/lenovo/luocc/mok-warprole/src:/mok/src -v /home/lenovo/luocc/mok-warprole/runtime-logs:/mok/runtime-logs \
+  --entrypoint bash harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130-mokwarprole-<head> \
+  -c "cd /mok/src && python3 -m benchmarks.bench_warprole_gemm"
+```
+
+`--network host` is required on GPU9 (no docker0). The provenance gate of the production bench needs
+the host copy's `git status --porcelain` to be empty, so edit only through commits.
