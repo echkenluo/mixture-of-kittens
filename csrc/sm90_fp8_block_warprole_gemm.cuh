@@ -40,10 +40,13 @@ template <int NC> struct stage_smem {
 template <int NC, int STAGES> struct smem_layout {
     stage_smem<NC> stage[STAGES];
     d_st d[2];                        // per-consumer staging (GEMM) or gate/up pair (fused W13)
+    d_st w2d[NC];                     // fused kernel: W2 TMA-store staging, so d[] stays the W13 hand-off
     float b_scale[2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
 };
 
-constexpr int PRODUCER_REGS = 40;
+// 56 (not 40): warps 1-3 of the producer warpgroup run the fused W13 epilogue in
+// the fused kernel and need the room; 2*128*192 + 128*56 + 128*64 = 64512 <= 64K.
+constexpr int PRODUCER_REGS = 56;
 constexpr int COMM_REGS = 64;
 template <int NC> constexpr int num_threads() { return 128 * (NC + 2); }
 template <int NC, int CTAS_PER_SM> constexpr int consumer_regs() {
@@ -160,21 +163,26 @@ __device__ __forceinline__ void stage_b_scale_row(
 
 // Write a finished M64 x N128 tile to global memory through the consumer's own
 // staging tile with a TMA store.  All 128 threads of consumer `c` call this.
+template <typename D_GL>
+__device__ __forceinline__ void store_bf16_tile_via(
+        d_st &staging, int barrier_id, const D_GL &D, const acc_rt &total, int m_tile, int n_tile) {
+    if (warpgroup::laneid() == 0) tma::store_async_read_wait();   // the previous store has read staging
+    warpgroup::sync(barrier_id);
+    rt_bf<16, N_TILE> out;
+    warp::copy(out, total);
+    warpgroup::store(staging, out);
+    fence_async_proxy_shared();          // make generic-proxy smem writes visible to the TMA unit
+    warpgroup::sync(barrier_id);
+    if (warpgroup::laneid() == 0) {
+        tma::store_async(D, staging, {m_tile, n_tile});
+        tma::store_commit_group();
+    }
+}
 template <int NC, int STAGES, typename D_GL>
 __device__ __forceinline__ void store_bf16_tile(
         smem_layout<NC, STAGES> &smem, int c, int barrier_id, const D_GL &D, const acc_rt &total,
         int m_tile, int n_tile) {
-    if (warpgroup::laneid() == 0) tma::store_async_read_wait();   // the previous store has read d[c]
-    warpgroup::sync(barrier_id);
-    rt_bf<16, N_TILE> out;
-    warp::copy(out, total);
-    warpgroup::store(smem.d[c], out);
-    fence_async_proxy_shared();          // make generic-proxy smem writes visible to the TMA unit
-    warpgroup::sync(barrier_id);
-    if (warpgroup::laneid() == 0) {
-        tma::store_async(D, smem.d[c], {m_tile, n_tile});
-        tma::store_commit_group();
-    }
+    store_bf16_tile_via(smem.d[c], barrier_id, D, total, m_tile, n_tile);
 }
 
 // ---------------------------------------------------------------------------

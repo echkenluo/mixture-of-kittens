@@ -41,6 +41,16 @@ constexpr unsigned long long SITE_WARPROLE_PUSH_DONE = 44ull;
 constexpr unsigned long long SITE_WARPROLE_CONTRACT = 45ull;
 constexpr unsigned long long SITE_WARPROLE_TASK_BOX = 46ull;
 
+// Named barriers of the W13 hand-off between the consumers and the epilogue warps
+// (warps 1-3 of the producer warpgroup): ids 1-2 are the consumer warpgroups,
+// 3 the standalone consumers_sync, 4 the phase-5 consumer barrier.
+constexpr int BAR_D_FULL = 5;    // consumers arrive after parking gate/up in smem.d, epilogue warps sync
+constexpr int BAR_D_EMPTY = 6;   // epilogue warps arrive when done reading smem.d, consumers sync
+constexpr int BAR_EPI = 7;       // the 96 epilogue threads alone
+constexpr int EPI_WARPS = 3;
+constexpr int EPI_THREADS = 32 * EPI_WARPS;
+template <int NC> constexpr int handoff_threads() { return 128 * NC + EPI_THREADS; }
+
 constexpr int W2_N_TILES_128 = HIDDEN / N_TILE;     // 32
 constexpr int W13_N_TILES_128 = 2 * INTER / N_TILE; // 32 (interleaved gate/up)
 
@@ -216,6 +226,7 @@ void kernel(const __grid_constant__ globals g) {
     __shared__ int expert_row_end[256];
     __shared__ int task_box[2];          // claimed task index by parity, -1 = no more tasks
     __shared__ unsigned int task_seq;    // entries the producer has published so far
+    __shared__ int epi_task[2];          // (m_tile, i_tile) of the gate/up pair parked in smem.d; m_tile -1 = end
     if (threadIdx.x == 0) {
         task_seq = 0u;
         // arrival count 1: the expect_tx arrive of issue(); the copies only move the tx-count
@@ -266,7 +277,27 @@ void kernel(const __grid_constant__ globals g) {
     } else if (role == NC) {
         // ------------------------------------------------ producer warpgroup
         warpgroup::decrease_registers<gemm::producer_regs<1>()>();
-        if (warpgroup::warpid() == 0) {
+        if (warpgroup::warpid() != 0) {
+            // Warps 1-3: fused SwiGLU/quant epilogue of every W13 tile the consumers park in
+            // smem.d, so the tensor cores never wait for it.  Hand-off through two named
+            // barriers; this side also publishes hidden_ready for the tile.
+            const int t = static_cast<int>(threadIdx.x) - (NC * 128 + 32);
+            asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+            for (;;) {
+                asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
+                const int m_tile = *reinterpret_cast<volatile int *>(&epi_task[0]);
+                const int i_tile = *reinterpret_cast<volatile int *>(&epi_task[1]);
+                if (m_tile < 0) break;
+                epilogue::swiglu_quant_tile<EPI_THREADS>(t, smem.d[0], smem.d[1], g.hidden, g.hidden_scale,
+                                                         m_tile, i_tile, g.limit);
+                asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                asm volatile("bar.sync %0, %1;" :: "n"(BAR_EPI), "n"(EPI_THREADS) : "memory");
+                if (t == 0) {   // barrier cumulativity + gpu-scope fence publish the whole tile
+                    asm volatile("{fence.acq_rel.gpu;}" ::: "memory");
+                    comm::add_release_gpu(g.hidden_ready + m_tile, 1u);
+                }
+            }
+        } else {
             int64_t stage_counter = 0;
             // Lane 0 claims one task ahead: the atomic's round trip then hides behind the
             // loads of the task in flight instead of stalling the producer at every task start.
@@ -336,14 +367,15 @@ void kernel(const __grid_constant__ globals g) {
                     first_task = false;
                 }
                 const int expert = g.c.m_indices[tk.m_tile * M_TILE];
-                epilogue::consumer_w13_task<NC, STAGES>(smem, full, empty, stage_counter, role, g.w13i_scale, expert,
-                                                        tk.m_tile, tk.n_index, g.hidden, g.hidden_scale, g.limit);
-                // consumer_w13_task ends with a barrier over all consumer threads: thread 0
-                // publishes the whole tile (barrier cumulativity + gpu-scope fence).
+                epilogue::consumer_w13_gemm_to_d<NC, STAGES>(
+                    smem, full, empty, stage_counter, role, g.w13i_scale, expert, tk.n_index,
+                    [] { asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory"); });
                 if (threadIdx.x == 0) {
-                    asm volatile("{fence.acq_rel.gpu;}" ::: "memory");
-                    comm::add_release_gpu(g.hidden_ready + tk.m_tile, 1u);
+                    *reinterpret_cast<volatile int *>(&epi_task[0]) = tk.m_tile;
+                    *reinterpret_cast<volatile int *>(&epi_task[1]) = tk.n_index;
                 }
+                // the epilogue warps take it from here (SwiGLU/quant + hidden_ready)
+                asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
             } else {
                 if (warpgroup::laneid() == 0)
                     wait_geq_or_trap<false>(g, g.hidden_ready + tk.m_tile,
@@ -356,7 +388,7 @@ void kernel(const __grid_constant__ globals g) {
                 warpgroup::sync(barrier_id);
                 gemm::acc_rt acc;
                 gemm::consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], W2_K_BLOCKS, acc);
-                gemm::store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.routed_y_gl, acc, tk.m_tile, n_tile);
+                gemm::store_bf16_tile_via(smem.w2d[role], barrier_id, g.routed_y_gl, acc, tk.m_tile, n_tile);
                 if (warpgroup::laneid() == 0) {
                     tma::store_async_wait();                                   // routed_y tile landed
                     asm volatile("{fence.proxy.async.global;}" ::: "memory");
@@ -366,6 +398,10 @@ void kernel(const __grid_constant__ globals g) {
             }
         }
         if (threadIdx.x == 0) stamp(g, 4);
+        // end of stream: release the epilogue warps with the sentinel
+        asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+        if (threadIdx.x == 0) *reinterpret_cast<volatile int *>(&epi_task[0]) = -1;
+        asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
     }
 
     // ---------------------------------------------------- phase 5: all roles rejoin

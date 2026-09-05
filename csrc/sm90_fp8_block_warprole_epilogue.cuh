@@ -29,30 +29,33 @@ template <int NC> __device__ __forceinline__ void consumers_sync() {
     else asm volatile("bar.sync 3, 256;" ::: "memory");
 }
 
-// All 128*NC consumer threads call this after the bf16 gate tile sits in
-// `gate_tile`, the bf16 up tile in `up_tile`, and consumers_sync() passed.
-// Thread t handles 8 consecutive columns of one row per pass; 16 threads share
-// a row so the K128 absmax is a 16-lane shuffle reduction.
-template <int NC>
+// EPI_THREADS threads (t = 0..EPI_THREADS-1, whole warps) call this after the
+// bf16 gate tile sits in `gate_tile`, the bf16 up tile in `up_tile`, and the
+// caller's barrier passed.  Thread t handles 8 consecutive columns of one row
+// per pass; 16 threads share a row so the K128 absmax is a 16-lane shuffle
+// reduction.  EPI_THREADS need not divide the tile: the last pass is guarded
+// (the guard is uniform over each 16-lane group, so the shuffle stays whole).
+template <int EPI_THREADS>
 __device__ __forceinline__ void swiglu_quant_tile(
-        d_st &gate_tile, d_st &up_tile, uint8_t *hidden, float *hidden_scale,
+        int t, d_st &gate_tile, d_st &up_tile, uint8_t *hidden, float *hidden_scale,
         int m_tile, int i_tile, float limit) {
-    constexpr int EPI_THREADS = 128 * NC;
+    static_assert(EPI_THREADS % 32 == 0);
     constexpr int THREADS_PER_ROW = N_TILE / 8;                    // 16
-    constexpr int ROWS_PER_PASS = EPI_THREADS / THREADS_PER_ROW;   // 8 or 16
-    static_assert(M_TILE % ROWS_PER_PASS == 0);
-    const int t = threadIdx.x;
+    constexpr int ROWS_PER_PASS = EPI_THREADS / THREADS_PER_ROW;   // 6, 8 or 16
+    constexpr int PASSES = (M_TILE + ROWS_PER_PASS - 1) / ROWS_PER_PASS;
     const int sub = t % THREADS_PER_ROW;
     const int col0 = sub * 8;
     const __nv_bfloat162 limit2 = __floats2bfloat162_rn(limit, limit);
     const __nv_bfloat162 neg_limit2 = __floats2bfloat162_rn(-limit, -limit);
 #pragma unroll 1
-    for (int pass = 0; pass < M_TILE / ROWS_PER_PASS; ++pass) {
+    for (int pass = 0; pass < PASSES; ++pass) {
         const int local_row = pass * ROWS_PER_PASS + t / THREADS_PER_ROW;
+        const bool valid = local_row < M_TILE;
+        const int load_row = valid ? local_row : 0;
         const uint4 gate_raw = *reinterpret_cast<const uint4 *>(
-            d_st::idx(gate_tile.data, {local_row, col0}));
+            d_st::idx(gate_tile.data, {load_row, col0}));
         const uint4 up_raw = *reinterpret_cast<const uint4 *>(
-            d_st::idx(up_tile.data, {local_row, col0}));
+            d_st::idx(up_tile.data, {load_row, col0}));
         const __nv_bfloat162 *gate_pairs = reinterpret_cast<const __nv_bfloat162 *>(&gate_raw);
         const __nv_bfloat162 *up_pairs = reinterpret_cast<const __nv_bfloat162 *>(&up_raw);
         float values[8];
@@ -80,6 +83,7 @@ __device__ __forceinline__ void swiglu_quant_tile(
             const uint32_t hi = pipeline::pack_v4_fp8x2(values[4 * i + 2] * inv_scale, values[4 * i + 3] * inv_scale);
             packed[i] = lo | (hi << 16);
         }
+        if (!valid) continue;
         const size_t row = static_cast<size_t>(m_tile) * M_TILE + local_row;
         *reinterpret_cast<uint2 *>(hidden + row * INTER + i_tile * N_TILE + col0) =
             make_uint2(packed[0], packed[1]);
@@ -120,8 +124,43 @@ __device__ __forceinline__ void consumer_w13_task(
         }
     }
     consumers_sync<NC>();   // gate and up tiles visible to every consumer thread
-    swiglu_quant_tile<NC>(smem.d[0], smem.d[1], hidden, hidden_scale, m_tile, i_tile, limit);
+    swiglu_quant_tile<128 * NC>(threadIdx.x, smem.d[0], smem.d[1], hidden, hidden_scale, m_tile, i_tile, limit);
     consumers_sync<NC>();   // nobody still reads d[] when the next task overwrites it
+}
+
+// Fused-kernel split of the W13 task: the consumers only run the mainloop(s) and
+// park the bf16 gate/up tiles in smem.d[]; the epilogue runs on other warps.
+// `wait_d_empty` is called once, right before the first store into d[].
+template <int NC, int STAGES, typename WaitEmpty>
+__device__ __forceinline__ void consumer_w13_gemm_to_d(
+        smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
+        int64_t &stage_counter, int role, const float *B_scale, int expert, int i_tile, WaitEmpty wait_d_empty) {
+    constexpr int N_TILES_128 = 2 * INTER / N_TILE;
+    constexpr int K_BLOCKS = W13_K_BLOCKS;
+    if constexpr (NC == 2) {
+        const int n_tile = 2 * i_tile + role;
+        gemm::stage_b_scale_row<NC, STAGES>(smem, role, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
+        warpgroup::sync(role + 1);
+        acc_rt acc;
+        gemm::consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], K_BLOCKS, acc);
+        rt_bf<16, N_TILE> out;
+        warp::copy(out, acc);
+        wait_d_empty();
+        warpgroup::store(smem.d[role], out);
+    } else {
+#pragma unroll 1
+        for (int half = 0; half < 2; ++half) {
+            const int n_tile = 2 * i_tile + half;
+            gemm::stage_b_scale_row<NC, STAGES>(smem, half, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
+            warpgroup::sync(1);
+            acc_rt acc;
+            gemm::consumer_task<NC, STAGES>(smem, full, empty, stage_counter, 0, smem.b_scale[half], K_BLOCKS, acc);
+            rt_bf<16, N_TILE> out;
+            warp::copy(out, acc);
+            if (half == 0) wait_d_empty();
+            warpgroup::store(smem.d[half], out);
+        }
+    }
 }
 
 // Producer-side W13 task: the same stage sequence the consumers consume.
