@@ -40,7 +40,6 @@ template <int NC> struct stage_smem {
 template <int NC, int STAGES> struct smem_layout {
     stage_smem<NC> stage[STAGES];
     d_st d[2];                        // per-consumer staging (GEMM) or gate/up pair (fused W13)
-    d_st w2d[NC];                     // fused kernel: W2 TMA-store staging, so d[] stays the W13 hand-off
     float b_scale[2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
 };
 

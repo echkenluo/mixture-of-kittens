@@ -226,7 +226,7 @@ void kernel(const __grid_constant__ globals g) {
     __shared__ int expert_row_end[256];
     __shared__ int task_box[2];          // claimed task index by parity, -1 = no more tasks
     __shared__ unsigned int task_seq;    // entries the producer has published so far
-    __shared__ int epi_task[2];          // (m_tile, i_tile) of the gate/up pair parked in smem.d; m_tile -1 = end
+    __shared__ int epi_task[2];          // (m_tile, i_tile) of the gate/up pair parked in smem.d; -1 = end, -2 = W2 skip
     if (threadIdx.x == 0) {
         task_seq = 0u;
         // arrival count 1: the expect_tx arrive of issue(); the copies only move the tx-count
@@ -287,7 +287,11 @@ void kernel(const __grid_constant__ globals g) {
                 asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
                 const int m_tile = *reinterpret_cast<volatile int *>(&epi_task[0]);
                 const int i_tile = *reinterpret_cast<volatile int *>(&epi_task[1]);
-                if (m_tile < 0) break;
+                if (m_tile == -1) break;
+                if (m_tile == -2) {   // a W2 store borrowed d and has released it
+                    asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                    continue;
+                }
                 epilogue::swiglu_quant_tile<EPI_THREADS>(t, smem.d[0], smem.d[1], g.hidden, g.hidden_scale,
                                                          m_tile, i_tile, g.limit);
                 asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
@@ -388,7 +392,14 @@ void kernel(const __grid_constant__ globals g) {
                 warpgroup::sync(barrier_id);
                 gemm::acc_rt acc;
                 gemm::consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], W2_K_BLOCKS, acc);
-                gemm::store_bf16_tile_via(smem.w2d[role], barrier_id, g.routed_y_gl, acc, tk.m_tile, n_tile);
+                // The store stages through smem.d[role], which the W13 hand-off owns: take the
+                // token, and give it back through a skip entry once the TMA unit has read d.
+                asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                gemm::store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.routed_y_gl, acc, tk.m_tile, n_tile);
+                if (warpgroup::laneid() == 0) tma::store_async_read_wait();   // d[role] read by the TMA unit
+                warpgroup::sync(barrier_id);
+                if (threadIdx.x == 0) *reinterpret_cast<volatile int *>(&epi_task[0]) = -2;
+                asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
                 if (warpgroup::laneid() == 0) {
                     tma::store_async_wait();                                   // routed_y tile landed
                     asm volatile("{fence.proxy.async.global;}" ::: "memory");
@@ -423,35 +434,54 @@ void kernel(const __grid_constant__ globals g) {
         char *slots = reinterpret_cast<char *>(&smem);
         const int stride = static_cast<int>(gridDim.x);
         const int n = (g.c.num_local_tokens - static_cast<int>(blockIdx.x) + stride - 1) / stride;
-        auto issue = [&](int j) {   // thread 0: stage this CTA's j-th token into slot j % RSTAGES
+        // Every global latency on the per-token path is prefetched one token ahead: the
+        // ids/weights of token j + 1 for the reduce, the ids of token j + RSTAGES + 1 for
+        // the issuing thread.  Without this each token paid a ~1.5 us round trip before
+        // its rows could even be requested and the phase ran at a quarter of HBM bandwidth.
+        auto load_ids = [&](int j, int (&ids)[TOPK]) {
+            const size_t route_base = static_cast<size_t>(blockIdx.x + j * stride) * TOPK;
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r) ids[r] = g.topk_ids[route_base + r];
+        };
+        auto load_w = [&](int j, float (&w)[TOPK]) {
+            const size_t route_base = static_cast<size_t>(blockIdx.x + j * stride) * TOPK;
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r) w[r] = g.weights[route_base + r];
+        };
+        auto issue = [&](int j, const int (&ids)[TOPK]) {   // thread 0: token j -> slot j % RSTAGES
             const size_t route_base = static_cast<size_t>(blockIdx.x + j * stride) * TOPK;
             char *slot = slots + (j % RSTAGES) * REDUCE_TOKEN_BYTES;
             uint32_t bytes = 0;
 #pragma unroll
-            for (int r = 0; r < TOPK; ++r) bytes += g.topk_ids[route_base + r] < 0 ? 0u : REDUCE_ROW_BYTES;
+            for (int r = 0; r < TOPK; ++r) bytes += ids[r] < 0 ? 0u : REDUCE_ROW_BYTES;
             tma::expect_bytes(reduce_full[j % RSTAGES], bytes);
 #pragma unroll
             for (int r = 0; r < TOPK; ++r)
-                if (g.topk_ids[route_base + r] >= 0)
+                if (ids[r] >= 0)
                     bulk_load(slot + r * REDUCE_ROW_BYTES, g.combine_local + (route_base + r) * HIDDEN,
                               REDUCE_ROW_BYTES, reduce_full[j % RSTAGES]);
         };
+        int ids_issue[TOPK];
         if (threadIdx.x == 0) {
             // The rows were written by the peers' comm warps (generic proxy, acquired above through
             // push_done); the bulk copies read them through the async proxy.
             asm volatile("{fence.proxy.async.global;}" ::: "memory");
-            for (int j = 0; j < RSTAGES && j < n; ++j) issue(j);
+            for (int j = 0; j < RSTAGES && j < n; ++j) {
+                load_ids(j, ids_issue);
+                issue(j, ids_issue);
+            }
+            if (RSTAGES < n) load_ids(RSTAGES, ids_issue);
         }
+        int ids_next[TOPK];
+        float w_next[TOPK];
+        if (n > 0) { load_ids(0, ids_next); load_w(0, w_next); }
         for (int j = 0; j < n; ++j) {
             const int token = static_cast<int>(blockIdx.x) + j * stride;
-            const size_t route_base = static_cast<size_t>(token) * TOPK;
             int ids[TOPK];
             float w[TOPK];
 #pragma unroll
-            for (int r = 0; r < TOPK; ++r) {
-                ids[r] = g.topk_ids[route_base + r];
-                w[r] = g.weights[route_base + r];
-            }
+            for (int r = 0; r < TOPK; ++r) { ids[r] = ids_next[r]; w[r] = w_next[r]; }
+            if (j + 1 < n) { load_ids(j + 1, ids_next); load_w(j + 1, w_next); }
             const char *slot = slots + (j % RSTAGES) * REDUCE_TOKEN_BYTES;
             wait(reduce_full[j % RSTAGES], (j / RSTAGES) & 1);
             __nv_bfloat16 *out_row = g.output + static_cast<size_t>(token) * HIDDEN;
@@ -466,7 +496,10 @@ void kernel(const __grid_constant__ globals g) {
                 *reinterpret_cast<uint4 *>(out_row + col) = reduce_chunk(raw, ids, w);
             }
             asm volatile("bar.sync 4, %0;" :: "n"(THREADS) : "memory");   // every thread is done with the slot
-            if (threadIdx.x == 0 && j + RSTAGES < n) issue(j + RSTAGES);
+            if (threadIdx.x == 0 && j + RSTAGES < n) {
+                issue(j + RSTAGES, ids_issue);
+                if (j + RSTAGES + 1 < n) load_ids(j + RSTAGES + 1, ids_issue);
+            }
         }
     }
     if (g.probe != nullptr) {   // benchmark-only: one extra barrier so slot 7 covers every reduce warp
