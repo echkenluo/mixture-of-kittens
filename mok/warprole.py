@@ -89,7 +89,7 @@ class WarpRoleState:
     hidden_ready: torch.Tensor    # (capacity/64,) int32
     y_ready: torch.Tensor         # (capacity/64,) int32
     push_done_local: torch.Tensor      # (1,) int32
-    input_expected_scratch: torch.Tensor  # (1,) int32
+    input_expected_scratch: torch.Tensor  # (3,) int32: rank-barrier scratch, task cursor, CTAs done
     push_done: torch.Tensor       # (1,) int32, symmetric
     push_done_handle: Any
     push_done_ptrs: list[int]
@@ -170,7 +170,7 @@ def create_warprole_state(
     hidden_ready = torch.zeros(capacity // M_TILE, dtype=torch.int32, device=device)
     y_ready = torch.zeros(capacity // M_TILE, dtype=torch.int32, device=device)
     push_done_local = torch.zeros(1, dtype=torch.int32, device=device)
-    input_expected_scratch = torch.zeros(1, dtype=torch.int32, device=device)
+    input_expected_scratch = torch.zeros(3, dtype=torch.int32, device=device)
 
     # The symmetric arrival counter every rank's combine_finish adds to.  It
     # must come from symmetric memory: the kernel dereferences the peer

@@ -8,9 +8,13 @@
 //   3  W2 tasks  -> routed_y, y_ready     producer + consumers (TMA store)
 //   4  combine tile m -> peers, push_done comm warpgroup
 //   5  weighted reduce of local tokens    consumers, after push_done == ep_size
-// The task stream is static (config.cuh decode_task); dependencies are the
-// three counters plus the ring barriers inside the CTA.  Every wait is bounded
-// by spin_limit and traps through the shared trap record.
+// The task stream order is static (config.cuh decode_task) but the assignment
+// is dynamic: each CTA's producer claims the next index from a global cursor
+// (input_expected_scratch[1]) and hands it to its consumers through a 2-entry
+// shared-memory mailbox, so a CTA that finished early takes the next task instead
+// of idling on a fixed stride.  The last CTA to finish rewinds the cursor.
+// Dependencies are the three counters plus the ring barriers inside the CTA.
+// Every wait is bounded by spin_limit and traps through the shared trap record.
 #if defined(KITTENS_SM90)
 #include <cstdlib>
 #include <ATen/ATen.h>
@@ -35,6 +39,7 @@ constexpr unsigned long long SITE_WARPROLE_HIDDEN_READY = 42ull;
 constexpr unsigned long long SITE_WARPROLE_Y_READY = 43ull;
 constexpr unsigned long long SITE_WARPROLE_PUSH_DONE = 44ull;
 constexpr unsigned long long SITE_WARPROLE_CONTRACT = 45ull;
+constexpr unsigned long long SITE_WARPROLE_TASK_BOX = 46ull;
 
 constexpr int W2_N_TILES_128 = HIDDEN / N_TILE;     // 32
 constexpr int W13_N_TILES_128 = 2 * INTER / N_TILE; // 32 (interleaved gate/up)
@@ -60,6 +65,8 @@ struct globals {
     unsigned int *barrier_target = nullptr;
     unsigned int *barrier_multicast_ptr = nullptr;
     unsigned int *input_expected_scratch = nullptr;
+    unsigned int *task_cursor = nullptr;   // input_expected_scratch + 1: next unclaimed task index
+    unsigned int *cta_done = nullptr;      // input_expected_scratch + 2: CTAs finished; the last rewinds both
     unsigned long long *trap_record = nullptr;
     unsigned long long spin_limit = 0;
     // Benchmark-only knobs (MOK_WARPROLE_NO_DEPS / MOK_WARPROLE_COMM_OFF /
@@ -204,7 +211,12 @@ void kernel(const __grid_constant__ globals g) {
     __shared__ semaphore full[STAGES];
     __shared__ semaphore empty[STAGES];
     __shared__ int expert_row_end[256];
-    if (threadIdx.x == 0) tc::build_expert_row_ends(g.c, expert_row_end);
+    __shared__ int task_box[2];          // claimed task index by parity, -1 = no more tasks
+    __shared__ unsigned int task_seq;    // entries the producer has published so far
+    if (threadIdx.x == 0) {
+        task_seq = 0u;
+        tc::build_expert_row_ends(g.c, expert_row_end);
+    }
     gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
 
     const shape s = comm::active_shape(g.c);
@@ -251,8 +263,21 @@ void kernel(const __grid_constant__ globals g) {
         warpgroup::decrease_registers<gemm::producer_regs<1>()>();
         if (warpgroup::warpid() == 0) {
             int64_t stage_counter = 0;
-            for (int64_t t = blockIdx.x;; t += gridDim.x) {
-                const task tk = decode_task<NC>(t, s);
+            for (unsigned int k = 0;; ++k) {
+                // Claim the next task index and publish it to the consumers.  The mailbox
+                // entry for task k is not rewritten before task k + 2 is claimed, and the
+                // producer cannot get there until every consumer has drained task k + 1
+                // down to STAGES stages (STAGES < K blocks of any task), so the consumers
+                // have read entry k long before it is reused.
+                int t = 0;
+                if (laneid() == 0) t = static_cast<int>(atomicAdd(g.task_cursor, 1u));
+                t = __shfl_sync(0xffffffffu, t, 0);
+                const task tk = decode_task<NC>(static_cast<int64_t>(t), s);
+                if (laneid() == 0) {
+                    *reinterpret_cast<volatile int *>(&task_box[k & 1u]) = tk.kind == task_kind::none ? -1 : t;
+                    __threadfence_block();
+                    *reinterpret_cast<volatile unsigned int *>(&task_seq) = k + 1u;
+                }
                 if (tk.kind == task_kind::none) break;
                 if (tk.kind == task_kind::w13) {
                     if (laneid() == 0)
@@ -283,9 +308,16 @@ void kernel(const __grid_constant__ globals g) {
         int64_t stage_counter = 0;
         const int barrier_id = role + 1;
         bool first_task = true;
-        for (int64_t t = blockIdx.x;; t += gridDim.x) {
-            const task tk = decode_task<NC>(t, s);
-            if (tk.kind == task_kind::none) break;
+        for (unsigned int k = 0;; ++k) {
+            unsigned long long iters = 0;
+            while (*reinterpret_cast<volatile unsigned int *>(&task_seq) < k + 1u) {
+                __nanosleep(32);
+                if (++iters >= g.spin_limit) trap(g, ERR_TIMEOUT, SITE_WARPROLE_TASK_BOX, k, k + 1u, 0, iters);
+            }
+            __threadfence_block();
+            const int t = *reinterpret_cast<volatile int *>(&task_box[k & 1u]);
+            if (t < 0) break;
+            const task tk = decode_task<NC>(static_cast<int64_t>(t), s);
             if (tk.kind == task_kind::w13) {
                 if (warpgroup::laneid() == 0)
                     wait_geq_or_trap<false>(g, g.c.x_ready + tk.minibatch,
@@ -348,6 +380,15 @@ void kernel(const __grid_constant__ globals g) {
         asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
         if (threadIdx.x == 0) stamp(g, 7);
     }
+    if (threadIdx.x == 0) {
+        // Every producer has stopped claiming (phase-5 __syncthreads above), so the last CTA
+        // to arrive rewinds the cursor for the next launch; the prepare kernel zeroes it too,
+        // but the benchmark knob modes call the fused kernel back to back without prepare.
+        if (atomicAdd(g.cta_done, 1u) + 1u == gridDim.x) {
+            atomicExch(g.task_cursor, 0u);
+            atomicExch(g.cta_done, 0u);
+        }
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0 && !g.skip_waits) {
         // Contract closure: every counter must have landed exactly on its target.
         for (int q = 0; q < minibatches(s); ++q) {
@@ -391,7 +432,9 @@ __global__ void prepare_kernel(prepare_globals p) {
         if (i == 0) {
             *p.push_done_local = 0u;
             *p.push_done = 0u;
-            *p.input_expected_scratch = 0u;
+            p.input_expected_scratch[0] = 0u;   // rank-barrier scratch
+            p.input_expected_scratch[1] = 0u;   // task cursor
+            p.input_expected_scratch[2] = 0u;   // CTAs done
         }
     }
 }
@@ -403,6 +446,8 @@ inline void entry_prepare_out(at::Tensor x_ready, at::Tensor hidden_ready, at::T
     for (const at::Tensor *t : {&x_ready, &hidden_ready, &y_ready, &push_done_local, &push_done, &input_expected_scratch})
         TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kInt && t->is_contiguous() && t->dim() == 1 && t->numel() >= 1,
                     "warprole counters must be 1-D contiguous CUDA int32");
+    TORCH_CHECK(input_expected_scratch.numel() >= 3,
+                "input_expected_scratch must be int32 [3]: barrier scratch, task cursor, CTAs done");
     c10::cuda::CUDAGuard device_guard(x_ready.device());
     prepare_globals p{u32_ptr(x_ready), x_ready.numel(), u32_ptr(hidden_ready), hidden_ready.numel(),
                       u32_ptr(y_ready), y_ready.numel(), u32_ptr(push_done_local), u32_ptr(push_done),
@@ -493,6 +538,8 @@ inline void entry_out(
     for (const at::Tensor *t : {&barrier_buffer, &barrier_target, &input_expected_scratch})
         TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kInt && t->is_contiguous() && t->numel() >= 1,
                     "barrier state must be CUDA int32");
+    TORCH_CHECK(input_expected_scratch.numel() >= 3,
+                "input_expected_scratch must be int32 [3]: barrier scratch, task cursor, CTAs done");
     TORCH_CHECK(barrier_multicast_ptr > 0 && trap_record_ptr > 0 && spin_limit > 0,
                 "barrier multicast pointer, trap record pointer and spin limit must be positive");
     kittens::py::tensor_check<gemm::a_gl>(routed_x);
@@ -520,6 +567,8 @@ inline void entry_out(
     g.barrier_target = u32_ptr(barrier_target);
     g.barrier_multicast_ptr = reinterpret_cast<unsigned int *>(barrier_multicast_ptr);
     g.input_expected_scratch = u32_ptr(input_expected_scratch);
+    g.task_cursor = g.input_expected_scratch + 1;
+    g.cta_done = g.input_expected_scratch + 2;
     g.trap_record = utils::mok_resolve_trap_record(trap_record_ptr);
     g.spin_limit = static_cast<unsigned long long>(spin_limit);
     g.skip_waits = env_flag("MOK_WARPROLE_NO_DEPS");
