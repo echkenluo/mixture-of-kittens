@@ -44,6 +44,15 @@ bytes of spill stores) is scalar reloads of `blockIdx`, `num_rows` and similar a
 the 40- and 64-register producer/comm regions plus the frames of the non-inlined trap calls; no `STL`/`LDL`
 sits between the `QGMMA` groups of either loop. Accepted.
 
+**ptxas contracts the consumer's scale-and-accumulate into FFMA (found on the first H20 run,
+2026-09-05).** `fp8_block_pipeline::run_tile` compiles its per-K128 `mul_row` + `add` to FMUL + FADD
+(the copy-or-add sits in another basic block); the peeled warp-role consumer loop put the same pair in
+one basic block and ptxas fused it into 64 FFMA per K block (SASS: 64 FFMA, 0 FADD in each standalone
+kernel). The outputs then differed from split in ~0.008% of bf16 elements, almost all by one ulp,
+uniformly over rows, columns and tiles. `gemm::accumulate_rn` (`__fadd_rn`, never contracted) restores
+FMUL + FADD; check with `cuobjdump -sass` that the standalone kernels show 64 FADD and 0 FFMA before
+trusting any bitwise result from a new build.
+
 ## Getting the built tree onto GPU9
 
 GPU9 cannot be reached from node 18 by ssh and the JumpServer command channel is limited to ~128 KB per
@@ -76,3 +85,8 @@ copy is owned by another uid than the container's root, so without it git refuse
 the harnesses record `git_head: unavailable` with an empty (clean-looking) `source_state`. The
 provenance gate of the production bench needs the host copy's `git status --porcelain` to be empty, so
 edit only through commits.
+
+Runs longer than a minute or so must be detached from the JumpServer session (`nohup setsid bash
+chain.sh > runtime-logs/chain.log 2>&1 < /dev/null &`, then poll the log): an attached
+`docker run` died together with the session on 2026-09-05 and left no output. Use
+`git --no-pager` inside the session, the pty otherwise stops at a pager prompt.
