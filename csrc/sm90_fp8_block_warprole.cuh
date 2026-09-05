@@ -97,6 +97,56 @@ __device__ __forceinline__ void wait_geq_or_trap(const globals &g, const unsigne
 
 // Phase 0.  Executed by the whole comm warpgroup of every CTA; CTA 0 arrives on
 // behalf of this rank.  Same protocol as terminal_full::production_input_barrier.
+// Phase-5 reduce, one warp per token.  Per element this is exactly
+// route_flags::weighted_reduce_masked_value (invalid routes skipped, the first
+// valid route a rounded multiply, later ones rounded FMAs, one BF16 rounding),
+// so the output stays bitwise equal to the split path.  It replaces a
+// CTA-per-token loop over single BF16 loads that re-read topk_ids and weights
+// for every column and kept about one load latency in flight per thread:
+// 0.8 ms for 2048 tokens (~100 GB/s) on H20, measured with the step-3 knobs.
+__device__ __forceinline__ void reduce_token_warp(
+        const __nv_bfloat16 *combine, const float *weights, const int *topk_ids, __nv_bfloat16 *output,
+        int token, int lane) {
+    const size_t route_base = static_cast<size_t>(token) * TOPK;
+    int ids[TOPK];
+    float w[TOPK];
+    const __nv_bfloat16 *rows[TOPK];
+#pragma unroll
+    for (int r = 0; r < TOPK; ++r) {
+        ids[r] = topk_ids[route_base + r];
+        w[r] = weights[route_base + r];
+        rows[r] = combine + (route_base + r) * HIDDEN;
+    }
+    __nv_bfloat16 *out_row = output + static_cast<size_t>(token) * HIDDEN;
+#pragma unroll 2
+    for (int col = lane * 8; col < HIDDEN; col += 32 * 8) {
+        uint4 raw[TOPK];
+#pragma unroll
+        for (int r = 0; r < TOPK; ++r)
+            raw[r] = ids[r] < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                                : *reinterpret_cast<const uint4 *>(rows[r] + col);
+        __align__(16) __nv_bfloat16 out8[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            float acc = 0.0f;
+            bool initialized = false;
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r) {
+                if (ids[r] < 0) continue;
+                const float v = __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(&raw[r])[c]);
+                if (!initialized) {
+                    acc = __fmul_rn(v, w[r]);
+                    initialized = true;
+                } else {
+                    acc = __fmaf_rn(v, w[r], acc);
+                }
+            }
+            out8[c] = initialized ? __float2bfloat16_rn(acc) : __float2bfloat16_rn(0.0f);
+        }
+        *reinterpret_cast<uint4 *>(out_row + col) = *reinterpret_cast<const uint4 *>(out8);
+    }
+}
+
 __device__ __forceinline__ void rank_barrier(const globals &g) {
     if (warpgroup::laneid() == 0) {
         if (blockIdx.x == 0) {
@@ -243,10 +293,13 @@ void kernel(const __grid_constant__ globals g) {
     if (threadIdx.x == 0)
         wait_geq_or_trap<true>(g, g.c.push_done, static_cast<unsigned int>(g.c.ep_size), SITE_WARPROLE_PUSH_DONE, 0);
     asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
-    if (!g.reduce_off)   // MOK_WARPROLE_REDUCE_OFF: benchmark-only
-    for (int token = blockIdx.x; token < g.c.num_local_tokens; token += gridDim.x)
-        route_flags::reduce_claimed_token(g.combine_local, g.weights, g.topk_ids, g.output, token, HIDDEN,
-                                          threadIdx.x, 128 * NC);
+    if (!g.reduce_off) {   // MOK_WARPROLE_REDUCE_OFF: benchmark-only
+        constexpr int REDUCE_WARPS = 4 * NC;   // the consumer warps of this CTA
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        for (int token = blockIdx.x * REDUCE_WARPS + warp; token < g.c.num_local_tokens;
+             token += gridDim.x * REDUCE_WARPS)
+            reduce_token_warp(g.combine_local, g.weights, g.topk_ids, g.output, token, lane);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0 && !g.skip_waits) {
         // Contract closure: every counter must have landed exactly on its target.
         for (int q = 0; q < minibatches(s); ++q) {
