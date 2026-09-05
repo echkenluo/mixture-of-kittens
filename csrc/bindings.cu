@@ -181,6 +181,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("gemm_input_scale"), pybind11::arg("gemm_weight_scale"),
           pybind11::arg("gemm_m_indices"), pybind11::arg("gemm_num_tokens"),
           pybind11::arg("gemm_output"));
+    m.def("fp8_block_warprole_probe_read", &mok_sm90::warprole::fused::probe_read,
+          "Benchmark-only: the [num_sms, 8] int64 globaltimer stamps of the last fused call made with "
+          "MOK_WARPROLE_PROBE=1 (entry, rank barrier, dispatch, first W13, last task, combine, push_done, reduce).");
     m.def("fp8_block_warprole_prepare_out", &mok_sm90::warprole::fused::entry_prepare_out, "",
           pybind11::arg("x_ready"), pybind11::arg("hidden_ready"), pybind11::arg("y_ready"),
           pybind11::arg("push_done_local"), pybind11::arg("push_done"), pybind11::arg("input_expected_scratch"));

@@ -186,6 +186,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "real mode only: after the timed blocks run one more fused call with "
+            "MOK_WARPROLE_PROBE=1 and report the per-CTA globaltimer stamps "
+            "(rank barrier, dispatch, first W13, last task, combine, push_done, reduce) "
+            "relative to the earliest CTA entry, in microseconds"
+        ),
+    )
+    parser.add_argument(
         "--cases",
         default=",".join(CASES),
         help="comma-separated subset of " + ",".join(CASES),
@@ -684,6 +694,16 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     midpoint = 0.5 * (a1["p50_ms"] + a2["p50_ms"])
     drift = abs(a2["p50_ms"] - a1["p50_ms"]) / midpoint
     standalone_p50 = w13_row["p50_ms"] + w2_row["p50_ms"]
+    probe = None
+    if args.probe and args.knobs == "real":
+        dist.barrier()
+        os.environ["MOK_WARPROLE_PROBE"] = "1"
+        try:
+            run_fused()
+            torch.cuda.synchronize()
+        finally:
+            os.environ["MOK_WARPROLE_PROBE"] = "0"
+        probe = summarize_probe(_C.fp8_block_warprole_probe_read().cpu())
     return {
         "rank": dist.get_rank(),
         "order": ["fused_a1", "w13", "w2", "fused_a2"],
@@ -695,7 +715,37 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
         "fused_midpoint_p50_ms": midpoint,
         "standalone_pair_p50_ms": standalone_p50,
         "overhead": (midpoint - standalone_p50) / standalone_p50,
+        "probe_us": probe,
     }
+
+
+PROBE_SLOT_NAMES = (
+    "entry", "rank_barrier", "dispatch_done", "first_w13", "last_task",
+    "combine_finish", "push_done", "reduce_done",
+)
+
+
+def summarize_probe(stamps: torch.Tensor) -> dict:
+    """Per slot, the min / median / max over CTAs in microseconds after the earliest entry.
+
+    Slots a CTA never reaches stay zero (e.g. reduce_done on nothing) and are dropped.
+    """
+    stamps = stamps.to(torch.float64)
+    t0 = stamps[:, 0][stamps[:, 0] > 0].min()
+    out = {}
+    for slot, name in enumerate(PROBE_SLOT_NAMES):
+        col = stamps[:, slot]
+        col = col[col > 0]
+        if col.numel() == 0:
+            continue
+        rel = (col - t0) / 1000.0
+        out[name] = {
+            "min": float(rel.min()),
+            "median": float(rel.median()),
+            "max": float(rel.max()),
+            "ctas": int(col.numel()),
+        }
+    return out
 
 
 def combine_ranks(local: dict, world_size: int) -> dict:
@@ -723,6 +773,18 @@ def combine_ranks(local: dict, world_size: int) -> dict:
         "overhead_limit": OVERHEAD_LIMIT,
         "pass": max(per_rank_overhead) <= OVERHEAD_LIMIT,
     }
+
+
+def print_probes(record: dict) -> None:
+    for key in sorted(record["measurements"]):
+        for entry in record["measurements"][key]["per_rank"]:
+            probe = entry.get("probe_us")
+            if not probe:
+                continue
+            fields = "|".join(
+                f"{name}={v['min']:.0f}/{v['median']:.0f}/{v['max']:.0f}" for name, v in probe.items()
+            )
+            print(f"WARPROLE_PROBE|{key}|rank={entry['rank']}|{fields}")
 
 
 def print_verdicts(record: dict) -> None:
@@ -882,6 +944,7 @@ def main() -> None:
                 json.dump(record, sink, indent=1)
             os.replace(tmp, output)
             print_verdicts(record)
+            print_probes(record)
         dist.barrier()
     finally:
         warprole.clear_warprole_state_cache()

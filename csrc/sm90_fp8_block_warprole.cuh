@@ -68,6 +68,9 @@ struct globals {
     int skip_waits = 0;
     int comm_off = 0;
     int reduce_off = 0;
+    // Benchmark-only timeline probe (MOK_WARPROLE_PROBE): per CTA, PROBE_SLOTS
+    // globaltimer stamps at the phase boundaries; nullptr in production.
+    unsigned long long *probe = nullptr;
 
     // kittens::gl has no default constructor: the five TMA-described tensors come first.
     __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13, const gemm::b_gl &w2_,
@@ -80,6 +83,17 @@ __device__ __forceinline__ void trap(const globals &g, unsigned long long code, 
                                      unsigned long long observed, unsigned long long iters) {
     utils::mok_trap_commit(g.trap_record, code, site, slot, expected, observed,
                            static_cast<unsigned long long>(g.c.ep_rank), 0ull, iters);
+}
+
+constexpr int PROBE_SLOTS = 8;
+// 0 entry  1 rank barrier done  2 all minibatches dispatched  3 first W13 task starts
+// 4 last GEMM task done  5 combine_finish done  6 push_done observed  7 reduce done
+__device__ __forceinline__ void stamp(const globals &g, int slot) {
+    if (g.probe != nullptr) {
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        g.probe[blockIdx.x * PROBE_SLOTS + slot] = t;
+    }
 }
 
 template <bool SYS>
@@ -118,7 +132,7 @@ __device__ __forceinline__ void reduce_token_warp(
         rows[r] = combine + (route_base + r) * HIDDEN;
     }
     __nv_bfloat16 *out_row = output + static_cast<size_t>(token) * HIDDEN;
-#pragma unroll 2
+#pragma unroll 4
     for (int col = lane * 8; col < HIDDEN; col += 32 * 8) {
         uint4 raw[TOPK];
 #pragma unroll
@@ -194,13 +208,16 @@ void kernel(const __grid_constant__ globals g) {
         trap(g, ERR_CONTRACT, SITE_WARPROLE_CONTRACT, 0, 0, static_cast<unsigned long long>(s.num_rows), 0);
     const int role = warpgroup::groupid();   // 0..NC-1 consumers, NC producer, NC+1 comm
     const int m_tiles = s.num_rows / M_TILE;
+    if (threadIdx.x == 0) stamp(g, 0);
 
     if (role == NC + 1) {
         // ------------------------------------------------ comm warpgroup
         warpgroup::decrease_registers<gemm::comm_regs<1>()>();
         if (!g.comm_off) {   // MOK_WARPROLE_COMM_OFF: benchmark-only, the warpgroup idles
             rank_barrier(g);
+            if (warpgroup::laneid() == 0) stamp(g, 1);
             for (int q = 0; q < minibatches(s); ++q) comm::dispatch_minibatch(g.c, s, q, expert_row_end);
+            if (warpgroup::laneid() == 0) stamp(g, 2);
             for (int m = blockIdx.x; m < m_tiles; m += gridDim.x) {
                 if (warpgroup::laneid() == 0)
                     wait_geq_or_trap<false>(g, g.c.y_ready + m, static_cast<unsigned int>(y_ready_target<NC>()),
@@ -209,6 +226,7 @@ void kernel(const __grid_constant__ globals g) {
                 comm::combine_tile(g.c, m);
             }
             comm::combine_finish(g.c);
+            if (warpgroup::laneid() == 0) stamp(g, 5);
         }
     } else if (role == NC) {
         // ------------------------------------------------ producer warpgroup
@@ -246,6 +264,7 @@ void kernel(const __grid_constant__ globals g) {
         warpgroup::increase_registers<gemm::consumer_regs<NC, 1>()>();
         int64_t stage_counter = 0;
         const int barrier_id = role + 1;
+        bool first_task = true;
         for (int64_t t = blockIdx.x;; t += gridDim.x) {
             const task tk = decode_task<NC>(t, s);
             if (tk.kind == task_kind::none) break;
@@ -255,6 +274,10 @@ void kernel(const __grid_constant__ globals g) {
                                             static_cast<unsigned int>(x_ready_target(s, tk.minibatch)),
                                             SITE_WARPROLE_X_READY, tk.minibatch);
                 warpgroup::sync(barrier_id);
+                if (first_task) {
+                    if (threadIdx.x == 0) stamp(g, 3);
+                    first_task = false;
+                }
                 const int expert = g.c.m_indices[tk.m_tile * M_TILE];
                 epilogue::consumer_w13_task<NC, STAGES>(smem, full, empty, stage_counter, role, g.w13i_scale, expert,
                                                         tk.m_tile, tk.n_index, g.hidden, g.hidden_scale, g.limit);
@@ -285,13 +308,16 @@ void kernel(const __grid_constant__ globals g) {
                 }
             }
         }
+        if (threadIdx.x == 0) stamp(g, 4);
     }
 
     // ---------------------------------------------------- phase 5: all roles rejoin
     __syncthreads();
     if (role >= NC) return;   // producer and comm warps are done; consumers reduce
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
         wait_geq_or_trap<true>(g, g.c.push_done, static_cast<unsigned int>(g.c.ep_size), SITE_WARPROLE_PUSH_DONE, 0);
+        stamp(g, 6);
+    }
     asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
     if (!g.reduce_off) {   // MOK_WARPROLE_REDUCE_OFF: benchmark-only
         constexpr int REDUCE_WARPS = 4 * NC;   // the consumer warps of this CTA
@@ -299,6 +325,10 @@ void kernel(const __grid_constant__ globals g) {
         for (int token = blockIdx.x * REDUCE_WARPS + warp; token < g.c.num_local_tokens;
              token += gridDim.x * REDUCE_WARPS)
             reduce_token_warp(g.combine_local, g.weights, g.topk_ids, g.output, token, lane);
+    }
+    if (g.probe != nullptr) {   // benchmark-only: one extra barrier so slot 7 covers every reduce warp
+        asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
+        if (threadIdx.x == 0) stamp(g, 7);
     }
     if (blockIdx.x == 0 && threadIdx.x == 0 && !g.skip_waits) {
         // Contract closure: every counter must have landed exactly on its target.
@@ -370,6 +400,18 @@ inline void entry_prepare_out(at::Tensor x_ready, at::Tensor hidden_ready, at::T
 // forward entry
 // ---------------------------------------------------------------------------
 // "1" enables a benchmark-only knob; anything else (including unset) leaves it off.
+// Benchmark-only timeline probe buffer, [num_sms, PROBE_SLOTS] int64 ns, allocated on
+// first use when MOK_WARPROLE_PROBE=1 and read back through fp8_block_warprole_probe_read.
+inline at::Tensor &probe_buffer() {
+    static at::Tensor buffer;
+    return buffer;
+}
+inline at::Tensor probe_read() {
+    at::Tensor &buffer = probe_buffer();
+    TORCH_CHECK(buffer.defined(), "no probe recorded: set MOK_WARPROLE_PROBE=1 before a fused call");
+    return buffer;
+}
+
 inline int env_flag(const char *name) {
     const char *v = std::getenv(name);
     return (v != nullptr && v[0] == '1' && v[1] == '\0') ? 1 : 0;
@@ -479,6 +521,14 @@ inline void entry_out(
     int blocks_per_sm = 0;
     CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel_ptr, THREADS, SMEM));
     TORCH_CHECK(blocks_per_sm >= 1, "warprole kernel does not fit one CTA per SM (smem ", SMEM, " bytes)");
+    if (env_flag("MOK_WARPROLE_PROBE")) {
+        at::Tensor &buffer = probe_buffer();
+        if (!buffer.defined() || buffer.numel() != static_cast<int64_t>(num_sms) * PROBE_SLOTS
+            || buffer.device() != x.device())
+            buffer = at::zeros({num_sms, PROBE_SLOTS}, x.options().dtype(at::kLong));
+        buffer.zero_();
+        g.probe = reinterpret_cast<unsigned long long *>(buffer.data_ptr<int64_t>());
+    }
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
     kernel_ptr<<<num_sms, THREADS, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());
