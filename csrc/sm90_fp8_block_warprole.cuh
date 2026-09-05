@@ -118,9 +118,13 @@ __device__ __forceinline__ void wait_geq_or_trap(const globals &g, const unsigne
 // CTA-per-token loop over single BF16 loads that re-read topk_ids and weights
 // for every column and kept about one load latency in flight per thread:
 // 0.8 ms for 2048 tokens (~100 GB/s) on H20, measured with the step-3 knobs.
+// The pointers are restrict-qualified on purpose: without it the compiler has to
+// keep every 16-byte load behind the previous iteration's store to `output`, so
+// each 512-byte step of a row paid one full memory latency (149 / 248 us for
+// 2048 / 3888 tokens on the probe, ~0.8 TB/s).
 __device__ __forceinline__ void reduce_token_warp(
-        const __nv_bfloat16 *combine, const float *weights, const int *topk_ids, __nv_bfloat16 *output,
-        int token, int lane) {
+        const __nv_bfloat16 *__restrict__ combine, const float *__restrict__ weights,
+        const int *__restrict__ topk_ids, __nv_bfloat16 *__restrict__ output, int token, int lane) {
     const size_t route_base = static_cast<size_t>(token) * TOPK;
     int ids[TOPK];
     float w[TOPK];
@@ -218,12 +222,26 @@ void kernel(const __grid_constant__ globals g) {
             if (warpgroup::laneid() == 0) stamp(g, 1);
             for (int q = 0; q < minibatches(s); ++q) comm::dispatch_minibatch(g.c, s, q, expert_row_end);
             if (warpgroup::laneid() == 0) stamp(g, 2);
-            for (int m = blockIdx.x; m < m_tiles; m += gridDim.x) {
-                if (warpgroup::laneid() == 0)
-                    wait_geq_or_trap<false>(g, g.c.y_ready + m, static_cast<unsigned int>(y_ready_target<NC>()),
-                                            SITE_WARPROLE_Y_READY, m);
-                warpgroup::sync(7);
-                comm::combine_tile(g.c, m);
+            // Combine is striped by row over every comm warp of the grid rather than
+            // one tile per CTA: the tiles of the last minibatch all become ready at
+            // about the same time, and pushing a 512 KB tile from a single SM left a
+            // 64 us tail after the last GEMM task (probe, 2048 and 3888 tokens).
+            // With 4 * gridDim.x stripes > 64 a warp owns at most one row per tile.
+            {
+                const int stripes = static_cast<int>(gridDim.x) * 4;
+                const int stripe = static_cast<int>(blockIdx.x) * 4 + warpgroup::warpid();
+                const int lane = laneid();
+                for (int m = 0; m < m_tiles; ++m) {
+                    const int base = m * M_TILE;
+                    int r = stripe - base % stripes;
+                    if (r < 0) r += stripes;
+                    if (r >= M_TILE) continue;
+                    if (lane == 0)
+                        wait_geq_or_trap<false>(g, g.c.y_ready + m, static_cast<unsigned int>(y_ready_target<NC>()),
+                                                SITE_WARPROLE_Y_READY, m);
+                    __syncwarp();
+                    for (; r < M_TILE; r += stripes) tc::push_routed_row(g.c, base + r, lane);
+                }
             }
             comm::combine_finish(g.c);
             if (warpgroup::laneid() == 0) stamp(g, 5);
