@@ -129,47 +129,49 @@ __device__ __forceinline__ void wait_geq_or_trap(const globals &g, const unsigne
 // keep every 16-byte load behind the previous iteration's store to `output`, so
 // each 512-byte step of a row paid one full memory latency (149 / 248 us for
 // 2048 / 3888 tokens on the probe, ~0.8 TB/s).
-__device__ __forceinline__ void reduce_token_warp(
-        const __nv_bfloat16 *__restrict__ combine, const float *__restrict__ weights,
-        const int *__restrict__ topk_ids, __nv_bfloat16 *__restrict__ output, int token, int lane) {
-    const size_t route_base = static_cast<size_t>(token) * TOPK;
-    int ids[TOPK];
-    float w[TOPK];
-    const __nv_bfloat16 *rows[TOPK];
+// Weighted reduce of one 8-column chunk: raw[r] holds 8 bf16 of route r, routes with
+// ids < 0 are padding.  Same arithmetic order as split's combine_reduce: the first valid
+// route by __fmul_rn, the rest by __fmaf_rn in route order, one bf16 rounding at the end.
+__device__ __forceinline__ uint4 reduce_chunk(const uint4 (&raw)[TOPK], const int (&ids)[TOPK],
+                                              const float (&w)[TOPK]) {
+    __align__(16) __nv_bfloat16 out8[8];
 #pragma unroll
-    for (int r = 0; r < TOPK; ++r) {
-        ids[r] = topk_ids[route_base + r];
-        w[r] = weights[route_base + r];
-        rows[r] = combine + (route_base + r) * HIDDEN;
-    }
-    __nv_bfloat16 *out_row = output + static_cast<size_t>(token) * HIDDEN;
-#pragma unroll 4
-    for (int col = lane * 8; col < HIDDEN; col += 32 * 8) {
-        uint4 raw[TOPK];
+    for (int c = 0; c < 8; ++c) {
+        float acc = 0.0f;
+        bool initialized = false;
 #pragma unroll
-        for (int r = 0; r < TOPK; ++r)
-            raw[r] = ids[r] < 0 ? make_uint4(0u, 0u, 0u, 0u)
-                                : *reinterpret_cast<const uint4 *>(rows[r] + col);
-        __align__(16) __nv_bfloat16 out8[8];
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            float acc = 0.0f;
-            bool initialized = false;
-#pragma unroll
-            for (int r = 0; r < TOPK; ++r) {
-                if (ids[r] < 0) continue;
-                const float v = __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(&raw[r])[c]);
-                if (!initialized) {
-                    acc = __fmul_rn(v, w[r]);
-                    initialized = true;
-                } else {
-                    acc = __fmaf_rn(v, w[r], acc);
-                }
+        for (int r = 0; r < TOPK; ++r) {
+            if (ids[r] < 0) continue;
+            const float v = __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(&raw[r])[c]);
+            if (!initialized) {
+                acc = __fmul_rn(v, w[r]);
+                initialized = true;
+            } else {
+                acc = __fmaf_rn(v, w[r], acc);
             }
-            out8[c] = initialized ? __float2bfloat16_rn(acc) : __float2bfloat16_rn(0.0f);
         }
-        *reinterpret_cast<uint4 *>(out_row + col) = *reinterpret_cast<const uint4 *>(out8);
+        out8[c] = initialized ? __float2bfloat16_rn(acc) : __float2bfloat16_rn(0.0f);
     }
+    return *reinterpret_cast<const uint4 *>(out8);
+}
+
+// One-dimensional TMA bulk copy global -> this CTA's shared memory; completion is counted
+// as transaction bytes on `bar` (16-byte aligned addresses, size a multiple of 16).
+__device__ __forceinline__ void bulk_load(void *smem_dst, const void *gmem_src, uint32_t bytes, semaphore &bar) {
+    const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    const uint32_t mbar = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(dst), "l"(gmem_src), "r"(bytes), "r"(mbar) : "memory");
+}
+
+// Phase-5 reduce staging: the TOPK combine rows of one token are 48 KB; as many tokens as
+// the (idle by then) GEMM ring holds are kept in flight per CTA, at most four.
+constexpr int REDUCE_ROW_BYTES = HIDDEN * 2;
+constexpr int REDUCE_TOKEN_BYTES = TOPK * REDUCE_ROW_BYTES;
+template <int NC, int STAGES> constexpr int reduce_stages() {
+    constexpr int fit = static_cast<int>(sizeof(gemm::smem_layout<NC, STAGES>) / REDUCE_TOKEN_BYTES);
+    static_assert(fit >= 2, "the GEMM ring must hold at least two tokens of combine rows");
+    return fit > 4 ? 4 : fit;
 }
 
 __device__ __forceinline__ void rank_barrier(const globals &g) {
@@ -210,11 +212,13 @@ void kernel(const __grid_constant__ globals g) {
         ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
     __shared__ semaphore full[STAGES];
     __shared__ semaphore empty[STAGES];
+    __shared__ semaphore reduce_full[reduce_stages<NC, STAGES>()];
     __shared__ int expert_row_end[256];
     __shared__ int task_box[2];          // claimed task index by parity, -1 = no more tasks
     __shared__ unsigned int task_seq;    // entries the producer has published so far
     if (threadIdx.x == 0) {
         task_seq = 0u;
+        for (int r = 0; r < reduce_stages<NC, STAGES>(); ++r) init_semaphore(reduce_full[r], 1, 1);
         tc::build_expert_row_ends(g.c, expert_row_end);
     }
     gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
@@ -370,11 +374,61 @@ void kernel(const __grid_constant__ globals g) {
     }
     asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
     if (!g.reduce_off) {   // MOK_WARPROLE_REDUCE_OFF: benchmark-only
-        constexpr int REDUCE_WARPS = 4 * NC;   // the consumer warps of this CTA
-        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-        for (int token = blockIdx.x * REDUCE_WARPS + warp; token < g.c.num_local_tokens;
-             token += gridDim.x * REDUCE_WARPS)
-            reduce_token_warp(g.combine_local, g.weights, g.topk_ids, g.output, token, lane);
+        // Weighted reduce of the local tokens.  Register-only loads kept too little in flight
+        // (about a quarter of HBM bandwidth), so thread 0 stages the combine rows of the next
+        // RSTAGES tokens into the idle GEMM ring with TMA bulk copies and all consumer threads
+        // reduce from shared memory; each thread owns 8 consecutive columns per pass.
+        constexpr int RSTAGES = reduce_stages<NC, STAGES>();
+        constexpr int THREADS = 128 * NC;
+        constexpr int PASSES = HIDDEN / (8 * THREADS);
+        char *slots = reinterpret_cast<char *>(&smem);
+        const int stride = static_cast<int>(gridDim.x);
+        const int n = (g.c.num_local_tokens - static_cast<int>(blockIdx.x) + stride - 1) / stride;
+        auto issue = [&](int j) {   // thread 0: stage this CTA's j-th token into slot j % RSTAGES
+            const size_t route_base = static_cast<size_t>(blockIdx.x + j * stride) * TOPK;
+            char *slot = slots + (j % RSTAGES) * REDUCE_TOKEN_BYTES;
+            uint32_t bytes = 0;
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r) bytes += g.topk_ids[route_base + r] < 0 ? 0u : REDUCE_ROW_BYTES;
+            tma::expect_bytes(reduce_full[j % RSTAGES], bytes);
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r)
+                if (g.topk_ids[route_base + r] >= 0)
+                    bulk_load(slot + r * REDUCE_ROW_BYTES, g.combine_local + (route_base + r) * HIDDEN,
+                              REDUCE_ROW_BYTES, reduce_full[j % RSTAGES]);
+        };
+        if (threadIdx.x == 0) {
+            // The rows were written by the peers' comm warps (generic proxy, acquired above through
+            // push_done); the bulk copies read them through the async proxy.
+            asm volatile("{fence.proxy.async.global;}" ::: "memory");
+            for (int j = 0; j < RSTAGES && j < n; ++j) issue(j);
+        }
+        for (int j = 0; j < n; ++j) {
+            const int token = static_cast<int>(blockIdx.x) + j * stride;
+            const size_t route_base = static_cast<size_t>(token) * TOPK;
+            int ids[TOPK];
+            float w[TOPK];
+#pragma unroll
+            for (int r = 0; r < TOPK; ++r) {
+                ids[r] = g.topk_ids[route_base + r];
+                w[r] = g.weights[route_base + r];
+            }
+            const char *slot = slots + (j % RSTAGES) * REDUCE_TOKEN_BYTES;
+            wait(reduce_full[j % RSTAGES], (j / RSTAGES) & 1);
+            __nv_bfloat16 *out_row = g.output + static_cast<size_t>(token) * HIDDEN;
+#pragma unroll
+            for (int p = 0; p < PASSES; ++p) {
+                const int col = (p * THREADS + static_cast<int>(threadIdx.x)) * 8;
+                uint4 raw[TOPK];
+#pragma unroll
+                for (int r = 0; r < TOPK; ++r)
+                    raw[r] = ids[r] < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                                        : *reinterpret_cast<const uint4 *>(slot + r * REDUCE_ROW_BYTES + col * 2);
+                *reinterpret_cast<uint4 *>(out_row + col) = reduce_chunk(raw, ids, w);
+            }
+            asm volatile("bar.sync 4, %0;" :: "n"(THREADS) : "memory");   // every thread is done with the slot
+            if (threadIdx.x == 0 && j + RSTAGES < n) issue(j + RSTAGES);
+        }
     }
     if (g.probe != nullptr) {   // benchmark-only: one extra barrier so slot 7 covers every reduce warp
         asm volatile("bar.sync 4, %0;" :: "n"(128 * NC) : "memory");
