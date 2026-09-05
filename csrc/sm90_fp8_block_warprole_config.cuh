@@ -42,26 +42,44 @@ template <int NC> MOK_WARPROLE_HD int64_t tasks_before_minibatch(shape s, int q)
 template <int NC> MOK_WARPROLE_HD int64_t total_tasks(shape s) {
     return static_cast<int64_t>(s.num_rows / M_TILE) * geometry<NC>::TASKS_PER_TILE;
 }
+// Position of a task inside one phase (all the W13 or all the W2 tasks of one
+// minibatch): n-major, so the 16 tiles of a row block share one weight slab in L2.
+template <int NC> MOK_WARPROLE_HD task phase_task(task_kind kind, int q, int tiles, int64_t local) {
+    return task{kind, q, first_tile_of_minibatch(q) + static_cast<int>(local % tiles),
+                static_cast<int>(local / tiles)};
+}
+// Stream order: W13(0), then W13(q), W2(q-1) for q = 1..Q-1, then W2(Q-1).  The W2
+// phase of a minibatch trails its W13 phase by one full phase, so hidden_ready[m]
+// is complete well before any CTA reaches a W2 task of that row block; issuing
+// W2(q) right after W13(q) made the first W2 wave wait for the last W13 wave that
+// was still running on other CTAs (about one task time per minibatch).
 template <int NC> MOK_WARPROLE_HD task decode_task(int64_t idx, shape s) {
     using G = geometry<NC>;
     if (idx < 0 || idx >= total_tasks<NC>(s)) return task{task_kind::none, -1, -1, -1};
-    const int64_t full = static_cast<int64_t>(MINIBATCH_TILES) * G::TASKS_PER_TILE;
-    const int q = static_cast<int>(idx / full);
-    const int tiles = tiles_in_minibatch(s, q);
-    int64_t local = idx - static_cast<int64_t>(q) * full;
-    const int64_t w13_count = static_cast<int64_t>(tiles) * G::W13_TASKS_PER_TILE;
-    task t{task_kind::none, q, -1, -1};
-    if (local < w13_count) {
-        t.kind = task_kind::w13;
-        t.n_index = static_cast<int>(local / tiles);
-        t.m_tile = first_tile_of_minibatch(q) + static_cast<int>(local % tiles);
-    } else {
-        local -= w13_count;
-        t.kind = task_kind::w2;
-        t.n_index = static_cast<int>(local / tiles);
-        t.m_tile = first_tile_of_minibatch(q) + static_cast<int>(local % tiles);
+    const int Q = minibatches(s);
+    const int last_tiles = tiles_in_minibatch(s, Q - 1);
+    if (Q == 1) {
+        const int64_t w13_count = static_cast<int64_t>(last_tiles) * G::W13_TASKS_PER_TILE;
+        return idx < w13_count ? phase_task<NC>(task_kind::w13, 0, last_tiles, idx)
+                               : phase_task<NC>(task_kind::w2, 0, last_tiles, idx - w13_count);
     }
-    return t;
+    constexpr int64_t F13 = static_cast<int64_t>(MINIBATCH_TILES) * G::W13_TASKS_PER_TILE;
+    constexpr int64_t F2 = static_cast<int64_t>(MINIBATCH_TILES) * G::W2_TASKS_PER_TILE;
+    if (idx < F13) return phase_task<NC>(task_kind::w13, 0, MINIBATCH_TILES, idx);
+    idx -= F13;
+    // pair k = [W13(k+1), W2(k)]; pairs 0..Q-3 are full, pair Q-2 holds the (possibly partial) last W13
+    const int64_t k = idx / (F13 + F2);
+    if (k < Q - 2) {
+        const int64_t local = idx - k * (F13 + F2);
+        return local < F13 ? phase_task<NC>(task_kind::w13, static_cast<int>(k) + 1, MINIBATCH_TILES, local)
+                           : phase_task<NC>(task_kind::w2, static_cast<int>(k), MINIBATCH_TILES, local - F13);
+    }
+    int64_t local = idx - static_cast<int64_t>(Q - 2) * (F13 + F2);
+    const int64_t last_w13 = static_cast<int64_t>(last_tiles) * G::W13_TASKS_PER_TILE;
+    if (local < last_w13) return phase_task<NC>(task_kind::w13, Q - 1, last_tiles, local);
+    local -= last_w13;
+    if (local < F2) return phase_task<NC>(task_kind::w2, Q - 2, MINIBATCH_TILES, local);
+    return phase_task<NC>(task_kind::w2, Q - 1, last_tiles, local - F2);
 }
 MOK_WARPROLE_HD int dispatch_tickets(shape s, int q) { return rows_in_minibatch(s, q) / DISPATCH_TICKET_ROWS; }
 MOK_WARPROLE_HD int ticket_first_row(shape s, int q, int t) {

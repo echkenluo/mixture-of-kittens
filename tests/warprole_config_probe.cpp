@@ -31,11 +31,42 @@ static void check_coverage(shape s, int expected_tiles) {
     assert(seen_w13 + seen_w2 == total);
 }
 
+// W2(q) must start after the last W13(q) task and, for every minibatch but the
+// last, after the last W13(q+1) task as well: the W2 phase trails by one phase so
+// hidden_ready waits are off the critical path.  Within a phase the order stays
+// n-major (m_tile inner).
+template <int NC>
+static void check_order(shape s) {
+    const int Q = minibatches(s);
+    std::vector<int64_t> last_w13(Q, -1), first_w2(Q, -1), prev_in_phase(Q * 2, -1);
+    const int64_t total = total_tasks<NC>(s);
+    task prev = decode_task<NC>(0, s);
+    for (int64_t idx = 0; idx < total; ++idx) {
+        const task t = decode_task<NC>(idx, s);
+        if (t.kind == task_kind::w13) last_w13[t.minibatch] = idx;
+        else if (first_w2[t.minibatch] < 0) first_w2[t.minibatch] = idx;
+        if (idx > 0 && t.kind == prev.kind && t.minibatch == prev.minibatch) {
+            const int tiles = tiles_in_minibatch(s, t.minibatch);
+            const int64_t p = static_cast<int64_t>(prev.n_index) * tiles + prev.m_tile - first_tile_of_minibatch(t.minibatch);
+            const int64_t c = static_cast<int64_t>(t.n_index) * tiles + t.m_tile - first_tile_of_minibatch(t.minibatch);
+            assert(c == p + 1);                       // n-major, m inner, no gaps
+        }
+        prev = t;
+    }
+    for (int q = 0; q < Q; ++q) {
+        assert(last_w13[q] >= 0 && first_w2[q] >= 0);
+        assert(first_w2[q] > last_w13[q]);
+        if (q + 1 < Q) assert(first_w2[q] > last_w13[q + 1]);
+        if (q + 1 < Q) assert(first_w2[q + 1] > first_w2[q]);
+    }
+}
+
 // The header promises constexpr (i.e. __host__ __device__ constexpr under nvcc),
 // so the decode must be usable in a constant expression.
 static_assert(minibatches(shape{12288}) == 12);
 static_assert(total_tasks<2>(shape{12288}) == 6144);
-static_assert(decode_task<2>(16 * 16, shape{12288}).kind == task_kind::w2);
+static_assert(decode_task<2>(16 * 16, shape{12288}).kind == task_kind::w13);   // W13(1) follows W13(0)
+static_assert(decode_task<2>(16 * 32, shape{12288}).kind == task_kind::w2);    // then W2(0)
 
 int main() {
     shape s{12288};                         // 2048 token/rank, EP4, uniform
@@ -52,10 +83,12 @@ int main() {
     assert(b.kind == task_kind::w13 && b.m_tile == 1 && b.n_index == 0);
     task c = decode_task<2>(16, s);         // second i-tile
     assert(c.kind == task_kind::w13 && c.m_tile == 0 && c.n_index == 1);
-    task d = decode_task<2>(16 * 16, s);    // first W2 of minibatch 0
-    assert(d.kind == task_kind::w2 && d.minibatch == 0 && d.m_tile == 0 && d.n_index == 0);
-    task e = decode_task<2>(16 * 32, s);    // first task of minibatch 1
-    assert(e.kind == task_kind::w13 && e.minibatch == 1 && e.m_tile == 16);
+    task d = decode_task<2>(16 * 16, s);    // W13 of minibatch 1 comes before W2 of minibatch 0
+    assert(d.kind == task_kind::w13 && d.minibatch == 1 && d.m_tile == 16 && d.n_index == 0);
+    task e = decode_task<2>(16 * 32, s);    // first W2 of minibatch 0
+    assert(e.kind == task_kind::w2 && e.minibatch == 0 && e.m_tile == 0 && e.n_index == 0);
+    task e2 = decode_task<2>(16 * 48, s);   // then W13 of minibatch 2
+    assert(e2.kind == task_kind::w13 && e2.minibatch == 2 && e2.m_tile == 32 && e2.n_index == 0);
     task f = decode_task<2>(total_tasks<2>(s), s);
     assert(f.kind == task_kind::none);
     task g = decode_task<2>(total_tasks<2>(t) - 1, t);   // tail minibatch, single tile
@@ -74,6 +107,11 @@ int main() {
     check_coverage<1>(s, 192);              // 192*16 W13 tasks + 192*32 W2 tasks
     check_coverage<2>(t, 193);              // tail minibatch of a single tile
     check_coverage<1>(t, 193);
+    check_order<2>(s); check_order<1>(s); check_order<2>(t); check_order<1>(t);
+    shape v{2048};                          // exactly two minibatches: W13(0), W13(1), W2(0), W2(1)
+    check_coverage<2>(v, 32); check_order<2>(v);
+    shape w{1024 + 128};                    // two minibatches, partial second one
+    check_coverage<2>(w, 18); check_order<2>(w); check_order<1>(w);
 
     // A single-tile shape: one (partial) minibatch, one tile's worth of tasks.
     shape u{64};
@@ -85,6 +123,7 @@ int main() {
     assert(x_ready_target(u, 0) == 64);
     check_coverage<2>(u, 1);
     check_coverage<1>(u, 1);
+    check_order<2>(u);
 
     std::puts("warprole config probe OK");
     return 0;
