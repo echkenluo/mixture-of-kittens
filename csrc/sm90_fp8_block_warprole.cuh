@@ -267,15 +267,16 @@ void kernel(const __grid_constant__ globals g) {
         warpgroup::decrease_registers<gemm::producer_regs<1>()>();
         if (warpgroup::warpid() == 0) {
             int64_t stage_counter = 0;
+            // Lane 0 claims one task ahead: the atomic's round trip then hides behind the
+            // loads of the task in flight instead of stalling the producer at every task start.
+            int next = 0;
+            if (laneid() == 0) next = static_cast<int>(atomicAdd(g.task_cursor, 1u));
             for (unsigned int k = 0;; ++k) {
-                // Claim the next task index and publish it to the consumers.  The mailbox
-                // entry for task k is not rewritten before task k + 2 is claimed, and the
-                // producer cannot get there until every consumer has drained task k + 1
-                // down to STAGES stages (STAGES < K blocks of any task), so the consumers
-                // have read entry k long before it is reused.
-                int t = 0;
-                if (laneid() == 0) t = static_cast<int>(atomicAdd(g.task_cursor, 1u));
-                t = __shfl_sync(0xffffffffu, t, 0);
+                // Publish the claimed index to the consumers.  The mailbox entry for task k
+                // is not rewritten before task k + 2 starts, and the producer cannot get
+                // there until every consumer has drained task k + 1 down to STAGES stages
+                // (STAGES < K blocks of any task), so entry k was read long before its reuse.
+                const int t = __shfl_sync(0xffffffffu, next, 0);
                 const task tk = decode_task<NC>(static_cast<int64_t>(t), s);
                 if (laneid() == 0) {
                     *reinterpret_cast<volatile int *>(&task_box[k & 1u]) = tk.kind == task_kind::none ? -1 : t;
@@ -283,6 +284,7 @@ void kernel(const __grid_constant__ globals g) {
                     *reinterpret_cast<volatile unsigned int *>(&task_seq) = k + 1u;
                 }
                 if (tk.kind == task_kind::none) break;
+                if (laneid() == 0) next = static_cast<int>(atomicAdd(g.task_cursor, 1u));
                 if (tk.kind == task_kind::w13) {
                     if (laneid() == 0)
                         wait_geq_or_trap<false>(g, g.c.x_ready + tk.minibatch,
