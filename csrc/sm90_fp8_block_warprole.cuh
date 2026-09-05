@@ -218,7 +218,8 @@ void kernel(const __grid_constant__ globals g) {
     __shared__ unsigned int task_seq;    // entries the producer has published so far
     if (threadIdx.x == 0) {
         task_seq = 0u;
-        for (int r = 0; r < reduce_stages<NC, STAGES>(); ++r) init_semaphore(reduce_full[r], 1, 1);
+        // arrival count 1: the expect_tx arrive of issue(); the copies only move the tx-count
+        for (int r = 0; r < reduce_stages<NC, STAGES>(); ++r) init_semaphore(reduce_full[r], 1, 0);
         tc::build_expert_row_ends(g.c, expert_row_end);
     }
     gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
