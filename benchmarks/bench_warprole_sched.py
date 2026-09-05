@@ -173,13 +173,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--knobs",
         default="all",
-        choices=("all", "nodeps", "comm", "reduce"),
+        choices=("all", "nodeps", "comm", "reduce", "real"),
         help=(
             "all: NO_DEPS + COMM_OFF + REDUCE_OFF (scheduling overhead only); "
             "nodeps: NO_DEPS alone, so the comm warpgroup and the final reduce run "
             "(the difference to 'all' is their contribution); "
             "comm: NO_DEPS + REDUCE_OFF (comm warpgroup on, reduce off); "
-            "reduce: NO_DEPS + COMM_OFF (reduce on, comm warpgroup off)"
+            "reduce: NO_DEPS + COMM_OFF (reduce on, comm warpgroup off); "
+            "real: no knob at all, the production kernel with its dependency waits "
+            "(the difference to 'nodeps' is what the waits cost); the counters are "
+            "reset by the prepare entry before every fused call, as in production"
         ),
     )
     parser.add_argument(
@@ -630,7 +633,20 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     w13 = w13_kwargs(harness)
     w2 = w2_kwargs(harness)
 
+    prepare = dict(
+        x_ready=harness.state.x_ready,
+        hidden_ready=harness.state.hidden_ready,
+        y_ready=harness.state.y_ready,
+        push_done_local=harness.state.push_done_local,
+        push_done=harness.state.push_done,
+        input_expected_scratch=harness.state.input_expected_scratch,
+    )
+
     def run_fused() -> None:
+        if args.knobs == "real":
+            # With the waits live every call must start from zeroed counters; the
+            # production launcher (mok/warprole.py) issues the same prepare call.
+            _C.fp8_block_warprole_prepare_out(**prepare)
         fused_entry(**fused)
 
     def run_w13() -> None:
@@ -641,14 +657,7 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
 
     # Leaves the counters at zero and gives `hidden`/`routed_y` real values, so
     # neither arm's first timed call is the first launch to touch them.
-    _C.fp8_block_warprole_prepare_out(
-        x_ready=harness.state.x_ready,
-        hidden_ready=harness.state.hidden_ready,
-        y_ready=harness.state.y_ready,
-        push_done_local=harness.state.push_done_local,
-        push_done=harness.state.push_done,
-        input_expected_scratch=harness.state.input_expected_scratch,
-    )
+    _C.fp8_block_warprole_prepare_out(**prepare)
     run_w13()
     run_w2()
     torch.cuda.synchronize()
@@ -761,11 +770,14 @@ def require_warprole(device: torch.device, variants: tuple[str, ...]) -> None:
 def main() -> None:
     args = parse_args()
     # The entry reads the knobs with getenv on every call, so flipping them
-    # here (before any entry call) is enough; NO_DEPS stays on in every mode.
-    if args.knobs in ("nodeps", "comm"):
+    # here (before any entry call) is enough; NO_DEPS stays on in every mode
+    # except "real", which runs the production kernel.
+    if args.knobs in ("nodeps", "comm", "real"):
         os.environ["MOK_WARPROLE_COMM_OFF"] = "0"
-    if args.knobs in ("nodeps", "reduce"):
+    if args.knobs in ("nodeps", "reduce", "real"):
         os.environ["MOK_WARPROLE_REDUCE_OFF"] = "0"
+    if args.knobs == "real":
+        os.environ["MOK_WARPROLE_NO_DEPS"] = "0"
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA device is required; this benchmark times kernels")
     rank = int(os.environ["RANK"])
