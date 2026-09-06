@@ -67,7 +67,7 @@ os.environ.update(WARPROLE_KNOBS)
 import torch
 import torch.distributed as dist
 
-from mok import _C, functional, ops, warprole
+from mok import _C, functional, warprole
 
 EP_SIZE = 4
 TOTAL_EXPERTS = 64
@@ -325,15 +325,13 @@ def quantize_k128(activations: torch.Tensor):
 
 
 def make_weights(device: torch.device):
-    """Random FP8 expert weights, returned in the layout both arms read.
+    """Random FP8 expert weights in the plain [E, 2I, K] / [E, K, I] layout.
 
     Same generator as tests/test_warprole_ep4.py::make_weights: values clamped
     into FP8 range before the cast, block scales in [0.01, 0.10).  The seed does
-    not depend on the rank; every rank holds its own 16 local experts.
-
-    W13 is interleaved here, once, and the plain [E, 2I, K] layout is dropped:
-    the fused kernel and the standalone W13 entry both take the interleaved
-    form, and one copy of it is 268 MB.
+    not depend on the rank; every rank holds its own 16 local experts.  The
+    fused kernel and the standalone W13 entry read the gate/up weight as the
+    model stores it, so no reordered copy exists.
     """
     generator = torch.Generator(device=device).manual_seed(SEED)
 
@@ -355,8 +353,7 @@ def make_weights(device: torch.device):
     w2_scale = block_scale(
         LOCAL_EXPERTS, HIDDEN // K_GROUP, INTERMEDIATE // K_GROUP
     )
-    w13i, w13i_scale = ops.interleave_w13(w13, w13_scale)
-    return w13i, w13i_scale, w2, w2_scale
+    return w13, w13_scale, w2, w2_scale
 
 
 def make_routing(case: Case, rank: int, device: torch.device):
@@ -405,8 +402,8 @@ class Harness:
     active_rows: int
     router_weights_flat: torch.Tensor
     topk_ids_flat: torch.Tensor
-    w13i: torch.Tensor
-    w13i_scale: torch.Tensor
+    w13: torch.Tensor
+    w13_scale: torch.Tensor
     w2: torch.Tensor
     w2_scale: torch.Tensor
 
@@ -421,7 +418,7 @@ def build_harness(
     counter, ``build_schedule`` all-gathers the routes and the dispatch runs a
     cross-rank barrier.  All of it happens before any timed block.
     """
-    w13i, w13i_scale, w2, w2_scale = weights
+    w13, w13_scale, w2, w2_scale = weights
     config = functional.MoKConfig(
         schedule_capacity_multiplier=case.capacity_multiplier,
         all_gather_top_experts_chunk_bytes=chunk_bytes_for(case.graph_tokens),
@@ -495,8 +492,8 @@ def build_harness(
         active_rows=active_rows,
         router_weights_flat=router_weights.view(-1),
         topk_ids_flat=top_experts.view(-1),
-        w13i=w13i,
-        w13i_scale=w13i_scale,
+        w13=w13,
+        w13_scale=w13_scale,
         w2=w2,
         w2_scale=w2_scale,
     )
@@ -524,8 +521,8 @@ def fused_kwargs(harness: Harness) -> dict:
         "num_tokens": schedule.num_tokens,
         "tokens_per_expert": schedule.tokens_per_expert,
         "topk": TOPK,
-        "w13i": harness.w13i,
-        "w13i_scale": harness.w13i_scale,
+        "w13": harness.w13,
+        "w13_scale": harness.w13_scale,
         "w2": harness.w2,
         "w2_scale": harness.w2_scale,
         "hidden": state.hidden,
@@ -558,8 +555,8 @@ def w13_kwargs(harness: Harness) -> dict:
     return {
         "input": state.routed_x,
         "input_scale": state.routed_x_scale,
-        "w13_interleaved": harness.w13i,
-        "w13_interleaved_scale": harness.w13i_scale,
+        "w13": harness.w13,
+        "w13_scale": harness.w13_scale,
         "m_indices": state.m_indices,
         "num_tokens": harness.schedule.num_tokens,
         "hidden": state.hidden,

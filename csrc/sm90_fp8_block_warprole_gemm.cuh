@@ -63,12 +63,15 @@ __device__ __forceinline__ void fence_async_proxy_shared() {
 
 // Producer side of one task: executed by every lane of warp 0 of the producer
 // warpgroup.  `stage_counter` runs across tasks so slot and phase stay in step
-// with the consumers, which advance the same counter.
+// with the consumers, which advance the same counter.  Consumer c reads B tile
+// `n_tile_base + c * n_tile_stride`: adjacent tiles for a plain GEMM, the gate
+// and up tiles of one intermediate block for the W13 task.
 template <int NC, int STAGES, typename A_GL, typename B_GL>
 __device__ __forceinline__ void producer_task(
         const A_GL &A, const float *A_scale, const B_GL &B,
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
-        int64_t &stage_counter, int m_tile, int expert, int n_tile_base, int k_blocks) {
+        int64_t &stage_counter, int m_tile, int expert, int n_tile_base, int k_blocks,
+        int n_tile_stride = 1) {
     const int lane = laneid();
     const float *scale_rows = A_scale + static_cast<size_t>(m_tile) * M_TILE * k_blocks;
     for (int kb = 0; kb < k_blocks; ++kb, ++stage_counter) {
@@ -80,7 +83,7 @@ __device__ __forceinline__ void producer_task(
             tma::load_async(smem.stage[s].a, A, {m_tile, kb}, full[s]);
 #pragma unroll
             for (int c = 0; c < NC; ++c)
-                tma::load_async(smem.stage[s].b[c], B, {expert, n_tile_base + c, kb}, full[s]);
+                tma::load_async(smem.stage[s].b[c], B, {expert, n_tile_base + c * n_tile_stride, kb}, full[s]);
         }
         smem.stage[s].a_scale[lane] = scale_rows[static_cast<size_t>(lane) * k_blocks + kb];
         smem.stage[s].a_scale[lane + 32] = scale_rows[static_cast<size_t>(lane + 32) * k_blocks + kb];

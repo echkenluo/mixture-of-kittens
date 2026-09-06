@@ -11,9 +11,9 @@ The megakernel replaces the whole split routed-expert sequence
 with one launch that keeps a producer, one or two consumers and a comm
 warpgroup resident in every CTA.  Everything the launch needs beyond the route
 workspace lives in :class:`WarpRoleState`: the intermediate FP8 activations and
-their K128 scales, the BF16 routed output rows, the four dependency counters,
-the symmetric per-rank arrival counter ``push_done`` and the interleaved gate/up
-weights.
+their K128 scales, the BF16 routed output rows, the four dependency counters
+and the symmetric per-rank arrival counter ``push_done``.  The expert weights
+are read in the layout the model stores them; no reordered copy is kept.
 
 The route workspace already owns the symmetric input and combine buffers, the
 routed FP8 rows, the schedule arrays, the cross-rank barrier and the trap
@@ -26,7 +26,7 @@ dependency left is in the split reference used by the tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -41,7 +41,6 @@ from .functional import (
     format_trap_record,
     release_workspace_lease,
 )
-from .ops import interleave_w13
 
 # Frozen model shape, mirroring csrc/sm90_fp8_block_warprole_config.cuh.
 HIDDEN = 4096
@@ -93,11 +92,6 @@ class WarpRoleState:
     push_done: torch.Tensor       # (1,) int32, symmetric
     push_done_handle: Any
     push_done_ptrs: list[int]
-    # id(w13) -> (w13, w13_interleaved, w13_scale_interleaved).  The original
-    # tensor is kept so the id cannot be recycled by a freed weight.
-    interleaved_w13: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-        field(default_factory=dict)
-    )
 
 
 # (id(workspace), capacity) -> (workspace, state).  The workspace is kept alive
@@ -237,18 +231,6 @@ def get_warprole_state(
     return state
 
 
-def _interleaved_weights(
-    state: WarpRoleState, w13: torch.Tensor, w13_scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Interleave gate/up N128 blocks once per weight tensor and cache it."""
-    cached = state.interleaved_w13.get(id(w13))
-    if cached is not None and cached[0] is w13:
-        return cached[1], cached[2]
-    w13i, w13i_scale = interleave_w13(w13, w13_scale)
-    state.interleaved_w13[id(w13)] = (w13, w13i, w13i_scale)
-    return w13i, w13i_scale
-
-
 def _check_tensor(
     name: str,
     value: torch.Tensor,
@@ -364,8 +346,6 @@ def warprole_forward(
         device,
     )
 
-    w13i, w13i_scale = _interleaved_weights(state, w13, w13_scale)
-
     # Publish this rank's activations where the peers' comm warpgroups read
     # them.  The kernel's phase-0 rank barrier is what makes the peers wait for
     # these stores, and stream order makes the copies precede that barrier.
@@ -396,8 +376,8 @@ def warprole_forward(
         num_tokens=schedule.num_tokens,
         tokens_per_expert=schedule.tokens_per_expert,
         topk=TOPK,
-        w13i=w13i,
-        w13i_scale=w13i_scale,
+        w13=w13,
+        w13_scale=w13_scale,
         w2=w2,
         w2_scale=w2_scale,
         hidden=state.hidden,

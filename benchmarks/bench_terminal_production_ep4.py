@@ -1117,9 +1117,9 @@ def benchmark_cell(
         )
     if candidate_name == "warprole":
         # The state cache holds a strong reference to this cell's route
-        # workspace, so dropping it is what lets the cell's buffers and the
-        # interleaved W13 copy be freed below.  Every rank has finished its
-        # launches: the closure checks above each synchronized the device.
+        # workspace, so dropping it is what lets the cell's buffers be freed
+        # below.  Every rank has finished its launches: the closure checks
+        # above each synchronized the device.
         dist.barrier()
         clear_warprole_state_cache()
     del split_output, candidate_output, k1k2_output

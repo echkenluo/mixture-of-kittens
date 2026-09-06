@@ -52,16 +52,16 @@ constexpr int EPI_THREADS = 32 * EPI_WARPS;
 template <int NC> constexpr int handoff_threads() { return 128 * NC + EPI_THREADS; }
 
 constexpr int W2_N_TILES_128 = HIDDEN / N_TILE;     // 32
-constexpr int W13_N_TILES_128 = 2 * INTER / N_TILE; // 32 (interleaved gate/up)
+constexpr int W13_N_TILES_128 = 2 * INTER / N_TILE; // 32: 16 gate tiles, then 16 up tiles
 
 struct globals {
     comm::globals c{};
     gemm::a_gl routed_x_gl;    // [capacity, 4096] fp8
     gemm::a_gl hidden_gl;      // [capacity, 2048] fp8
-    gemm::b_gl w13i;           // [E, 4096, 4096] fp8, interleaved gate/up
+    gemm::b_gl w13;            // [E, 4096, 4096] fp8, gate rows then up rows
     gemm::b_gl w2;             // [E, 4096, 2048] fp8
     gemm::d_gl routed_y_gl;    // [capacity, 4096] bf16
-    const float *w13i_scale = nullptr;   // [E, 32, 32]
+    const float *w13_scale = nullptr;    // [E, 32, 32]
     const float *w2_scale = nullptr;     // [E, 32, 16]
     uint8_t *hidden = nullptr;           // [capacity, 2048] fp8
     float *hidden_scale = nullptr;       // [capacity, 16]
@@ -90,9 +90,9 @@ struct globals {
     unsigned long long *probe = nullptr;
 
     // kittens::gl has no default constructor: the five TMA-described tensors come first.
-    __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13, const gemm::b_gl &w2_,
+    __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13_, const gemm::b_gl &w2_,
                      const gemm::d_gl &ry)
-        : routed_x_gl(rx), hidden_gl(h), w13i(w13), w2(w2_), routed_y_gl(ry) {}
+        : routed_x_gl(rx), hidden_gl(h), w13(w13_), w2(w2_), routed_y_gl(ry) {}
 };
 
 __device__ __forceinline__ void trap(const globals &g, unsigned long long code, unsigned long long site,
@@ -329,7 +329,7 @@ void kernel(const __grid_constant__ globals g) {
                     __syncwarp();
                     asm volatile("{fence.proxy.async.global;}" ::: "memory");
                     const int expert = g.c.m_indices[tk.m_tile * M_TILE];
-                    epilogue::producer_w13_task<NC, STAGES>(g.routed_x_gl, g.c.routed_x_scale, g.w13i, smem, full, empty,
+                    epilogue::producer_w13_task<NC, STAGES>(g.routed_x_gl, g.c.routed_x_scale, g.w13, smem, full, empty,
                                                             stage_counter, tk.m_tile, expert, tk.n_index);
                 } else {
                     if (laneid() == 0)
@@ -372,7 +372,7 @@ void kernel(const __grid_constant__ globals g) {
                 }
                 const int expert = g.c.m_indices[tk.m_tile * M_TILE];
                 epilogue::consumer_w13_gemm_to_d<NC, STAGES>(
-                    smem, full, empty, stage_counter, role, g.w13i_scale, expert, tk.n_index,
+                    smem, full, empty, stage_counter, role, g.w13_scale, expert, tk.n_index,
                     [] { asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory"); });
                 if (threadIdx.x == 0) {
                     *reinterpret_cast<volatile int *>(&epi_task[0]) = tk.m_tile;
@@ -612,7 +612,7 @@ inline void entry_out(
         at::Tensor routed_x, at::Tensor routed_x_scale, at::Tensor m_indices,
         at::Tensor schedule_peer_rank, at::Tensor schedule_peer_token_idx, at::Tensor num_tokens,
         at::Tensor tokens_per_expert, int64_t topk,
-        at::Tensor w13i, at::Tensor w13i_scale, at::Tensor w2, at::Tensor w2_scale,
+        at::Tensor w13, at::Tensor w13_scale, at::Tensor w2, at::Tensor w2_scale,
         at::Tensor hidden, at::Tensor hidden_scale, at::Tensor routed_y,
         std::vector<int64_t> combine_ptrs, at::Tensor combine_local, at::Tensor weights, at::Tensor topk_ids,
         at::Tensor output, std::vector<int64_t> push_done_ptrs, int64_t ep_rank,
@@ -625,18 +625,18 @@ inline void entry_out(
                                    schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk,
                                    routed_y, combine_ptrs, push_done_ptrs, ep_rank, x_ready, y_ready, push_done_local);
     const int64_t capacity = routed_x.size(0);
-    const int64_t experts = w13i.size(0);
+    const int64_t experts = w13.size(0);
     TORCH_CHECK(cg.topk == TOPK, "warprole is specialized for top-6 routing");
-    TORCH_CHECK(w13i.dim() == 3 && w13i.size(1) == 2 * INTER && w13i.size(2) == HIDDEN
-                    && w13i.scalar_type() == at::kFloat8_e4m3fn && w13i.is_contiguous() && w13i.is_cuda(),
-                "w13i must be contiguous CUDA fp8 [E,4096,4096] (interleaved gate/up)");
+    TORCH_CHECK(w13.dim() == 3 && w13.size(1) == 2 * INTER && w13.size(2) == HIDDEN
+                    && w13.scalar_type() == at::kFloat8_e4m3fn && w13.is_contiguous() && w13.is_cuda(),
+                "w13 must be contiguous CUDA fp8 [E,4096,4096] (gate rows then up rows)");
     TORCH_CHECK(w2.dim() == 3 && w2.size(0) == experts && w2.size(1) == HIDDEN && w2.size(2) == INTER
                     && w2.scalar_type() == at::kFloat8_e4m3fn && w2.is_contiguous() && w2.is_cuda(),
                 "w2 must be contiguous CUDA fp8 [E,4096,2048]");
-    TORCH_CHECK(w13i_scale.is_cuda() && w13i_scale.scalar_type() == at::kFloat && w13i_scale.is_contiguous()
-                    && w13i_scale.dim() == 3 && w13i_scale.size(0) == experts && w13i_scale.size(1) == W13_N_TILES_128
-                    && w13i_scale.size(2) == W13_K_BLOCKS,
-                "w13i_scale must be float32 [E,32,32]");
+    TORCH_CHECK(w13_scale.is_cuda() && w13_scale.scalar_type() == at::kFloat && w13_scale.is_contiguous()
+                    && w13_scale.dim() == 3 && w13_scale.size(0) == experts && w13_scale.size(1) == W13_N_TILES_128
+                    && w13_scale.size(2) == W13_K_BLOCKS,
+                "w13_scale must be float32 [E,32,32]");
     TORCH_CHECK(w2_scale.is_cuda() && w2_scale.scalar_type() == at::kFloat && w2_scale.is_contiguous()
                     && w2_scale.dim() == 3 && w2_scale.size(0) == experts && w2_scale.size(1) == W2_N_TILES_128
                     && w2_scale.size(2) == W2_K_BLOCKS,
@@ -670,16 +670,16 @@ inline void entry_out(
                 "barrier multicast pointer, trap record pointer and spin limit must be positive");
     kittens::py::tensor_check<gemm::a_gl>(routed_x);
     kittens::py::tensor_check<gemm::a_gl>(hidden);
-    kittens::py::tensor_check<gemm::b_gl>(w13i);
+    kittens::py::tensor_check<gemm::b_gl>(w13);
     kittens::py::tensor_check<gemm::b_gl>(w2);
     kittens::py::tensor_check<gemm::d_gl>(routed_y);
-    kittens::py::device_check(x, w13i, w2, hidden, routed_y, combine_local, weights, topk_ids, output);
+    kittens::py::device_check(x, w13, w2, hidden, routed_y, combine_local, weights, topk_ids, output);
 
     globals g(kittens::py::tensor_to_gl<gemm::a_gl>(routed_x), kittens::py::tensor_to_gl<gemm::a_gl>(hidden),
-              kittens::py::tensor_to_gl<gemm::b_gl>(w13i), kittens::py::tensor_to_gl<gemm::b_gl>(w2),
+              kittens::py::tensor_to_gl<gemm::b_gl>(w13), kittens::py::tensor_to_gl<gemm::b_gl>(w2),
               kittens::py::tensor_to_gl<gemm::d_gl>(routed_y));
     g.c = cg;
-    g.w13i_scale = w13i_scale.data_ptr<float>();
+    g.w13_scale = w13_scale.data_ptr<float>();
     g.w2_scale = w2_scale.data_ptr<float>();
     g.hidden = static_cast<uint8_t *>(hidden.data_ptr());
     g.hidden_scale = hidden_scale.data_ptr<float>();

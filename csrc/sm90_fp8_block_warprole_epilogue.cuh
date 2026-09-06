@@ -7,8 +7,9 @@
 // fp8_block_pipeline::activate_quant_worker, which reproduces SGLang's
 // silu_and_mul_contig_post_quant bit for bit.
 //
-// Weight layout: the gate/up weight is interleaved by mok.ops.interleave_w13 so
-// that intermediate tile j is N tiles 2j (gate) and 2j+1 (up) of one tensor.
+// Weight layout: the plain [E, 2I, K] gate/up weight as the model loads it
+// (gate rows first, then up rows).  Intermediate tile j is N tile j (gate) and
+// N tile I/128 + j (up) of that tensor; nothing is copied or reordered.
 #if defined(KITTENS_SM90)
 #include <ATen/ATen.h>
 
@@ -22,6 +23,7 @@ using gemm::acc_rt;
 using gemm::smem_layout;
 
 constexpr int INTER_GROUPS = INTER / K_TILE;   // 16 activation scale groups per row
+constexpr int UP_TILE_OFFSET = INTER / N_TILE;  // up tile j is N tile 16 + j of w13
 
 // Barrier over the consumer threads only (thread ids [0, 128*NC)).
 template <int NC> __device__ __forceinline__ void consumers_sync() {
@@ -99,10 +101,10 @@ __device__ __forceinline__ void consumer_w13_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
         int64_t &stage_counter, int role, const float *B_scale, int expert, int m_tile, int i_tile,
         uint8_t *hidden, float *hidden_scale, float limit) {
-    constexpr int N_TILES_128 = 2 * INTER / N_TILE;   // 32 tiles in the interleaved weight
+    constexpr int N_TILES_128 = 2 * INTER / N_TILE;   // 32 N128 tiles: 16 gate, then 16 up
     constexpr int K_BLOCKS = W13_K_BLOCKS;
     if constexpr (NC == 2) {
-        const int n_tile = 2 * i_tile + role;
+        const int n_tile = i_tile + role * UP_TILE_OFFSET;
         gemm::stage_b_scale_row<NC, STAGES>(smem, role, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
         warpgroup::sync(role + 1);
         acc_rt acc;
@@ -113,7 +115,7 @@ __device__ __forceinline__ void consumer_w13_task(
     } else {
 #pragma unroll 1
         for (int half = 0; half < 2; ++half) {
-            const int n_tile = 2 * i_tile + half;
+            const int n_tile = i_tile + half * UP_TILE_OFFSET;
             gemm::stage_b_scale_row<NC, STAGES>(smem, half, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
             warpgroup::sync(1);
             acc_rt acc;
@@ -138,7 +140,7 @@ __device__ __forceinline__ void consumer_w13_gemm_to_d(
     constexpr int N_TILES_128 = 2 * INTER / N_TILE;
     constexpr int K_BLOCKS = W13_K_BLOCKS;
     if constexpr (NC == 2) {
-        const int n_tile = 2 * i_tile + role;
+        const int n_tile = i_tile + role * UP_TILE_OFFSET;
         gemm::stage_b_scale_row<NC, STAGES>(smem, role, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
         warpgroup::sync(role + 1);
         acc_rt acc;
@@ -150,7 +152,7 @@ __device__ __forceinline__ void consumer_w13_gemm_to_d(
     } else {
 #pragma unroll 1
         for (int half = 0; half < 2; ++half) {
-            const int n_tile = 2 * i_tile + half;
+            const int n_tile = i_tile + half * UP_TILE_OFFSET;
             gemm::stage_b_scale_row<NC, STAGES>(smem, half, B_scale, expert, N_TILES_128, n_tile, K_BLOCKS);
             warpgroup::sync(1);
             acc_rt acc;
@@ -171,12 +173,12 @@ __device__ __forceinline__ void producer_w13_task(
         int m_tile, int expert, int i_tile) {
     if constexpr (NC == 2) {
         gemm::producer_task<NC, STAGES>(A, A_scale, B, smem, full, empty, stage_counter,
-                                        m_tile, expert, 2 * i_tile, W13_K_BLOCKS);
+                                        m_tile, expert, i_tile, W13_K_BLOCKS, UP_TILE_OFFSET);
     } else {
         gemm::producer_task<NC, STAGES>(A, A_scale, B, smem, full, empty, stage_counter,
-                                        m_tile, expert, 2 * i_tile, W13_K_BLOCKS);
+                                        m_tile, expert, i_tile, W13_K_BLOCKS);
         gemm::producer_task<NC, STAGES>(A, A_scale, B, smem, full, empty, stage_counter,
-                                        m_tile, expert, 2 * i_tile + 1, W13_K_BLOCKS);
+                                        m_tile, expert, UP_TILE_OFFSET + i_tile, W13_K_BLOCKS);
     }
 }
 
@@ -187,7 +189,7 @@ namespace standalone {
 
 struct globals {
     gemm::a_gl A;        // [M, 4096] fp8
-    gemm::b_gl B;        // [E, 4096, 4096] fp8, interleaved gate/up
+    gemm::b_gl B;        // [E, 4096, 4096] fp8, gate rows then up rows
     const float *A_scale;
     const float *B_scale;
     const int *m_indices;
@@ -249,30 +251,30 @@ void w13_kernel(const __grid_constant__ globals g) {
 }
 
 template <int NC, int STAGES, int CTAS_PER_SM>
-inline void entry_w13_out(at::Tensor A, at::Tensor A_scale, at::Tensor W13i, at::Tensor W13i_scale,
+inline void entry_w13_out(at::Tensor A, at::Tensor A_scale, at::Tensor W13, at::Tensor W13_scale,
                           at::Tensor m_indices, at::Tensor num_tokens, at::Tensor hidden,
                           at::Tensor hidden_scale, double swiglu_limit) {
-    TORCH_CHECK(A.dim() == 2 && W13i.dim() == 3, "A must be [M,K] and W13i [E,2I,K]");
+    TORCH_CHECK(A.dim() == 2 && W13.dim() == 3, "A must be [M,K] and W13 [E,2I,K]");
     kittens::py::tensor_check<gemm::a_gl>(A);
-    kittens::py::tensor_check<gemm::b_gl>(W13i);
+    kittens::py::tensor_check<gemm::b_gl>(W13);
     const int total_m = (int)A.size(0);
-    const int experts = (int)W13i.size(0);
-    TORCH_CHECK(A.size(1) == HIDDEN && W13i.size(2) == HIDDEN, "K must be 4096");
-    TORCH_CHECK(W13i.size(1) == 2 * INTER, "W13i must have 2*2048 rows per expert");
+    const int experts = (int)W13.size(0);
+    TORCH_CHECK(A.size(1) == HIDDEN && W13.size(2) == HIDDEN, "K must be 4096");
+    TORCH_CHECK(W13.size(1) == 2 * INTER, "W13 must have 2*2048 rows per expert");
     TORCH_CHECK(total_m >= 64 && total_m % 64 == 0, "M must be positive and divisible by 64");
-    TORCH_CHECK(A_scale.is_cuda() && W13i_scale.is_cuda() && m_indices.is_cuda(),
+    TORCH_CHECK(A_scale.is_cuda() && W13_scale.is_cuda() && m_indices.is_cuda(),
                 "scales and m_indices must be CUDA tensors");
     TORCH_CHECK(A_scale.scalar_type() == at::ScalarType::Float
-                    && W13i_scale.scalar_type() == at::ScalarType::Float,
+                    && W13_scale.scalar_type() == at::ScalarType::Float,
                 "scales must be float32");
     TORCH_CHECK(m_indices.scalar_type() == at::ScalarType::Int, "m_indices must be int32");
-    TORCH_CHECK(A_scale.is_contiguous() && W13i_scale.is_contiguous() && m_indices.is_contiguous(),
+    TORCH_CHECK(A_scale.is_contiguous() && W13_scale.is_contiguous() && m_indices.is_contiguous(),
                 "scales and m_indices must be contiguous");
     TORCH_CHECK(A_scale.dim() == 2 && A_scale.size(0) == total_m && A_scale.size(1) == W13_K_BLOCKS,
                 "A_scale must have shape [M,32]");
-    TORCH_CHECK(W13i_scale.dim() == 3 && W13i_scale.size(0) == experts
-                    && W13i_scale.size(1) == 2 * INTER / 128 && W13i_scale.size(2) == W13_K_BLOCKS,
-                "W13i_scale must have shape [E,32,32]");
+    TORCH_CHECK(W13_scale.dim() == 3 && W13_scale.size(0) == experts
+                    && W13_scale.size(1) == 2 * INTER / 128 && W13_scale.size(2) == W13_K_BLOCKS,
+                "W13_scale must have shape [E,32,32]");
     TORCH_CHECK(m_indices.dim() == 1 && m_indices.size(0) == total_m, "m_indices must have shape [M]");
     TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::Float8_e4m3fn
                     && hidden.is_contiguous() && hidden.dim() == 2 && hidden.size(0) == total_m
@@ -285,16 +287,16 @@ inline void entry_w13_out(at::Tensor A, at::Tensor A_scale, at::Tensor W13i, at:
     TORCH_CHECK(num_tokens.is_cuda() && num_tokens.scalar_type() == at::ScalarType::Int
                     && num_tokens.is_contiguous() && num_tokens.dim() == 1 && num_tokens.numel() == 1,
                 "num_tokens must be contiguous CUDA int32 [1]");
-    kittens::py::device_check(A, W13i, A_scale, W13i_scale, m_indices);
+    kittens::py::device_check(A, W13, A_scale, W13_scale, m_indices);
     kittens::py::device_check(A, hidden, hidden_scale, num_tokens);
 
     c10::cuda::CUDAGuard device_guard(A.device());
     const int m_tiles = total_m / 64;
     globals g{
         kittens::py::tensor_to_gl<gemm::a_gl>(A),
-        kittens::py::tensor_to_gl<gemm::b_gl>(W13i),
+        kittens::py::tensor_to_gl<gemm::b_gl>(W13),
         A_scale.data_ptr<float>(),
-        W13i_scale.data_ptr<float>(),
+        W13_scale.data_ptr<float>(),
         m_indices.data_ptr<int>(),
         num_tokens.data_ptr<int>(),
         static_cast<uint8_t *>(hidden.data_ptr()),

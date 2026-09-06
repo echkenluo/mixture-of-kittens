@@ -9,7 +9,7 @@ Run on one H20 inside the SGLang v0.5.17 container:
 import pytest
 import torch
 
-from mok import _C, ops
+from mok import _C
 
 ENTRIES = {
     "c1s6": "fp8_block_warprole_w13_c1s6_out",
@@ -91,10 +91,9 @@ def test_warprole_w13_bitwise(entry: str) -> None:
     a, w13, a_scale, w13_scale, m_indices, total_m = make_inputs(device)
     num_tokens = torch.tensor([total_m], dtype=torch.int32, device=device)
     hidden_ref, scale_ref = reference(device, a, w13, a_scale, w13_scale, m_indices, total_m, num_tokens)
-    w13i, w13i_scale = ops.interleave_w13(w13, w13_scale)
     hidden = torch.zeros_like(hidden_ref)
     scale = torch.zeros_like(scale_ref)
-    getattr(_C, ENTRIES[entry])(a, a_scale, w13i, w13i_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
+    getattr(_C, ENTRIES[entry])(a, a_scale, w13, w13_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
     torch.cuda.synchronize()
     assert torch.equal(scale, scale_ref), f"{entry}: activation scales differ from the split path"
     assert torch.equal(hidden.view(torch.uint8), hidden_ref.view(torch.uint8)), \
@@ -108,10 +107,9 @@ def test_warprole_w13_respects_num_tokens(entry: str) -> None:
     active = 64 * 50
     num_tokens = torch.tensor([active], dtype=torch.int32, device=device)
     hidden_ref, scale_ref = reference(device, a, w13, a_scale, w13_scale, m_indices, total_m, num_tokens)
-    w13i, w13i_scale = ops.interleave_w13(w13, w13_scale)
     hidden = torch.zeros_like(hidden_ref)
     scale = torch.full_like(scale_ref, -1.0)
-    getattr(_C, ENTRIES[entry])(a, a_scale, w13i, w13i_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
+    getattr(_C, ENTRIES[entry])(a, a_scale, w13, w13_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
     torch.cuda.synchronize()
     assert torch.equal(scale[:active], scale_ref[:active])
     assert torch.equal(hidden[:active].view(torch.uint8), hidden_ref[:active].view(torch.uint8))
