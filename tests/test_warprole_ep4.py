@@ -279,10 +279,11 @@ class Harness:
 
 
 _WEIGHTS: dict[int, tuple[torch.Tensor, ...]] = {}
-_HARNESSES: dict[str, Harness] = {}
+_HARNESSES: dict[tuple[str, str], Harness] = {}
 
 
-def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -> Harness:
+def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False,
+                  group=None) -> Harness:
     """Create (or return) the harness for one case.
 
     Every collective here is issued in lockstep across all EP ranks: the
@@ -291,7 +292,9 @@ def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -
     harness is cached so the repeat-forward test reuses the same state rather
     than allocating a second one.
     """
-    cached = None if fresh else _HARNESSES.get(case.name)
+    group = dist.group.WORLD if group is None else group
+    cache_key = (case.name, group.group_name)
+    cached = None if fresh else _HARNESSES.get(cache_key)
     if cached is not None:
         return cached
 
@@ -310,7 +313,7 @@ def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -
                         else functional.get_fp8_route_workspace)
     workspace = create_workspace(
         config,
-        dist.group.WORLD,
+        group,
         device=device,
         num_local_tokens=case.graph_tokens,
         hidden_size=HIDDEN,
@@ -320,7 +323,7 @@ def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -
     capacity = workspace.schedule_capacity
     create_state = warprole.create_warprole_state if fresh else warprole.get_warprole_state
     state = create_state(
-        workspace, dist.group.WORLD, device=device, capacity=capacity
+        workspace, group, device=device, capacity=capacity
     )
 
     top_experts, router_weights = make_routing(case, rank, device)
@@ -389,7 +392,7 @@ def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -
     torch.cuda.synchronize()
     dist.barrier()
     if not fresh:
-        _HARNESSES[case.name] = harness
+        _HARNESSES[cache_key] = harness
     return harness
 
 

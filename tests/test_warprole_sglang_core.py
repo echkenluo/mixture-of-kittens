@@ -42,7 +42,8 @@ def test_real_sglang_core(sglang_context, tokens, variant):
 
     rank, _, device = sglang_context
     harness = base.build_harness(base.Case(f"sglang_core_{tokens}", tokens, 1.0),
-                                 rank, device, fresh=True)
+                                 rank, device, fresh=True,
+                                 group=adapter.get_tp_group().device_group)
     layer = SimpleNamespace(
         layer_id=0, num_local_experts=base.LOCAL_EXPERTS,
         w13_weight=harness.w13, w13_weight_scale_inv=harness.w13_scale,
