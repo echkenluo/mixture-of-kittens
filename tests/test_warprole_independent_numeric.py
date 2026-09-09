@@ -43,9 +43,13 @@ def oracle_rows(data):
     return torch.cat(rows)
 
 
-def check(actual, expected, tag):
+def measure(actual, expected, tag):
     receipt = metrics(actual, expected)
     print("INDEPENDENT_NUMERIC " + json.dumps({"tag": tag, **receipt}), flush=True)
+    return receipt
+
+
+def check(receipt):
     assert receipt["exact_fraction"] >= .999, receipt
     assert receipt["max_row_relative_l2"] <= .001, receipt
 
@@ -62,8 +66,12 @@ def test_gemm_cpu_oracle(variant, stage, k):
     getattr(_C, f"fp8_block_warprole_gemm_{variant}_out")(
         a, b, a_scale, b_scale, indices, active, out)
     actual = out.cpu()
-    check(actual[list(SAMPLES)], expected, f"{variant}/{stage}")
-    assert bool((actual[128:] == 12345.0).all()), "inactive rows overwritten"
+    receipt = measure(actual[list(SAMPLES)], expected, f"{variant}/{stage}")
+    inactive_unchanged = bool((actual[128:] == 12345.0).all())
+    print("INDEPENDENT_SENTINEL " + json.dumps({"tag": f"{variant}/{stage}",
+          "inactive_unchanged": inactive_unchanged}), flush=True)
+    check(receipt)
+    assert inactive_unchanged, "inactive rows overwritten"
 
 
 @pytest.mark.parametrize("variant", ("c1s6", "c2s4"))
@@ -78,11 +86,17 @@ def test_w13_activation_cpu_oracle(variant):
     getattr(_C, f"fp8_block_warprole_w13_{variant}_out")(
         a, a_scale, b, b_scale, indices, active, hidden, scales, 10.0)
     actual, actual_scale = hidden.cpu(), scales.cpu()
-    check(actual.float()[list(SAMPLES)].to(torch.float8_e4m3fn), expected, f"{variant}/activation")
+    receipt = measure(actual.float()[list(SAMPLES)].to(torch.float8_e4m3fn), expected, f"{variant}/activation")
     selected_scale = actual_scale[list(SAMPLES)]
-    assert bool(torch.isfinite(selected_scale).all()) and bool((selected_scale > 0).all())
+    scales_valid = bool(torch.isfinite(selected_scale).all()) and bool((selected_scale > 0).all())
     relative = float(((selected_scale - expected_scale).abs() / expected_scale).max())
-    print("INDEPENDENT_SCALE " + json.dumps({"variant": variant, "max_relative": relative}), flush=True)
+    inactive_hidden = bool((actual[128:].float() == 1.0).all())
+    inactive_scales = bool((actual_scale[128:] == -1.0).all())
+    print("INDEPENDENT_SCALE " + json.dumps({"variant": variant, "max_relative": relative,
+          "finite_and_positive": scales_valid, "inactive_hidden_unchanged": inactive_hidden,
+          "inactive_scales_unchanged": inactive_scales}), flush=True)
+    check(receipt)
+    assert scales_valid
     assert relative <= 1e-5
-    assert bool((actual[128:].float() == 1.0).all())
-    assert bool((actual_scale[128:] == -1.0).all())
+    assert inactive_hidden
+    assert inactive_scales
