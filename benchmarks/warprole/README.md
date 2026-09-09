@@ -26,6 +26,23 @@ MOK_SM90_EXPERIMENTAL=1 torchrun --standalone --nproc-per-node=8 -m pytest -x -s
 The CPU tests under `tests/host` check Python ownership and finite-output
 assertions only. They do not establish CUDA synchronization or numerical parity.
 
+Additional complete-port gates run in separate processes after that matrix:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pytest -x -s tests/test_warprole_reuse_stress.py
+torchrun --standalone --nproc-per-node=4 -m tests.warprole_reentry_probe /results
+```
+
+Use eight ranks for EP8. Reuse checks 256 candidate calls per variant against
+eight precomputed split references, with no split call during the candidate
+sequence. It includes a rank sending no routes, every rank targeting six experts
+on rank zero, all-padding, partial padding, changed inputs, and retained output
+ownership. It is an extended reuse check, not a long-duration soak test.
+The reentry probe deliberately traps each CUDA context and exits without CUDA
+cleanup. The parent must require all rank receipts and the exact
+`EXPECTED_REENTRANT_TRAP_PASS` verdict; an arbitrary nonzero exit is not a pass.
+These gates do not establish independent numerical accuracy or service quality.
+
 ## Build and resource reports
 
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the
