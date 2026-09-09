@@ -233,19 +233,21 @@ def provenance(device: torch.device, rank: int, world_size: int) -> dict:
     repo = pathlib.Path(functional.__file__).resolve().parents[1]
     shared_objects = sorted((repo / "mok").glob("_C*.so"))
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", "-c", f"safe.directory={repo}", "rev-parse", "HEAD"],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
     )
     status = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", "-c", f"safe.directory={repo}", "status", "--porcelain"],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
     )
+    if head.returncode != 0 or status.returncode != 0:
+        raise RuntimeError(f"runtime Git provenance failed: {head.stderr}{status.stderr}")
     try:
         smi = subprocess.run(
             [
@@ -725,6 +727,8 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
         probe = summarize_probe(stamps)
     return {
         "rank": dist.get_rank(),
+        "active_rows": harness.active_rows,
+        "tokens_per_expert": harness.schedule.tokens_per_expert.cpu().tolist(),
         "order": ["fused_a1", "w13", "w2", "fused_a2"],
         "fused_a1": a1,
         "w13": w13_row,

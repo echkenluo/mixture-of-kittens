@@ -69,7 +69,7 @@ medians. Compare timestamps within a rank; cross-GPU clock alignment is not
 established. Probe calls occur after timed A/B/A blocks and are not included in
 the reported timing samples. Real mode includes prepare in every fused call.
 
-Real-mode timed warmup uses a rank-zero broadcast stop decision so all ranks
+Real-mode time-based warmup uses a rank-zero broadcast stop decision so all ranks
 issue the same number of communicating kernel calls, even with host clock skew.
 The broadcasts occur outside measured blocks.
 
@@ -80,6 +80,12 @@ full-pipeline regression. The historical 3% step-3 overhead gate applies only to
 quality or service performance. This benchmark sets destructive ablation knobs
 at import and resets them in `main()` according to `--knobs`; never import it
 into a serving process.
+
+Each rank now retains its own padded active-row count and raw per-expert token
+counts, so rank timing differences can be checked against actual scheduled work.
+The runtime Git query trusts only the explicitly mounted repository for that
+command; it does not modify global Git configuration. Query failures raise an
+error instead of being reported as an empty clean status.
 
 ## Build and resource reports
 
