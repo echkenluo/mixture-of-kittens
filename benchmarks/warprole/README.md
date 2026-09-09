@@ -92,6 +92,15 @@ not individual kernel timestamps and do not replace CUDA-event samples.
 
 ## Build and resource reports
 
+`MOK_WARPROLE_INTERLEAVE=1` selects the experimental communication schedule:
+dispatch batches 0 and 1, then combine batch q before dispatching q+2. This
+preserves the compute task stream, readiness counters, final push/reduction
+protocol, and full-capacity buffers. It is not ring-buffer reuse. The default
+remains the existing dispatch-all then combine path. Probe slot 2 still means
+last dispatch completion; in interleaved mode the elapsed interval includes
+earlier combine work and waits. GPU correctness and same-binary on/off timing
+must pass before any service adoption.
+
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the
 `harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130` container (CUDA 13.0, Torch 2.11) on node 18,
 and keeps two reports per build under `$ROOT/reports/<head>-<utc-stamp>`:

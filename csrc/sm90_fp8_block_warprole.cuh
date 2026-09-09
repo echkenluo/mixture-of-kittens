@@ -83,6 +83,9 @@ struct globals {
     int skip_waits = 0;
     int comm_off = 0;
     int reduce_off = 0;
+    // Opt-in production candidate: interleave combine(q) with dispatch(q+2).
+    // Full-capacity buffers remain distinct; this does not implement ring reuse.
+    int interleave_comm = 0;
     // Benchmark-only timeline probe (MOK_WARPROLE_PROBE): per CTA, PROBE_SLOTS
     // globaltimer stamps at the phase boundaries; nullptr in production.
     unsigned long long *probe = nullptr;
@@ -246,18 +249,16 @@ void kernel(const __grid_constant__ globals g) {
         if (!g.comm_off) {   // MOK_WARPROLE_COMM_OFF: benchmark-only, the warpgroup idles
             rank_barrier(g);
             if (warpgroup::laneid() == 0) stamp(g, 1);
-            for (int q = 0; q < minibatches(s); ++q) comm::dispatch_minibatch(g.c, s, q, expert_row_end);
-            if (warpgroup::laneid() == 0) stamp(g, 2);
             // Combine is striped by row over every comm warp of the grid rather than
             // one tile per CTA: the tiles of the last minibatch all become ready at
             // about the same time, and pushing a 512 KB tile from a single SM left a
             // 64 us tail after the last GEMM task (probe, 2048 and 3888 tokens).
             // With 4 * gridDim.x stripes > 64 a warp owns at most one row per tile.
-            {
+            auto combine_tiles = [&](int first, int last) {
                 const int stripes = static_cast<int>(gridDim.x) * 4;
                 const int stripe = static_cast<int>(blockIdx.x) * 4 + warpgroup::warpid();
                 const int lane = laneid();
-                for (int m = 0; m < m_tiles; ++m) {
+                for (int m = first; m < last; ++m) {
                     const int base = m * M_TILE;
                     int r = stripe - base % stripes;
                     if (r < 0) r += stripes;
@@ -268,6 +269,29 @@ void kernel(const __grid_constant__ globals g) {
                     __syncwarp();
                     for (; r < M_TILE; r += stripes) tc::push_routed_row(g.c, base + r, lane);
                 }
+            };
+            const int batches = minibatches(s);
+            if (g.interleave_comm) {
+                // decode_task orders W13(0), W13(1), W2(0), W13(2), W2(1), ... .
+                // Two dispatched batches let W2(q) finish before dispatch(q+2)
+                // depends on combine(q). One-batch lookahead can deadlock on
+                // multi-batch streams whose workers all claim W13(1).
+                for (int q = 0; q < batches && q < 2; ++q)
+                    comm::dispatch_minibatch(g.c, s, q, expert_row_end);
+                if (batches <= 2 && warpgroup::laneid() == 0) stamp(g, 2);
+                for (int q = 0; q < batches; ++q) {
+                    const int first = first_tile_of_minibatch(q);
+                    combine_tiles(first, first + tiles_in_minibatch(s, q));
+                    if (q + 2 < batches) {
+                        comm::dispatch_minibatch(g.c, s, q + 2, expert_row_end);
+                        if (q + 3 == batches && warpgroup::laneid() == 0) stamp(g, 2);
+                    }
+                }
+            } else {
+                for (int q = 0; q < batches; ++q)
+                    comm::dispatch_minibatch(g.c, s, q, expert_row_end);
+                if (warpgroup::laneid() == 0) stamp(g, 2);
+                combine_tiles(0, m_tiles);
             }
             comm::combine_finish(g.c);
             if (warpgroup::laneid() == 0) stamp(g, 5);
@@ -698,6 +722,7 @@ inline void entry_out(
     g.skip_waits = env_flag("MOK_WARPROLE_NO_DEPS");
     g.comm_off = env_flag("MOK_WARPROLE_COMM_OFF");
     g.reduce_off = env_flag("MOK_WARPROLE_REDUCE_OFF");
+    g.interleave_comm = env_flag("MOK_WARPROLE_INTERLEAVE");
     TORCH_CHECK(!g.comm_off || g.skip_waits,
                 "MOK_WARPROLE_COMM_OFF=1 requires MOK_WARPROLE_NO_DEPS=1: without dispatch the GEMM roles would wait forever");
     TORCH_CHECK(!g.reduce_off || g.skip_waits,

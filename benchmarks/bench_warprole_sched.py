@@ -277,6 +277,7 @@ def provenance(device: torch.device, rank: int, world_size: int) -> dict:
             device
         ).multi_processor_count,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+        "interleaved_communication": os.environ.get("MOK_WARPROLE_INTERLEAVE", "0"),
         "gpu_clocks_sm_mem": clocks,
         "warprole_knobs": {
             name: os.environ.get(name, "unset") for name in WARPROLE_KNOBS
