@@ -101,6 +101,13 @@ last dispatch completion; in interleaved mode the elapsed interval includes
 earlier combine work and waits. GPU correctness and same-binary on/off timing
 must pass before any service adoption.
 
+`tests/test_warprole_interleave_boundaries.py` adds twelve cases per rank,
+separate from the historical eighteen-case matrix. Cyclic next-rank routes
+force exactly one, two, or three minibatches (including partial last batches),
+with and without an empty sender/receiver, on both variants. The fixture asserts
+the actual padded row count before comparing outputs with split; small input
+token counts alone do not establish a small minibatch count.
+
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the
 `harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130` container (CUDA 13.0, Torch 2.11) on node 18,
 and keeps two reports per build under `$ROOT/reports/<head>-<utc-stamp>`:
