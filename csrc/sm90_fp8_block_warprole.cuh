@@ -44,9 +44,7 @@ constexpr unsigned long long SITE_WARPROLE_TASK_BOX = 46ull;
 // Named barriers of the W13 hand-off between the consumers and the epilogue warps
 // (warps 1-3 of the producer warpgroup): ids 1-2 are the consumer warpgroups,
 // 3 the standalone consumers_sync, 4 the phase-5 consumer barrier.
-constexpr int BAR_D_FULL = 5;    // consumers arrive after parking gate/up in smem.d, epilogue warps sync
-constexpr int BAR_D_EMPTY = 6;   // epilogue warps arrive when done reading smem.d, consumers sync
-constexpr int BAR_EPI = 7;       // the 96 epilogue threads alone
+// IDs live in config.cuh, shared with the communication helpers.
 constexpr int EPI_WARPS = 3;
 constexpr int EPI_THREADS = 32 * EPI_WARPS;
 template <int NC> constexpr int handoff_threads() { return 128 * NC + EPI_THREADS; }
@@ -210,7 +208,7 @@ __device__ __forceinline__ void rank_barrier(const globals &g) {
         }
         asm volatile("{fence.acquire.sys;}" ::: "memory");
     }
-    warpgroup::sync(7);
+    warpgroup::sync(BAR_COMM);
 }
 
 template <int NC, int STAGES>

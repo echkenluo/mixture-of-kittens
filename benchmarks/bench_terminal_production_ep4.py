@@ -12,7 +12,7 @@ routes.  Both counts are emitted so bucket work is never mislabeled as useful
 token throughput.
 
 ``--candidate warprole`` swaps the measured arm for the warp-role megakernel
-(``mok.warprole.warprole_forward``) and leaves everything else -- the split and
+(``mok.warprole.warprole_forward_leased``) and leaves everything else -- the split and
 K1/K2 baselines, the A/B/A order, the bitwise gate, the A/A drift limit, the
 timing method and the frozen provenance -- exactly as it is for terminal.  The
 default is ``terminal``, so an invocation that does not pass the flag runs the
@@ -57,7 +57,7 @@ from mok.functional import (
 from mok.warprole import (
     clear_warprole_state_cache,
     get_warprole_state,
-    warprole_forward,
+    warprole_forward_leased,
 )
 try:
     from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
@@ -611,11 +611,10 @@ def make_runners(
             dtype=torch.bfloat16,
             device=device,
         )
-        for name in ("terminal", "split", "k1k2")
+        for name in ("terminal", "split", "k1k2", "warprole")
     }
-    # The warp-role arm writes into the output its own launch state owns, so it
-    # has no entry in `outputs`; it still needs a call counter for the receipt.
-    calls = {name: 0 for name in (*outputs, "warprole")}
+    # Each arm materializes output before releasing the workspace.
+    calls = {name: 0 for name in outputs}
     # Built here, once per token case, because creating it rendezvouses
     # symmetric memory and barriers across the four ranks -- work that must
     # never land inside a timed region.
@@ -719,7 +718,8 @@ def make_runners(
 
     def run_warprole() -> torch.Tensor:
         calls["warprole"] += 1
-        return warprole_forward(
+        acquire_workspace_lease(route_workspace)
+        result = warprole_forward_leased(
             route_workspace,
             warprole_state,
             schedule,
@@ -736,6 +736,9 @@ def make_runners(
             swiglu_limit=10.0,
             spin_limit=args.spin_limit,
         )
+        outputs["warprole"].copy_(result)
+        release_workspace_lease(route_workspace)
+        return outputs["warprole"]
 
     tensors = {
         "x": x,
@@ -766,6 +769,8 @@ def require_exact(
             f"{name} metadata mismatch: {expected.shape}/{expected.dtype} "
             f"vs {actual.shape}/{actual.dtype}"
         )
+    if not bool(torch.isfinite(expected).all()) or not bool(torch.isfinite(actual).all()):
+        raise RuntimeError(f"{name} contains non-finite output")
     if expected.dtype == torch.bfloat16:
         lhs, rhs = expected.view(torch.int16), actual.view(torch.int16)
     elif expected.dtype == torch.float32:

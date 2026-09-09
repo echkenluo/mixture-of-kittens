@@ -1,4 +1,4 @@
-"""Four-rank bitwise tests for the warp-role megakernel (plan Task 6, step 5).
+"""EP4/EP8 bitwise tests for the warp-role megakernel (plan Task 6, step 5).
 
 The megakernel has to produce, bit for bit, what the split path produces on the
 same inputs:
@@ -13,15 +13,12 @@ That is the sequence the terminal EP4 benchmark times as its ``split`` arm, and
 it is reproduced here call for call so a mismatch points at the kernel and not
 at a different reference.
 
-The cases cover the shapes the schedule and the task decode behave differently
-on: a full 2048-token batch whose routed rows land on exact minibatch
-boundaries, a 3888-token batch bucketed up to 3904 so the schedule has a padded
-tail, a 64-token batch that is smaller than one minibatch, and a routing skew
-that gives rank 0's experts about three times the rows of any other rank.  A
-fifth test runs two forwards back to back on one state, which is the only case
-that exercises the per-launch counter reset.
+The cases cover full/tail/small batches, skewed routing, an empty expert rank,
+all-padding routes, genuinely fresh workspaces, and changed inputs/routes on
+successive calls.  Every rank has distinct weights.  The default global expert
+count is the production value 256; MOK_TEST_EXPERTS=64 recovers the older size.
 
-Run on four H20s inside the SGLang v0.5.17 container:
+Run inside the SGLang container, changing nproc-per-node to 8 for EP8:
 
     torchrun --standalone --nproc-per-node=4 -m pytest -s tests/test_warprole_ep4.py
 """
@@ -39,9 +36,11 @@ import torch
 import torch.distributed as dist
 
 from mok import _C, functional, warprole
+from warprole_assertions import assert_bitwise
 
-EP_SIZE = 4
-TOTAL_EXPERTS = 64
+EP_SIZE = int(os.environ.get("WORLD_SIZE", "4"))
+TOTAL_EXPERTS = int(os.environ.get("MOK_TEST_EXPERTS", "256"))
+assert EP_SIZE in (4, 8) and TOTAL_EXPERTS % EP_SIZE == 0
 LOCAL_EXPERTS = TOTAL_EXPERTS // EP_SIZE
 HIDDEN = 4096
 INTERMEDIATE = 2048
@@ -73,6 +72,8 @@ class Case:
     effective_tokens: int
     capacity_multiplier: float
     skew: bool = False
+    empty_rank: bool = False
+    all_padding: bool = False
 
     @property
     def graph_tokens(self) -> int:
@@ -86,6 +87,8 @@ CASES = {
         Case("tail_3888", 3888, 0.5),
         Case("small_64", 64, 1.5),
         Case("skew_512", 512, 1.0, skew=True),
+        Case("empty_rank_256", 256, 1.0, empty_rank=True),
+        Case("all_padding_256", 256, 1.0, all_padding=True),
     )
 }
 
@@ -174,11 +177,11 @@ def make_weights(
 
     Same generator shape as tests/test_warprole_w13.py::make_inputs: values
     clamped into FP8 range before the cast, block scales in [0.01, 0.10) so the
-    accumulated products stay well inside BF16.  The seed does not depend on
-    the rank: every rank holds the weights of its own 16 local experts and the
-    routing decides which rows reach them.
+    accumulated products stay well inside BF16.  The weight seed differs from
+    the input seed; each rank uses distinct expert weights to expose incorrect
+    expert ownership.
     """
-    generator = torch.Generator(device=device).manual_seed(SEED)
+    generator = torch.Generator(device=device).manual_seed(SEED + 100003 * dist.get_rank())
 
     def fp8(*shape: int) -> torch.Tensor:
         values = torch.randn(
@@ -206,10 +209,9 @@ def make_routing(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pick top-6 experts and router weights for this rank's tokens.
 
-    Uniform cases draw six distinct experts out of 64 with equal probability,
-    so each rank receives about a quarter of all routes.  The skewed case
-    weights rank 0's sixteen experts three to one, which puts half of every
-    rank's routes on rank 0 -- three times what any other rank receives.
+    Uniform cases draw six distinct global experts.  The skewed case gives
+    rank 0's experts three times the probability of the others; empty_rank
+    excludes rank 0's experts entirely.
     Tokens past ``effective_tokens`` are padding: expert -1 keeps them out of
     the schedule, and the reducer masks them on both arms.
     """
@@ -217,6 +219,8 @@ def make_routing(
     probabilities = torch.ones(TOTAL_EXPERTS, device=device)
     if case.skew:
         probabilities[:LOCAL_EXPERTS] = 3.0
+    if case.empty_rank:
+        probabilities[:LOCAL_EXPERTS] = 0.0
     chosen = torch.multinomial(
         probabilities.expand(case.effective_tokens, TOTAL_EXPERTS).contiguous(),
         TOPK,
@@ -240,6 +244,9 @@ def make_routing(
     router_weights[: case.effective_tokens] = logits / logits.sum(
         dim=-1, keepdim=True
     )
+    if case.all_padding:
+        top_experts.fill_(-1)
+        router_weights.zero_()
     return top_experts.contiguous(), router_weights.contiguous()
 
 
@@ -250,6 +257,7 @@ class Harness:
     case: Case
     rank: int
     device: torch.device
+    config: functional.MoKConfig
     workspace: functional.MoKFP8RouteWorkspace
     state: warprole.WarpRoleState
     schedule: functional.MoKSchedule
@@ -273,16 +281,16 @@ _WEIGHTS: dict[int, tuple[torch.Tensor, ...]] = {}
 _HARNESSES: dict[str, Harness] = {}
 
 
-def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
+def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -> Harness:
     """Create (or return) the harness for one case.
 
-    Every step here is collective in lockstep across the four ranks: the
+    Every collective here is issued in lockstep across all EP ranks: the
     workspace rendezvouses symmetric memory, the state rendezvouses its
     ``push_done`` counter, and ``build_schedule`` all-gathers the routes.  The
     harness is cached so the repeat-forward test reuses the same state rather
     than allocating a second one.
     """
-    cached = _HARNESSES.get(case.name)
+    cached = None if fresh else _HARNESSES.get(case.name)
     if cached is not None:
         return cached
 
@@ -291,10 +299,16 @@ def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
     w13, w13_scale, w2, w2_scale = _WEIGHTS[0]
 
     config = functional.MoKConfig(
-        schedule_capacity_multiplier=case.capacity_multiplier,
+        schedule_capacity_multiplier=max(
+            case.capacity_multiplier,
+            (EP_SIZE + math.ceil(LOCAL_EXPERTS * (EXPERT_PADDING - 1)
+                                 / (case.graph_tokens * TOPK))) / EP_SIZE,
+        ),
         all_gather_top_experts_chunk_bytes=chunk_bytes_for(case.graph_tokens),
     )
-    workspace = functional.get_fp8_route_workspace(
+    create_workspace = (functional.create_fp8_route_workspace if fresh
+                        else functional.get_fp8_route_workspace)
+    workspace = create_workspace(
         config,
         dist.group.WORLD,
         device=device,
@@ -304,11 +318,13 @@ def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
         num_local_experts=LOCAL_EXPERTS,
     )
     capacity = workspace.schedule_capacity
-    state = warprole.get_warprole_state(
+    create_state = warprole.create_warprole_state if fresh else warprole.get_warprole_state
+    state = create_state(
         workspace, dist.group.WORLD, device=device, capacity=capacity
     )
 
     top_experts, router_weights = make_routing(case, rank, device)
+    functional.acquire_workspace_lease(workspace)
     schedule = functional.build_schedule(
         workspace,
         config,
@@ -316,12 +332,13 @@ def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
         num_local_experts=LOCAL_EXPERTS,
         expert_padding=EXPERT_PADDING,
     )
+    functional.release_workspace_lease(workspace)
     active_rows = int(schedule.num_tokens.item())
     assert active_rows % M_TILE == 0, (
         f"{case.name}: the megakernel only accepts M64-aligned schedules, got "
         f"{active_rows} rows"
     )
-    assert 0 < active_rows <= capacity, (
+    assert 0 <= active_rows <= capacity, (
         f"{case.name}: {active_rows} routed rows do not fit capacity "
         f"{capacity}; raise capacity_multiplier"
     )
@@ -338,6 +355,7 @@ def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
         case=case,
         rank=rank,
         device=device,
+        config=config,
         workspace=workspace,
         state=state,
         schedule=schedule,
@@ -370,7 +388,8 @@ def build_harness(case: Case, rank: int, device: torch.device) -> Harness:
     )
     torch.cuda.synchronize()
     dist.barrier()
-    _HARNESSES[case.name] = harness
+    if not fresh:
+        _HARNESSES[case.name] = harness
     return harness
 
 
@@ -378,10 +397,12 @@ def run_split(harness: Harness) -> torch.Tensor:
     """The reference arm, call for call the terminal benchmark's split arm."""
     activation, kind = sglang_activation()
     workspace = harness.workspace
-    schedule = harness.schedule
-    active_rows = harness.active_rows
-
     functional.acquire_workspace_lease(workspace)
+    schedule = functional.build_schedule(
+        workspace, harness.config, harness.topk_ids,
+        num_local_experts=LOCAL_EXPERTS, expert_padding=EXPERT_PADDING,
+    )
+    active_rows = int(schedule.num_tokens.item())
     functional.dispatch_fp8_block(
         workspace,
         schedule,
@@ -416,16 +437,18 @@ def run_split(harness: Harness) -> torch.Tensor:
     else:
         # The static entry has no row-count argument; the benchmark's split arm
         # slices the buffers instead, and this call mirrors it exactly.
-        activation(
-            input=harness.gate_up[:active_rows],
-            output=harness.down_input[:active_rows],
-            output_scale=harness.down_input_scale[:active_rows],
-            quant_group_size=K_GROUP,
-            scale_ue8m0=False,
-            transposed=False,
-            swiglu_limit=SWIGLU_LIMIT,
-            swizzle=False,
-        )
+        # Static activation cannot launch a zero grid on an empty expert rank.
+        if active_rows > 0:
+            activation(
+                input=harness.gate_up[:active_rows],
+                output=harness.down_input[:active_rows],
+                output_scale=harness.down_input_scale[:active_rows],
+                quant_group_size=K_GROUP,
+                scale_ue8m0=False,
+                transposed=False,
+                swiglu_limit=SWIGLU_LIMIT,
+                swizzle=False,
+            )
     functional.grouped_gemm_fp8_block_dynamic_out(
         harness.down_input,
         harness.w2,
@@ -448,10 +471,10 @@ def run_split(harness: Harness) -> torch.Tensor:
 
 
 def run_warprole(harness: Harness, variant: str) -> torch.Tensor:
-    return warprole.warprole_forward(
+    return warprole.warprole_forward_from_topk(
         harness.workspace,
         harness.state,
-        harness.schedule,
+        harness.config,
         harness.x_fp8,
         harness.x_scale,
         harness.router_weights,
@@ -463,27 +486,6 @@ def run_warprole(harness: Harness, variant: str) -> torch.Tensor:
         variant=variant,
         swiglu_limit=SWIGLU_LIMIT,
     )
-
-
-def assert_bitwise(label: str, expected: torch.Tensor, actual: torch.Tensor) -> None:
-    """Compare BF16 outputs on their bit patterns.
-
-    ``torch.equal`` on the int16 views is the strict form: it does not let a
-    NaN pass as a mismatch-free comparison and it separates -0 from +0, which
-    the reducer's contract distinguishes.
-    """
-    assert expected.shape == actual.shape and expected.dtype == actual.dtype, (
-        f"{label}: metadata differ, {expected.shape}/{expected.dtype} vs "
-        f"{actual.shape}/{actual.dtype}"
-    )
-    left, right = expected.view(torch.int16), actual.view(torch.int16)
-    if not torch.equal(left, right):
-        mismatch = int((left != right).sum().item())
-        row = int((left != right).any(dim=-1).nonzero()[0].item())
-        raise AssertionError(
-            f"{label}: {mismatch} of {left.numel()} elements differ from the "
-            f"split path, first at token {row}"
-        )
 
 
 def assert_trap_clear(harness: Harness, label: str) -> None:
@@ -528,7 +530,7 @@ def test_warprole_matches_split(
 ) -> None:
     rank, world_size, device = context
     require_warprole(device)
-    assert world_size == EP_SIZE, "the warprole contract under test is EP4"
+    assert world_size == EP_SIZE, "run with four or eight ranks"
     harness = build_harness(CASES[case_name], rank, device)
     compare_arms(harness, variant, case_name)
 
@@ -539,15 +541,15 @@ def test_warprole_first_on_fresh_workspace(
 ) -> None:
     """The megakernel must be correct when nothing ran on the workspace before.
 
-    SGLang reaches ``warprole_forward`` without ever running the split path
+    SGLang reaches ``warprole_forward_leased`` without ever running the split path
     on that workspace, so nothing has pre-cleared the combine buffer or
     touched the barrier state.  Every other test runs split first, which
     would hide a dependence on that history.
     """
     rank, world_size, device = context
     require_warprole(device)
-    assert world_size == EP_SIZE, "the warprole contract under test is EP4"
-    harness = build_harness(CASES["uniform_2048"], rank, device)
+    assert world_size == EP_SIZE, "run with four or eight ranks"
+    harness = build_harness(CASES["uniform_2048"], rank, device, fresh=True)
 
     warprole_output = run_warprole(harness, variant).clone()
     torch.cuda.synchronize()
@@ -577,23 +579,27 @@ def test_warprole_repeated_forward(
     """
     rank, world_size, device = context
     require_warprole(device)
-    assert world_size == EP_SIZE, "the warprole contract under test is EP4"
+    assert world_size == EP_SIZE, "run with four or eight ranks"
     harness = build_harness(CASES["uniform_2048"], rank, device)
 
-    split_output = run_split(harness)
+    original = (harness.x_fp8, harness.x_scale, harness.topk_ids, harness.router_weights)
+    first_expected = run_split(harness).clone()
+    first = run_warprole(harness, variant)
+    first_snapshot = first.clone()
+    harness.x_fp8 = (-harness.x_fp8.float()).to(torch.float8_e4m3fn)
+    harness.x_scale = harness.x_scale * 0.5
+    harness.topk_ids = (harness.topk_ids + LOCAL_EXPERTS) % TOTAL_EXPERTS
+    harness.router_weights = harness.router_weights.roll(1, dims=1).contiguous()
+    # No reference launch between the two candidate calls: only the candidate
+    # can reset its dependency counters and replace its schedule/input storage.
+    second = run_warprole(harness, variant)
+    second_expected = run_split(harness).clone()
     torch.cuda.synchronize()
     dist.barrier()
-
-    first = run_warprole(harness, variant).clone()
-    second = run_warprole(harness, variant).clone()
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    effective = harness.case.effective_tokens
-    assert_bitwise(
-        f"repeat/{variant}/first", split_output[:effective], first[:effective]
-    )
-    assert_bitwise(
-        f"repeat/{variant}/second", split_output[:effective], second[:effective]
-    )
+    assert_bitwise(f"repeat/{variant}/first", first_expected, first)
+    assert_bitwise(f"repeat/{variant}/owned", first_snapshot, first)
+    assert_bitwise(f"repeat/{variant}/second", second_expected, second)
+    assert not torch.equal(first.view(torch.int16), second.view(torch.int16))
+    assert first.data_ptr() != second.data_ptr()
     assert_trap_clear(harness, f"repeat/{variant}")
+    harness.x_fp8, harness.x_scale, harness.topk_ids, harness.router_weights = original

@@ -35,8 +35,11 @@ import torch.distributed._symmetric_memory as symm_mem
 
 from . import _C
 from .functional import (
+    MoKConfig,
     MoKFP8RouteWorkspace,
     MoKSchedule,
+    _build_schedule_validated,
+    _validate_build_schedule_inputs,
     acquire_workspace_lease,
     format_trap_record,
     release_workspace_lease,
@@ -135,6 +138,8 @@ def create_warprole_state(
         )
     if workspace.hidden_size != HIDDEN or workspace.topk != TOPK:
         raise ValueError("warprole is specialized for hidden 4096 and top-6")
+    if workspace.ep_size not in (4, 8):
+        raise ValueError("warprole requires EP4 or EP8")
     if group.group_name != workspace.group_name:
         raise ValueError("group must be the workspace's process group")
     if dist.get_world_size(group=group) != workspace.ep_size:
@@ -252,10 +257,9 @@ def _check_tensor(
         )
 
 
-def warprole_forward(
+def _validate_forward_inputs(
     workspace: MoKFP8RouteWorkspace,
     state: WarpRoleState,
-    schedule: MoKSchedule,
     x_fp8: torch.Tensor,
     x_scale: torch.Tensor,
     router_weights: torch.Tensor,
@@ -268,30 +272,12 @@ def warprole_forward(
     variant: str = "c2s4",
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     spin_limit: int = DEFAULT_SPIN_LIMIT,
-) -> torch.Tensor:
-    """Run the routed expert segment in one launch and return the BF16 output.
-
-    ``x_fp8``/``x_scale`` are this rank's quantized activations.  They are
-    published into the workspace's symmetric input buffers -- the same buffers
-    the split dispatch publishes into -- because the comm warpgroup pulls its
-    routed rows straight out of the peers' copies of them.  Passing the
-    workspace buffers themselves skips the copy.
-
-    The returned tensor is ``state.output`` and is overwritten by the next
-    call.
-
-    The trap check afterwards is a non-blocking read of the host-mapped record:
-    it reports a trap from an earlier launch immediately and one from this
-    launch only after the caller synchronizes.  Callers that need a verdict for
-    this launch must synchronize first.  While a CUDA graph is being captured
-    the check is skipped, because a host read cannot be captured.
-    """
+) -> str:
+    """Check metadata without mutating workspace storage or launching CUDA work."""
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
     if not isinstance(state, WarpRoleState):
         raise TypeError("state must be a WarpRoleState")
-    if not isinstance(schedule, MoKSchedule):
-        raise TypeError("schedule must be a MoKSchedule")
     if variant not in VARIANT_ENTRIES:
         raise ValueError(f"variant must be one of {sorted(VARIANT_ENTRIES)}")
     entry_name = VARIANT_ENTRIES[variant]
@@ -303,12 +289,16 @@ def warprole_forward(
         raise ValueError("state does not belong to this workspace")
     if (
         type(swiglu_limit) not in (int, float)
-        or not float(swiglu_limit) > 0.0
+        or not 0.0 < float(swiglu_limit) < float("inf")
     ):
         raise ValueError("swiglu_limit must be a positive number")
     if type(spin_limit) is not int or spin_limit <= 0:
         raise ValueError("spin_limit must be a positive int")
 
+    if workspace.ep_size not in (4, 8):
+        raise ValueError("warprole requires EP4 or EP8")
+    if workspace.hidden_size != HIDDEN or workspace.topk != TOPK:
+        raise ValueError("warprole is specialized for hidden 4096 and top-6")
     device = workspace.device
     tokens = workspace.num_local_tokens
     experts = workspace.num_local_experts
@@ -346,6 +336,44 @@ def warprole_forward(
         device,
     )
 
+    return entry_name
+
+
+def warprole_forward_leased(
+    workspace: MoKFP8RouteWorkspace,
+    state: WarpRoleState,
+    schedule: MoKSchedule,
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    router_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    variant: str = "c2s4",
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    spin_limit: int = DEFAULT_SPIN_LIMIT,
+) -> torch.Tensor:
+    """Run using a lease already held by the caller on the current stream.
+
+    Acquire BEFORE building the workspace-backed schedule or publishing inputs.
+    Keep the lease until the returned borrowed ``state.output`` has been copied
+    to caller-owned storage.  This function neither acquires nor releases it.
+    Never release after a failed launch; discard the failed workspace/context.
+    State creation/rendezvous must finish before entering this transaction.
+    """
+    if not isinstance(schedule, MoKSchedule):
+        raise TypeError("schedule must be a MoKSchedule")
+    if schedule.expert_padding % M_TILE != 0:
+        raise ValueError("warprole requires M64-aligned expert segments")
+    entry_name = _validate_forward_inputs(
+        workspace, state, x_fp8, x_scale, router_weights, topk_ids,
+        w13, w13_scale, w2, w2_scale, variant=variant,
+        swiglu_limit=swiglu_limit, spin_limit=spin_limit
+    )
+
     # Publish this rank's activations where the peers' comm warpgroups read
     # them.  The kernel's phase-0 rank barrier is what makes the peers wait for
     # these stores, and stream order makes the copies precede that barrier.
@@ -354,7 +382,6 @@ def warprole_forward(
     if x_scale is not workspace.x_scale_buffer:
         workspace.x_scale_buffer.copy_(x_scale)
 
-    acquire_workspace_lease(workspace)
     _C.fp8_block_warprole_prepare_out(
         x_ready=state.x_ready,
         hidden_ready=state.hidden_ready,
@@ -402,8 +429,6 @@ def warprole_forward(
         swiglu_limit=float(swiglu_limit),
         spin_limit=spin_limit,
     )
-    release_workspace_lease(workspace)
-
     # The trap record is host-mapped, so this read is a host access: it
     # cannot be captured into a CUDA graph.  During capture the launch is
     # recorded, not run, and the check is left to the caller's next eager
@@ -416,3 +441,52 @@ def warprole_forward(
             or "MOK_TRAP|claimed but payload not committed"
         )
     return state.output
+
+
+def warprole_forward_from_topk(
+    workspace: MoKFP8RouteWorkspace,
+    state: WarpRoleState,
+    config: MoKConfig,
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    router_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    variant: str = "c2s4",
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    spin_limit: int = DEFAULT_SPIN_LIMIT,
+) -> torch.Tensor:
+    """Build routes, run the megakernel, and return an independently owned output.
+
+    This is the owning API.  Schedule mutation, input publication, prepare,
+    compute, and output materialization form one uninterrupted lease.  All ranks
+    must use the same call order.  Concurrent reuse fails closed rather than
+    waiting.  Metadata errors are rejected before acquiring the lease; a later
+    failure leaves it held, so partially written storage cannot be reused.
+    """
+    _validate_forward_inputs(
+        workspace, state, x_fp8, x_scale, router_weights, topk_ids,
+        w13, w13_scale, w2, w2_scale, variant=variant,
+        swiglu_limit=swiglu_limit, spin_limit=spin_limit
+    )
+    ids = _validate_build_schedule_inputs(
+        workspace, config, topk_ids,
+        num_local_experts=workspace.num_local_experts, expert_padding=M_TILE,
+    )
+    acquire_workspace_lease(workspace)
+    schedule = _build_schedule_validated(
+        workspace, config, ids,
+        num_local_experts=workspace.num_local_experts, expert_padding=M_TILE,
+    )
+    borrowed = warprole_forward_leased(
+        workspace, state, schedule, x_fp8, x_scale, router_weights, topk_ids,
+        w13, w13_scale, w2, w2_scale, variant=variant,
+        swiglu_limit=swiglu_limit, spin_limit=spin_limit,
+    )
+    result = borrowed.clone(memory_format=torch.contiguous_format)
+    release_workspace_lease(workspace)
+    return result

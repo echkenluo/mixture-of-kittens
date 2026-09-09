@@ -117,7 +117,7 @@ __device__ __forceinline__ void combine_tile(const G &g, int m_tile) {
 // pushes are complete.  Fence pattern copied from fp8_block_routed::combine_kernel.
 template <typename G>
 __device__ __forceinline__ void combine_finish(const G &g) {
-    warpgroup::sync(7);
+    warpgroup::sync(BAR_COMM);
     if (warpgroup::laneid() == 0) {
         asm volatile("{fence.release.sys;}" ::: "memory");
         const unsigned int prior = atomicAdd(g.push_done_local, 1u);

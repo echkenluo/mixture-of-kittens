@@ -13,6 +13,14 @@ constexpr int W2_K_BLOCKS = INTER / K_TILE;     // 16
 constexpr int MINIBATCH_ROWS = 1024;
 constexpr int MINIBATCH_TILES = MINIBATCH_ROWS / M_TILE;   // 16
 constexpr int DISPATCH_TICKET_ROWS = 8;
+// Named barriers are CTA-wide, not private to a warpgroup.  Reserve 1-4 for
+// consumers, 5-6 for W13 hand-off, 7 for epilogue warps, and 8 for comm.
+constexpr int BAR_D_FULL = 5;
+constexpr int BAR_D_EMPTY = 6;
+constexpr int BAR_EPI = 7;
+constexpr int BAR_COMM = 8;
+static_assert(BAR_COMM != BAR_EPI && BAR_COMM != BAR_D_FULL &&
+              BAR_COMM != BAR_D_EMPTY && BAR_COMM > 4 && BAR_COMM < 16);
 static_assert(MINIBATCH_ROWS % M_TILE == 0 && MINIBATCH_ROWS % DISPATCH_TICKET_ROWS == 0);
 
 template <int NUM_CONSUMERS> struct geometry {
