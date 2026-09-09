@@ -1,5 +1,33 @@
 # warprole build helper
 
+## H20 ownership API (complete-port branch)
+
+`warprole_forward` has been replaced with two explicitly different APIs:
+
+- `warprole_forward_from_topk(workspace, state, config, ...)` builds the schedule
+  while holding the workspace lease and returns an independent output copy.
+- `warprole_forward_leased(workspace, state, schedule, ...)` is a low-level
+  operation. The caller acquires before any schedule/input mutation, keeps the
+  lease through output materialization, and releases afterwards on that stream.
+  Its return aliases `state.output`. Failed calls leave the workspace unusable.
+
+Create state collectively before the transaction. The service adapter uses the
+leased entry. The layer microbenchmark uses a prebuilt, immutable schedule and
+now includes an output copy on both split and warp-role arms; historical timings
+without that copy have a different boundary. Concurrent unsequenced calls using
+the same workspace fail closed; event-ordered stream hand-off is the supported
+reuse pattern. GPU correctness tests default to 256 global experts:
+
+```bash
+MOK_SM90_EXPERIMENTAL=1 torchrun --standalone --nproc-per-node=4 -m pytest -x -s tests/test_warprole_ep4.py
+MOK_SM90_EXPERIMENTAL=1 torchrun --standalone --nproc-per-node=8 -m pytest -x -s tests/test_warprole_ep4.py
+```
+
+The CPU tests under `tests/host` check Python ownership and finite-output
+assertions only. They do not establish CUDA synchronization or numerical parity.
+
+## Build and resource reports
+
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the
 `harbor.lenovo.com/luocc/sglang-dsv4:a8-base-cu130` container (CUDA 13.0, Torch 2.11) on node 18,
 and keeps two reports per build under `$ROOT/reports/<head>-<utc-stamp>`:

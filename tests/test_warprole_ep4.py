@@ -181,7 +181,7 @@ def make_weights(
     the input seed; each rank uses distinct expert weights to expose incorrect
     expert ownership.
     """
-    generator = torch.Generator(device=device).manual_seed(SEED + 100003 * dist.get_rank())
+    generator = torch.Generator(device=device).manual_seed(SEED + 50000 + 100003 * dist.get_rank())
 
     def fp8(*shape: int) -> torch.Tensor:
         values = torch.randn(
@@ -603,3 +603,32 @@ def test_warprole_repeated_forward(
     assert first.data_ptr() != second.data_ptr()
     assert_trap_clear(harness, f"repeat/{variant}")
     harness.x_fp8, harness.x_scale, harness.topk_ids, harness.router_weights = original
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_warprole_ordered_stream_handoff(context, variant):
+    """An event orders workspace reuse; outputs survive a later stream's call.
+
+    Unordered simultaneous reuse is deliberately unsupported and must trap in
+    a separate process.  This test exercises the supported stream hand-off.
+    """
+    rank, _, device = context
+    harness = build_harness(CASES["skew_512"], rank, device)
+    expected = run_split(harness).clone()
+    current = torch.cuda.current_stream(device)
+    first_stream = torch.cuda.Stream(device=device)
+    second_stream = torch.cuda.Stream(device=device)
+    first_stream.wait_stream(current)
+    done = torch.cuda.Event()
+    with torch.cuda.stream(first_stream):
+        first = run_warprole(harness, variant)
+        done.record()
+    second_stream.wait_event(done)
+    with torch.cuda.stream(second_stream):
+        second = run_warprole(harness, variant)
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    assert_bitwise(f"streams/{variant}/first", expected, first)
+    assert_bitwise(f"streams/{variant}/second", expected, second)
+    assert first.data_ptr() != second.data_ptr()
+    assert_trap_clear(harness, f"streams/{variant}")

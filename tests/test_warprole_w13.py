@@ -51,10 +51,17 @@ def _sglang_activation():
 
 def make_inputs(device: torch.device, seed: int = 20260904):
     gen = torch.Generator(device=device).manual_seed(seed)
-    rows = ROW_PATTERN * (EXPERTS // len(ROW_PATTERN))
+    logical_rows = ROW_PATTERN * (EXPERTS // len(ROW_PATTERN))
+    # A tile selects its expert from its first row.  Preserve non-M64 logical
+    # lengths but pad EACH expert segment, as the production schedule does.
+    rows = [((n + 63) // 64) * 64 for n in logical_rows]
     total_m = sum(rows)
     a = torch.randn((total_m, HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
     a = a.clamp(-3, 3).to(torch.float8_e4m3fn)
+    start = 0
+    for logical, padded in zip(logical_rows, rows):
+        a[start + logical:start + padded].zero_()
+        start += padded
     w13 = torch.randn((EXPERTS, 2 * INTER, HIDDEN), generator=gen, device=device, dtype=torch.bfloat16)
     w13 = w13.clamp(-3, 3).to(torch.float8_e4m3fn)
     a_scale = torch.rand((total_m, HIDDEN // 128), generator=gen, device=device) * 0.09 + 0.01
@@ -95,6 +102,8 @@ def test_warprole_w13_bitwise(entry: str) -> None:
     scale = torch.zeros_like(scale_ref)
     getattr(_C, ENTRIES[entry])(a, a_scale, w13, w13_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
     torch.cuda.synchronize()
+    assert bool(torch.isfinite(hidden.float()).all()) and bool(torch.isfinite(scale).all())
+    assert bool(torch.isfinite(hidden_ref.float()).all()) and bool(torch.isfinite(scale_ref).all())
     assert torch.equal(scale, scale_ref), f"{entry}: activation scales differ from the split path"
     assert torch.equal(hidden.view(torch.uint8), hidden_ref.view(torch.uint8)), \
         f"{entry}: FP8 activations differ from the split path"
@@ -111,6 +120,9 @@ def test_warprole_w13_respects_num_tokens(entry: str) -> None:
     scale = torch.full_like(scale_ref, -1.0)
     getattr(_C, ENTRIES[entry])(a, a_scale, w13, w13_scale, m_indices, num_tokens, hidden, scale, SWIGLU_LIMIT)
     torch.cuda.synchronize()
+    assert bool(torch.isfinite(hidden[:active].float()).all())
+    assert bool(torch.isfinite(hidden_ref[:active].float()).all())
+    assert bool(torch.isfinite(scale[:active]).all()) and bool(torch.isfinite(scale_ref[:active]).all())
     assert torch.equal(scale[:active], scale_ref[:active])
     assert torch.equal(hidden[:active].view(torch.uint8), hidden_ref[:active].view(torch.uint8))
     assert bool((scale[active:] == -1.0).all()), "rows beyond num_tokens must stay untouched"
