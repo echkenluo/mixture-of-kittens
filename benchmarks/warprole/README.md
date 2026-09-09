@@ -52,6 +52,31 @@ inputs/routes, independent returned copies and device-visible lease ownership.
 It does not exercise model loading, policy admission, shared experts, graphs or
 HTTP serving and therefore does not replace the complete service gate.
 
+## Service-shaped internal timing diagnostics
+
+`bench_warprole_sched.py` retains its historical 64-expert/two-case defaults.
+For the current TP4/EP4 DSV4 geometry, select 256 experts and the explicit
+1024/2048 local-token cases with schedule capacity factor 5:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=4 benchmarks/bench_warprole_sched.py --total-experts 256 --cases service_uniform_1024,service_uniform_2048 --variants c2s4 --knobs real --probe --out /results/service-shaped-timing.json
+```
+
+This uses uniform synthetic routes and synthetic weights, not captured model
+routes/weights. The raw per-CTA globaltimer stamps are retained alongside the
+summary, so phase relationships can be recomputed without subtracting unrelated
+medians. Compare timestamps within a rank; cross-GPU clock alignment is not
+established. Probe calls occur after timed A/B/A blocks and are not included in
+the reported timing samples. Real mode includes prepare in every fused call.
+
+The standalone W13/W2 pair omits activation/quantization, dispatch, combine and
+final reduction, so its difference from the real fused path is not a matched
+full-pipeline regression. The historical 3% step-3 overhead gate applies only to
+`--knobs all`; real and ablation modes are diagnostic. No mode establishes model
+quality or service performance. This benchmark sets destructive ablation knobs
+at import and resets them in `main()` according to `--knobs`; never import it
+into a serving process.
+
 ## Build and resource reports
 
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the

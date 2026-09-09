@@ -121,6 +121,8 @@ CASES = {
     for case in (
         Case("uniform_2048", 2048, 0.5),
         Case("tail_3888", 3888, 0.5),
+        Case("service_uniform_1024", 1024, 1.25),
+        Case("service_uniform_2048", 2048, 1.25),
     )
 }
 
@@ -196,8 +198,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--total-experts", type=int, choices=(64, 256), default=64,
+        help="global expert count; use 256 for the current DSV4 service geometry",
+    )
+    parser.add_argument(
         "--cases",
-        default=",".join(CASES),
+        default="uniform_2048,tail_3888",
         help="comma-separated subset of " + ",".join(CASES),
     )
     parser.add_argument(
@@ -223,7 +229,8 @@ def sha256(path: pathlib.Path) -> str:
 
 def provenance(device: torch.device, rank: int, world_size: int) -> dict:
     """Read-only record of what produced these numbers."""
-    repo = pathlib.Path(__file__).resolve().parents[1]
+    # A frozen harness may be mounted separately from the immutable runtime.
+    repo = pathlib.Path(functional.__file__).resolve().parents[1]
     shared_objects = sorted((repo / "mok").glob("_C*.so"))
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -329,7 +336,7 @@ def make_weights(device: torch.device):
 
     Same generator as tests/test_warprole_ep4.py::make_weights: values clamped
     into FP8 range before the cast, block scales in [0.01, 0.10).  The seed does
-    not depend on the rank; every rank holds its own 16 local experts.  The
+    not depend on the rank; each rank holds TOTAL_EXPERTS / EP_SIZE experts. The
     fused kernel and the standalone W13 entry read the gate/up weight as the
     model stores it, so no reordered copy exists.
     """
@@ -357,7 +364,7 @@ def make_weights(device: torch.device):
 
 
 def make_routing(case: Case, rank: int, device: torch.device):
-    """Uniform top-6 routing over all 64 experts, as the EP4 test builds it.
+    """Uniform top-6 routing over the configured global experts.
 
     Tokens past ``effective_tokens`` are padding: expert -1 keeps them out of
     the schedule.  The fused kernel never reduces them here anyway, because
@@ -692,6 +699,7 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     drift = abs(a2["p50_ms"] - a1["p50_ms"]) / midpoint
     standalone_p50 = w13_row["p50_ms"] + w2_row["p50_ms"]
     probe = None
+    probe_stamps = None
     if args.probe and args.knobs == "real":
         dist.barrier()
         os.environ["MOK_WARPROLE_PROBE"] = "1"
@@ -700,7 +708,9 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
             torch.cuda.synchronize()
         finally:
             os.environ["MOK_WARPROLE_PROBE"] = "0"
-        probe = summarize_probe(_C.fp8_block_warprole_probe_read().cpu())
+        stamps = _C.fp8_block_warprole_probe_read().cpu()
+        probe_stamps = stamps.tolist()
+        probe = summarize_probe(stamps)
     return {
         "rank": dist.get_rank(),
         "order": ["fused_a1", "w13", "w2", "fused_a2"],
@@ -713,6 +723,7 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
         "standalone_pair_p50_ms": standalone_p50,
         "overhead": (midpoint - standalone_p50) / standalone_p50,
         "probe_us": probe,
+        "probe_raw_globaltimer_ns": probe_stamps,
     }
 
 
@@ -808,6 +819,7 @@ def print_verdicts(record: dict) -> None:
     print(
         f"WARPROLE_STEP3_VERDICT|all_pass={record['verdict']['all_pass']}"
         f"|all_valid={record['verdict']['all_valid']}"
+        f"|step3_gate_applicable={record['verdict']['step3_overhead_gate_applicable']}"
         f"|out={record['output']}",
         flush=True,
     )
@@ -827,7 +839,10 @@ def require_warprole(device: torch.device, variants: tuple[str, ...]) -> None:
 
 
 def main() -> None:
+    global TOTAL_EXPERTS, LOCAL_EXPERTS
     args = parse_args()
+    TOTAL_EXPERTS = args.total_experts
+    LOCAL_EXPERTS = TOTAL_EXPERTS // EP_SIZE
     # The entry reads the knobs with getenv on every call, so flipping them
     # here (before any entry call) is enough; NO_DEPS stays on in every mode
     # except "real", which runs the production kernel.
@@ -873,6 +888,8 @@ def main() -> None:
                 measurements[f"{case_name}/{variant}"] = result
 
         verdict = {
+            "formal_quality_or_performance_go": False,
+            "step3_overhead_gate_applicable": args.knobs == "all",
             "gate": (
                 f"rank-max overhead <= {OVERHEAD_LIMIT * 100:.0f}% in every "
                 f"shape and variant; fused A/A drift <= "
@@ -904,6 +921,7 @@ def main() -> None:
                 "intermediate": INTERMEDIATE,
                 "topk": TOPK,
                 "num_local_experts": LOCAL_EXPERTS,
+                "total_experts": TOTAL_EXPERTS,
                 "expert_padding": EXPERT_PADDING,
                 "swiglu_limit": SWIGLU_LIMIT,
                 "seed": SEED,
@@ -916,9 +934,11 @@ def main() -> None:
                     for variant in args.variants
                 },
                 "timing_boundary": (
-                    "binding + kernel; the driver's counter reset, workspace "
-                    "lease and trap read stay outside the timed region on the "
-                    "fused arm"
+                    "CUDA-event elapsed time of binding + kernel calls; real mode "
+                    "includes prepare counter reset in every fused call. Workspace "
+                    "lease, setup and trap read are outside. The standalone W13/W2 "
+                    "pair excludes dispatch, activation/quant, combine and final reduce; "
+                    "real-mode overhead is not a matched full-pipeline speedup."
                 ),
                 "reported_statistic": (
                     "per-rank p50, and the rank-max of the per-rank overhead"
