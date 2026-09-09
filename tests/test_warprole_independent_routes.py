@@ -6,14 +6,16 @@ dispatch buffers, hidden state, or split output. This is synthetic correctness,
 not dense random GEMM accuracy or model quality.
 """
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 import torch
 
 from .test_warprole_ep4 import (
     Case, HIDDEN, LOCAL_EXPERTS, TOTAL_EXPERTS, TOPK,
-    build_harness, run_warprole,
+    build_harness, run_split, run_warprole,
 )
 from .warprole_numeric_reference import metrics
 from .warprole_route_reference import block_scales, point_parameters, routed_forward
@@ -63,6 +65,57 @@ def test_independent_routing(context, variant, padding):
         harness.x_fp8.cpu(), harness.x_scale.cpu(), ids.cpu(), weights.cpu())
     actual = run_warprole(harness, variant).cpu()
     result = metrics(actual, expected)
+    # Preserve the failing boundary before another collective or assertion.
+    # Intermediate rows use the candidate schedule only for diagnosis; the
+    # full-output expected value above remains independent of that schedule.
+    root = Path("/results")
+    if root.is_dir():
+        stem = f"routes-rank{rank}-{variant}-padding{int(padding)}"
+        workspace = harness.workspace
+        count = int(workspace.schedule_num_tokens.item())
+        peer_rank = workspace.schedule_peer_rank[:count].cpu()
+        peer_token = workspace.schedule_peer_token_idx[:count].cpu()
+        selected = torch.where((peer_rank >= 0) & (peer_token >= 0))[0]
+
+        def rows(tensor):
+            value = tensor[:count].cpu()
+            if value.dtype == torch.float8_e4m3fn:
+                return value.view(torch.uint8)[selected].view(torch.float8_e4m3fn)
+            return value[selected]
+
+        payload = {
+            "rank": rank, "world": world, "variant": variant, "padding": padding,
+            "x": harness.x_fp8.cpu(), "x_scale": harness.x_scale.cpu(),
+            "ids": ids.cpu(), "weights": weights.cpu(),
+            "actual": actual, "expected": expected,
+            "selected_rows": selected, "peer_rank": peer_rank[selected],
+            "peer_token": peer_token[selected],
+            "expert": rows(workspace.m_indices),
+            "routed_x": rows(workspace.routed_x),
+            "routed_x_scale": rows(workspace.routed_x_scale),
+            "hidden": rows(harness.state.hidden),
+            "hidden_scale": rows(harness.state.hidden_scale),
+            "routed_y": rows(harness.state.routed_y),
+        }
+        path = root / (stem + ".pt")
+        torch.save(payload, path)
+        split = run_split(harness).cpu()
+        payload.update(split=split, split_gate_up=rows(harness.gate_up),
+                       split_hidden=rows(harness.down_input),
+                       split_hidden_scale=rows(harness.down_input_scale),
+                       split_routed_y=rows(harness.split_routed_y),
+                       split_peer_rank=workspace.schedule_peer_rank[:count].cpu()[selected],
+                       split_peer_token=workspace.schedule_peer_token_idx[:count].cpu()[selected])
+        torch.save(payload, path)
+        (root / (stem + ".json")).write_text(json.dumps({
+            "rank": rank, "variant": variant, "padding": padding,
+            "actual_vs_reference": result,
+            "split_vs_reference": metrics(split, expected),
+            "actual_vs_split": metrics(actual, split),
+            "tensor_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "selected_rows": len(selected),
+            "scope": "diagnostic; original independent assertions unchanged",
+        }, indent=2) + "\n")
     print("INDEPENDENT_ROUTES " + json.dumps({
         "rank": rank, "world": world, "variant": variant, "padding": padding,
         "global_experts_in_source_routes": int(ids[ids >= 0].unique().numel()), **result,
