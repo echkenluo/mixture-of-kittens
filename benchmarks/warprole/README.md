@@ -86,6 +86,9 @@ counts, so rank timing differences can be checked against actual scheduled work.
 The runtime Git query trusts only the explicitly mounted repository for that
 command; it does not modify global Git configuration. Query failures raise an
 error instead of being reported as an empty clean status.
+Each measured block also records host wall-clock bounds, including its warmup
+and synchronizations, for matching external clock telemetry. These bounds are
+not individual kernel timestamps and do not replace CUDA-event samples.
 
 ## Build and resource reports
 

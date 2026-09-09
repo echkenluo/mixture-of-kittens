@@ -647,6 +647,15 @@ def summarize(samples: list[float]) -> dict:
     }
 
 
+def measure_block(function, args) -> dict:
+    # Host wall-clock bounds include the block's warmup and device syncs. They
+    # align external clock telemetry, not individual kernel-event timestamps.
+    start = time.time_ns()
+    result = summarize(time_calls(function, args.warmup, args.iters, args.calls_per_sample))
+    result.update(wall_start_ns=start, wall_end_ns=time.time_ns(), wall_bounds_include_warmup=True)
+    return result
+
+
 def measure_local(harness: Harness, variant: str, args) -> dict:
     """A/B/A on one rank: fused, the standalone pair, fused again.
 
@@ -694,13 +703,13 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     if args.burn_in_seconds > 0:
         burn_in(run_fused, args.burn_in_seconds, collective=args.knobs == "real")
     dist.barrier()
-    a1 = summarize(time_calls(run_fused, args.warmup, args.iters, args.calls_per_sample))
+    a1 = measure_block(run_fused, args)
     dist.barrier()
-    w13_row = summarize(time_calls(run_w13, args.warmup, args.iters, args.calls_per_sample))
+    w13_row = measure_block(run_w13, args)
     dist.barrier()
-    w2_row = summarize(time_calls(run_w2, args.warmup, args.iters, args.calls_per_sample))
+    w2_row = measure_block(run_w2, args)
     dist.barrier()
-    a2 = summarize(time_calls(run_fused, args.warmup, args.iters, args.calls_per_sample))
+    a2 = measure_block(run_fused, args)
     dist.barrier()
 
     if int(harness.workspace.trap_record[0].item()) != 0:
