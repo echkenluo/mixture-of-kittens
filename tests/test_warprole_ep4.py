@@ -37,6 +37,7 @@ import torch.distributed as dist
 
 from mok import _C, functional, warprole
 from .warprole_assertions import assert_bitwise
+from .warprole_test_shapes import schedule_multiplier
 
 EP_SIZE = int(os.environ.get("WORLD_SIZE", "4"))
 TOTAL_EXPERTS = int(os.environ.get("MOK_TEST_EXPERTS", "256"))
@@ -299,10 +300,9 @@ def build_harness(case: Case, rank: int, device: torch.device, *, fresh=False) -
     w13, w13_scale, w2, w2_scale = _WEIGHTS[0]
 
     config = functional.MoKConfig(
-        schedule_capacity_multiplier=max(
-            case.capacity_multiplier,
-            (EP_SIZE + math.ceil(LOCAL_EXPERTS * (EXPERT_PADDING - 1)
-                                 / (case.graph_tokens * TOPK))) / EP_SIZE,
+        schedule_capacity_multiplier=schedule_multiplier(
+            case.graph_tokens, TOPK, EP_SIZE, LOCAL_EXPERTS,
+            minimum=case.capacity_multiplier,
         ),
         all_gather_top_experts_chunk_bytes=chunk_bytes_for(case.graph_tokens),
     )
