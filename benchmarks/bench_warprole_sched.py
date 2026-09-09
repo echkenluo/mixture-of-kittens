@@ -608,10 +608,22 @@ def time_calls(function, warmup: int, iters: int, calls_per_sample: int) -> list
     return samples
 
 
-def burn_in(function, seconds: float) -> None:
-    """Run `function` untimed for `seconds` of wall clock before the first timed block."""
+def burn_in(function, seconds: float, *, collective: bool = False) -> None:
+    """Warm up with a common stop decision when the kernel communicates across ranks."""
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    decision = torch.empty(1, dtype=torch.int32, device="cuda") if collective else None
+    while True:
+        if collective:
+            # A local deadline can make one rank enter dist.barrier while peers
+            # launch another communicating kernel and wait forever for that rank.
+            if dist.get_rank() == 0:
+                decision.fill_(int(time.monotonic() < deadline))
+            dist.broadcast(decision, src=0)
+            keep_running = bool(decision.item())
+        else:
+            keep_running = time.monotonic() < deadline
+        if not keep_running:
+            break
         for _ in range(10):
             function()
         torch.cuda.synchronize()
@@ -678,7 +690,7 @@ def measure_local(harness: Harness, variant: str, args) -> dict:
     dist.barrier()
 
     if args.burn_in_seconds > 0:
-        burn_in(run_fused, args.burn_in_seconds)
+        burn_in(run_fused, args.burn_in_seconds, collective=args.knobs == "real")
     dist.barrier()
     a1 = summarize(time_calls(run_fused, args.warmup, args.iters, args.calls_per_sample))
     dist.barrier()
@@ -937,7 +949,8 @@ def main() -> None:
                     "CUDA-event elapsed time of binding + kernel calls; real mode "
                     "includes prepare counter reset in every fused call. Workspace "
                     "lease, setup and trap read are outside. The standalone W13/W2 "
-                    "pair excludes dispatch, activation/quant, combine and final reduce; "
+                    "pair includes the W13 fused activation/quant epilogue, but excludes "
+                    "dispatch, combine and final reduce; "
                     "real-mode overhead is not a matched full-pipeline speedup."
                 ),
                 "reported_statistic": (

@@ -69,8 +69,12 @@ medians. Compare timestamps within a rank; cross-GPU clock alignment is not
 established. Probe calls occur after timed A/B/A blocks and are not included in
 the reported timing samples. Real mode includes prepare in every fused call.
 
-The standalone W13/W2 pair omits activation/quantization, dispatch, combine and
-final reduction, so its difference from the real fused path is not a matched
+Real-mode timed warmup uses a rank-zero broadcast stop decision so all ranks
+issue the same number of communicating kernel calls, even with host clock skew.
+The broadcasts occur outside measured blocks.
+
+The standalone W13/W2 pair includes the fused W13 activation/quantization but
+omits dispatch, combine and final reduction, so its difference from the real fused path is not a matched
 full-pipeline regression. The historical 3% step-3 overhead gate applies only to
 `--knobs all`; real and ablation modes are diagnostic. No mode establishes model
 quality or service performance. This benchmark sets destructive ablation knobs
