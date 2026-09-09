@@ -36,7 +36,7 @@ import torch
 import torch.distributed as dist
 
 from mok import _C, functional, warprole
-from warprole_assertions import assert_bitwise
+from .warprole_assertions import assert_bitwise
 
 EP_SIZE = int(os.environ.get("WORLD_SIZE", "4"))
 TOTAL_EXPERTS = int(os.environ.get("MOK_TEST_EXPERTS", "256"))
