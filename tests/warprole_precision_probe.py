@@ -35,7 +35,7 @@ def torch_gpu_reference(data):
     return torch.cat(rows)
 
 
-def main(destination):
+def main(destination, extended=False):
     destination.mkdir(exist_ok=False)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -48,15 +48,33 @@ def main(destination):
         "samples": SAMPLES, "tf32_allowed": torch.backends.cuda.matmul.allow_tf32,
         "cases": [], "verdict": "DIAGNOSTIC_ONLY_NO_NUMERIC_GO",
     }
-    for case in ("original", "integer_values", "unit_scales", "single_k128", "single_k32"):
+    cases = ["original", "integer_values", "unit_scales", "single_k128", "single_k32"]
+    if extended:
+        import deep_gemm
+        package = Path(deep_gemm.__file__).parent
+        receipt["deepgemm"] = {
+            "version": deep_gemm.__version__, "package": str(package),
+            "python_sha256": hashlib.sha256((package / "__init__.py").read_bytes()).hexdigest(),
+            "binary_sha256": hashlib.sha256((package / "_C.so").read_bytes()).hexdigest(),
+            "entry": "fp8_gemm_nt", "recipe": "runtime default, same FP8/FP32 scale tensors",
+        }
+        cases += ["normal_unit_scales", "normal_single_k32"]
+    for case in cases:
         data = list(inputs(4096))
+        if case.startswith("normal_"):
+            # E4M3 smallest normal is 2**-6. Remove subnormal inputs in both
+            # operands to distinguish input handling from accumulation error.
+            for i in (0, 1):
+                values = data[i].float()
+                values[values.abs() < 2 ** -6] = 0
+                data[i] = values.to(torch.float8_e4m3fn)
         if case == "integer_values":
             data[0] = data[0].float().round().to(torch.float8_e4m3fn)
             data[1] = data[1].float().round().to(torch.float8_e4m3fn)
-        if case in ("unit_scales", "single_k128", "single_k32"):
+        if case in ("unit_scales", "single_k128", "single_k32", "normal_unit_scales", "normal_single_k32"):
             data[2].fill_(1)
             data[3].fill_(1)
-        if case in ("single_k128", "single_k32"):
+        if case in ("single_k128", "single_k32", "normal_single_k32"):
             cutoff = 128 if case == "single_k128" else 32
             x = data[0].float()
             x[:, cutoff:] = 0
@@ -79,6 +97,18 @@ def main(destination):
             actual = cpu[list(SAMPLES)]
             snapshots[arm] = actual
             case_receipt["arms"][arm] = metrics(actual, reference)
+        if extended:
+            pieces = []
+            for start, expert in ((0, 1), (64, 0)):
+                out = torch.empty((64, 4096), dtype=torch.bfloat16, device="cuda")
+                deep_gemm.fp8_gemm_nt(
+                    (a[start:start + 64], a_scale[start:start + 64]),
+                    (b[expert], b_scale[expert]), out)
+                selected = [i - start for i in SAMPLES if start <= i < start + 64]
+                pieces.append(out.cpu()[selected])
+            snapshots["deepgemm"] = torch.cat(pieces)
+            case_receipt["arms"]["deepgemm"] = metrics(snapshots["deepgemm"], reference)
+            case_receipt["deepgemm_vs_mok"] = metrics(snapshots["deepgemm"], snapshots["split"])
         case_receipt["split_vs_c1s6"] = metrics(snapshots["split"], snapshots["c1s6"])
         case_receipt["split_vs_c2s4"] = metrics(snapshots["split"], snapshots["c2s4"])
         tensor_path = destination / f"{case}.pt"
@@ -94,4 +124,6 @@ def main(destination):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", type=Path)
-    main(parser.parse_args().destination)
+    parser.add_argument("--extended", action="store_true")
+    args = parser.parse_args()
+    main(args.destination, args.extended)
