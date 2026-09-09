@@ -43,6 +43,15 @@ cleanup. The parent must require all rank receipts and the exact
 `EXPECTED_REENTRANT_TRAP_PASS` verdict; an arbitrary nonzero exit is not a pass.
 These gates do not establish independent numerical accuracy or service quality.
 
+`tests/test_warprole_sglang_core.py` separately exercises the actual SGLang
+`_run_native_core` on EP4/EP8 with synthetic weights, two variants and T256/1792.
+Use the complete-port SGLang checkout in `PYTHONPATH`; the deployment runner
+requires its full Git commit and verifies the loaded adapter file on each rank.
+The test uses real quantization, process groups and kernels. It checks changed
+inputs/routes, independent returned copies and device-visible lease ownership.
+It does not exercise model loading, policy admission, shared experts, graphs or
+HTTP serving and therefore does not replace the complete service gate.
+
 ## Build and resource reports
 
 `build_sm90.sh` compiles the SM90 extension without a GPU, inside the
