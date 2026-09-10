@@ -178,6 +178,46 @@ __device__ __forceinline__ Task lookup(int m,int experts,const int *ends,
     return Task{m,ends[e]/64-1,lo,e,length[lo],length[e]};
 }
 
+// Reorder only the W2 phase of one original minibatch: all paired leaders
+// (n-major), then all ordinary tiles (n-major), then unused partner slots.
+// The global cursor still counts the original slots. A false return skips a
+// partner slot; a true return gives a canonical task index for the mailbox,
+// so consumers need no mapping state. Every W13 index stays unchanged.
+__device__ __forceinline__ bool group_w2_task(int &index, task &tk, shape s,
+        int experts, const int *ends, const int *partner, const int *length,
+        int &cached_q, unsigned &leaders, unsigned &dense) {
+    const int lane=threadIdx.x%32;
+    const int tiles=tiles_in_minibatch(s,tk.minibatch);
+    const int first=first_tile_of_minibatch(tk.minibatch);
+    if(cached_q!=tk.minibatch) {
+        Task p{};
+        if(lane<tiles)p=lookup(first+lane,experts,ends,partner,length);
+        leaders=__ballot_sync(0xffffffffu,lane<tiles && p.m1>=0 && p.m0<p.m1);
+        dense=__ballot_sync(0xffffffffu,lane<tiles && p.m1<0);
+        cached_q=tk.minibatch;
+    }
+    if(leaders==0)return true;
+    constexpr int columns=geometry<2>::W2_TASKS_PER_TILE;
+    const int local=tk.n_index*tiles+tk.m_tile-first;
+    const int phase_base=index-local;
+    const int np=__popc(leaders),nd=__popc(dense);
+    const bool paired=local<np*columns;
+    const int ordinal=paired?local:local-np*columns;
+    const int count=paired?np:nd;
+    if(ordinal>=count*columns)return false;
+    const unsigned mask=paired?leaders:dense;
+    const int n=ordinal/count,offset=ordinal%count;
+    // Warp-wide select of the offset-th set bit, without a serial bit loop.
+    const unsigned before=(1u<<lane)-1u;
+    const unsigned selected=__ballot_sync(0xffffffffu,
+        (mask&(1u<<lane))!=0 && __popc(mask&before)==offset);
+    const int m=__ffs(selected)-1;
+    index=phase_base+n*tiles+m;
+    tk.m_tile=first+m;
+    tk.n_index=n;
+    return true;
+}
+
 template <typename G>
 __device__ __forceinline__ void producer(const G &g, Shared &s,
         semaphore *full,semaphore *empty,const Task &task,int ng) {

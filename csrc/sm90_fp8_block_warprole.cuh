@@ -219,10 +219,11 @@ __device__ __forceinline__ void rank_barrier(const globals &g) {
     warpgroup::sync(BAR_COMM);
 }
 
-template <int NC, int STAGES, bool RETAIN_W2_D = false, bool PAIR_W2 = false>
+template <int NC, int STAGES, bool RETAIN_W2_D = false, bool PAIR_W2 = false, bool GROUP_W2 = false>
 __global__ __launch_bounds__(gemm::num_threads<NC>(), 1)
 void kernel(const __grid_constant__ std::conditional_t<PAIR_W2, paired_globals, globals> g) {
     static_assert(!PAIR_W2 || (NC == 2 && STAGES == 4 && RETAIN_W2_D));
+    static_assert(!GROUP_W2 || PAIR_W2);
     using smem_t = gemm::smem_layout<NC, STAGES>;
     extern __shared__ int __shm[];
     auto &smem = *reinterpret_cast<smem_t *>(
@@ -316,6 +317,8 @@ void kernel(const __grid_constant__ std::conditional_t<PAIR_W2, paired_globals, 
         } else {
             int64_t stage_counter = 0;
             bool pair_mode = false;
+            int map_q = -1;
+            unsigned map_leaders = 0, map_dense = 0;
             // Lane 0 claims one task ahead: the atomic's round trip then hides behind the
             // loads of the task in flight instead of stalling the producer at every task start.
             int next = 0;
@@ -332,8 +335,14 @@ void kernel(const __grid_constant__ std::conditional_t<PAIR_W2, paired_globals, 
                     // Only the lower tile's W2 task executes. Skipped claims do
                     // not publish a mailbox entry or consume a sequence number.
                     while (tk.kind == task_kind::w2) {
-                        pt = paired_tail::lookup(tk.m_tile, g.c.num_local_experts, expert_row_end, pair_partner, pair_length);
-                        if (pt.m1 < 0 || pt.m0 < pt.m1) break;
+                        bool keep = true;
+                        if constexpr (GROUP_W2)
+                            keep = paired_tail::group_w2_task(t,tk,s,g.c.num_local_experts,
+                                expert_row_end,pair_partner,pair_length,map_q,map_leaders,map_dense);
+                        if (keep) {
+                            pt = paired_tail::lookup(tk.m_tile, g.c.num_local_experts, expert_row_end, pair_partner, pair_length);
+                            if (pt.m1 < 0 || pt.m0 < pt.m1) break;
+                        }
                         if (laneid() == 0) next = static_cast<int>(atomicAdd(g.task_cursor, 1u));
                         t = __shfl_sync(0xffffffffu, next, 0);
                         tk = decode_task<NC>(static_cast<int64_t>(t), s);
@@ -799,6 +808,8 @@ inline void entry_out(
     // Experimental scheduling change, default off; both variants preserve
     // the same arithmetic, shared-memory allocation and readiness counters.
     const bool pair_w2 = env_flag("MOK_WARPROLE_PAIR_W2_TAILS");
+    const bool group_w2 = env_flag("MOK_WARPROLE_GROUP_W2_TAILS");
+    TORCH_CHECK(!group_w2 || pair_w2, "MOK_WARPROLE_GROUP_W2_TAILS=1 requires MOK_WARPROLE_PAIR_W2_TAILS=1");
     TORCH_CHECK(!pair_w2 || (NC == 2 && STAGES == 4 && env_flag("MOK_WARPROLE_RETAIN_W2_D")),
                 "MOK_WARPROLE_PAIR_W2_TAILS=1 requires c2s4 and MOK_WARPROLE_RETAIN_W2_D=1");
     auto *kernel_ptr = env_flag("MOK_WARPROLE_RETAIN_W2_D")
@@ -826,7 +837,9 @@ inline void entry_out(
         if (pair_w2) {
             paired_globals pg(g, kittens::py::tensor_to_gl<paired_tail::XGL>(hidden));
             constexpr int paired_bytes = sizeof(paired_tail::Shared) + 1024;
-            launch(kernel<NC, STAGES, true, true>, pg, std::max(SMEM, paired_bytes));
+            auto *paired_kernel = group_w2 ? kernel<NC, STAGES, true, true, true>
+                                          : kernel<NC, STAGES, true, true, false>;
+            launch(paired_kernel, pg, std::max(SMEM, paired_bytes));
             return;
         }
     }
