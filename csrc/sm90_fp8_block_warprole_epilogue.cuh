@@ -37,10 +37,10 @@ template <int NC> __device__ __forceinline__ void consumers_sync() {
 // per pass; 16 threads share a row so the K128 absmax is a 16-lane shuffle
 // reduction.  EPI_THREADS need not divide the tile: the last pass is guarded
 // (the guard is uniform over each 16-lane group, so the shuffle stays whole).
-template <int EPI_THREADS>
+template <int EPI_THREADS, bool AUDIT_W13 = false>
 __device__ __forceinline__ void swiglu_quant_tile(
         int t, d_st &gate_tile, d_st &up_tile, uint8_t *hidden, float *hidden_scale,
-        int m_tile, int i_tile, float limit) {
+        int m_tile, int i_tile, float limit, __nv_bfloat16 *audit_w13 = nullptr) {
     static_assert(EPI_THREADS % 32 == 0);
     constexpr int THREADS_PER_ROW = N_TILE / 8;                    // 16
     constexpr int ROWS_PER_PASS = EPI_THREADS / THREADS_PER_ROW;   // 6, 8 or 16
@@ -58,6 +58,17 @@ __device__ __forceinline__ void swiglu_quant_tile(
             d_st::idx(gate_tile.data, {load_row, col0}));
         const uint4 up_raw = *reinterpret_cast<const uint4 *>(
             d_st::idx(up_tile.data, {load_row, col0}));
+        // Capture the exact BF16 values consumed below, after the caller's
+        // D_FULL barrier and before D_EMPTY allows a producer overwrite.
+        // Diagnostic specialization only; production emits no capture stores.
+        if constexpr (AUDIT_W13) {
+            if (valid) {
+                const size_t row = static_cast<size_t>(m_tile) * M_TILE + local_row;
+                const size_t offset = row * (2 * INTER) + i_tile * N_TILE + col0;
+                *reinterpret_cast<uint4 *>(audit_w13 + offset) = gate_raw;
+                *reinterpret_cast<uint4 *>(audit_w13 + offset + INTER) = up_raw;
+            }
+        }
         const __nv_bfloat162 *gate_pairs = reinterpret_cast<const __nv_bfloat162 *>(&gate_raw);
         const __nv_bfloat162 *up_pairs = reinterpret_cast<const __nv_bfloat162 *>(&up_raw);
         float values[8];

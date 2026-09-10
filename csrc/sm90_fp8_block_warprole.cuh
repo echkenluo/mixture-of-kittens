@@ -18,6 +18,7 @@
 #if defined(KITTENS_SM90)
 #include <cstdlib>
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 
 #include <vector>
 
@@ -63,6 +64,7 @@ struct globals {
     const float *w2_scale = nullptr;     // [E, 32, 16]
     uint8_t *hidden = nullptr;           // [capacity, 2048] fp8
     float *hidden_scale = nullptr;       // [capacity, 16]
+    __nv_bfloat16 *audit_w13 = nullptr;   // diagnostic-only [capacity, 4096]
     unsigned int *hidden_ready = nullptr;   // [m_tiles]
     float limit = 0.0f;
     const __nv_bfloat16 *combine_local = nullptr;   // [num_local_tokens * topk, 4096]
@@ -211,7 +213,7 @@ __device__ __forceinline__ void rank_barrier(const globals &g) {
     warpgroup::sync(BAR_COMM);
 }
 
-template <int NC, int STAGES>
+template <int NC, int STAGES, bool AUDIT_W13 = false>
 __global__ __launch_bounds__(gemm::num_threads<NC>(), 1)
 void kernel(const __grid_constant__ globals g) {
     using smem_t = gemm::smem_layout<NC, STAGES>;
@@ -290,8 +292,8 @@ void kernel(const __grid_constant__ globals g) {
                     asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
                     continue;
                 }
-                epilogue::swiglu_quant_tile<EPI_THREADS>(t, smem.d[0], smem.d[1], g.hidden, g.hidden_scale,
-                                                         m_tile, i_tile, g.limit);
+                epilogue::swiglu_quant_tile<EPI_THREADS, AUDIT_W13>(t, smem.d[0], smem.d[1], g.hidden, g.hidden_scale,
+                                                         m_tile, i_tile, g.limit, g.audit_w13);
                 asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
                 asm volatile("bar.sync %0, %1;" :: "n"(BAR_EPI), "n"(EPI_THREADS) : "memory");
                 if (t == 0) {   // barrier cumulativity + gpu-scope fence publish the whole tile
@@ -604,8 +606,8 @@ inline int env_flag(const char *name) {
     return (v != nullptr && v[0] == '1' && v[1] == '\0') ? 1 : 0;
 }
 
-template <int NC, int STAGES>
-inline void entry_out(
+template <int NC, int STAGES, bool AUDIT_W13>
+inline void entry_out_impl(
         at::Tensor x, std::vector<int64_t> x_ptrs, at::Tensor x_scale, std::vector<int64_t> x_scale_ptrs,
         at::Tensor routed_x, at::Tensor routed_x_scale, at::Tensor m_indices,
         at::Tensor schedule_peer_rank, at::Tensor schedule_peer_token_idx, at::Tensor num_tokens,
@@ -616,7 +618,7 @@ inline void entry_out(
         at::Tensor output, std::vector<int64_t> push_done_ptrs, int64_t ep_rank,
         at::Tensor x_ready, at::Tensor hidden_ready, at::Tensor y_ready, at::Tensor push_done_local,
         at::Tensor barrier_buffer, at::Tensor barrier_target, int64_t barrier_multicast_ptr,
-        at::Tensor input_expected_scratch, int64_t trap_record_ptr, double swiglu_limit, int64_t spin_limit) {
+        at::Tensor input_expected_scratch, int64_t trap_record_ptr, double swiglu_limit, int64_t spin_limit, at::Tensor audit_w13) {
     c10::cuda::CUDAGuard device_guard(x.device());
     comm::globals cg{};
     comm::bench::fill_comm_globals(cg, x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices,
@@ -624,6 +626,23 @@ inline void entry_out(
                                    routed_y, combine_ptrs, push_done_ptrs, ep_rank, x_ready, y_ready, push_done_local);
     const int64_t capacity = routed_x.size(0);
     const int64_t experts = w13.size(0);
+    if constexpr (AUDIT_W13) {
+        cudaStreamCaptureStatus capture;
+        CUDACHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(x.get_device()), &capture));
+        TORCH_CHECK(capture == cudaStreamCaptureStatusNone, "W13 audit rejects CUDA graph capture");
+        TORCH_CHECK(audit_w13.defined() && audit_w13.is_cuda() && audit_w13.device() == x.device()
+                    && audit_w13.scalar_type() == at::kBFloat16 && audit_w13.is_contiguous()
+                    && audit_w13.dim() == 2 && audit_w13.size(0) == capacity && audit_w13.size(1) == 2 * INTER,
+                    "W13 audit requires caller-owned contiguous CUDA BF16 [capacity,4096]");
+        for (const at::Tensor *tensor : {&x, &x_scale, &routed_x, &routed_x_scale, &m_indices,
+                &schedule_peer_rank, &schedule_peer_token_idx, &num_tokens, &tokens_per_expert,
+                &w13, &w13_scale, &w2, &w2_scale, &hidden, &hidden_scale, &routed_y,
+                &combine_local, &weights, &topk_ids, &output, &x_ready, &hidden_ready,
+                &y_ready, &push_done_local, &barrier_buffer, &barrier_target, &input_expected_scratch})
+            TORCH_CHECK(at::get_overlap_status(audit_w13, *tensor) == at::MemOverlapStatus::No,
+                        "W13 audit buffer must not alias live inputs, outputs or workspace state");
+    }
+
     TORCH_CHECK(cg.topk == TOPK, "warprole is specialized for top-6 routing");
     TORCH_CHECK(w13.dim() == 3 && w13.size(1) == 2 * INTER && w13.size(2) == HIDDEN
                     && w13.scalar_type() == at::kFloat8_e4m3fn && w13.is_contiguous() && w13.is_cuda(),
@@ -681,6 +700,7 @@ inline void entry_out(
     g.w2_scale = w2_scale.data_ptr<float>();
     g.hidden = static_cast<uint8_t *>(hidden.data_ptr());
     g.hidden_scale = hidden_scale.data_ptr<float>();
+    if constexpr (AUDIT_W13) g.audit_w13 = reinterpret_cast<__nv_bfloat16 *>(audit_w13.data_ptr());
     g.hidden_ready = u32_ptr(hidden_ready);
     g.limit = static_cast<float>(swiglu_limit);
     g.combine_local = reinterpret_cast<const __nv_bfloat16 *>(combine_local.data_ptr());
@@ -705,7 +725,7 @@ inline void entry_out(
 
     constexpr int SMEM = sizeof(gemm::smem_layout<NC, STAGES>) + 1024;
     constexpr int THREADS = gemm::num_threads<NC>();
-    auto *kernel_ptr = kernel<NC, STAGES>;
+    auto *kernel_ptr = kernel<NC, STAGES, AUDIT_W13>;
     CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     int num_sms = 0;
     CUDACHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.get_device()));
@@ -723,6 +743,39 @@ inline void entry_out(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
     kernel_ptr<<<num_sms, THREADS, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());
+}
+
+// Preserve the production Python/C++ signature; capture is a separate entry.
+template <int NC, int STAGES>
+inline void entry_out(
+        at::Tensor x, std::vector<int64_t> x_ptrs, at::Tensor x_scale, std::vector<int64_t> x_scale_ptrs,
+        at::Tensor routed_x, at::Tensor routed_x_scale, at::Tensor m_indices,
+        at::Tensor schedule_peer_rank, at::Tensor schedule_peer_token_idx, at::Tensor num_tokens,
+        at::Tensor tokens_per_expert, int64_t topk,
+        at::Tensor w13, at::Tensor w13_scale, at::Tensor w2, at::Tensor w2_scale,
+        at::Tensor hidden, at::Tensor hidden_scale, at::Tensor routed_y,
+        std::vector<int64_t> combine_ptrs, at::Tensor combine_local, at::Tensor weights, at::Tensor topk_ids,
+        at::Tensor output, std::vector<int64_t> push_done_ptrs, int64_t ep_rank,
+        at::Tensor x_ready, at::Tensor hidden_ready, at::Tensor y_ready, at::Tensor push_done_local,
+        at::Tensor barrier_buffer, at::Tensor barrier_target, int64_t barrier_multicast_ptr,
+        at::Tensor input_expected_scratch, int64_t trap_record_ptr, double swiglu_limit, int64_t spin_limit) {
+    entry_out_impl<NC, STAGES, false>(x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices, schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk, w13, w13_scale, w2, w2_scale, hidden, hidden_scale, routed_y, combine_ptrs, combine_local, weights, topk_ids, output, push_done_ptrs, ep_rank, x_ready, hidden_ready, y_ready, push_done_local, barrier_buffer, barrier_target, barrier_multicast_ptr, input_expected_scratch, trap_record_ptr, swiglu_limit, spin_limit, at::Tensor());
+}
+
+template <int NC, int STAGES>
+inline void entry_out_audit(
+        at::Tensor x, std::vector<int64_t> x_ptrs, at::Tensor x_scale, std::vector<int64_t> x_scale_ptrs,
+        at::Tensor routed_x, at::Tensor routed_x_scale, at::Tensor m_indices,
+        at::Tensor schedule_peer_rank, at::Tensor schedule_peer_token_idx, at::Tensor num_tokens,
+        at::Tensor tokens_per_expert, int64_t topk,
+        at::Tensor w13, at::Tensor w13_scale, at::Tensor w2, at::Tensor w2_scale,
+        at::Tensor hidden, at::Tensor hidden_scale, at::Tensor routed_y,
+        std::vector<int64_t> combine_ptrs, at::Tensor combine_local, at::Tensor weights, at::Tensor topk_ids,
+        at::Tensor output, std::vector<int64_t> push_done_ptrs, int64_t ep_rank,
+        at::Tensor x_ready, at::Tensor hidden_ready, at::Tensor y_ready, at::Tensor push_done_local,
+        at::Tensor barrier_buffer, at::Tensor barrier_target, int64_t barrier_multicast_ptr,
+        at::Tensor input_expected_scratch, int64_t trap_record_ptr, double swiglu_limit, int64_t spin_limit, at::Tensor audit_w13) {
+    entry_out_impl<NC, STAGES, true>(x, x_ptrs, x_scale, x_scale_ptrs, routed_x, routed_x_scale, m_indices, schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, topk, w13, w13_scale, w2, w2_scale, hidden, hidden_scale, routed_y, combine_ptrs, combine_local, weights, topk_ids, output, push_done_ptrs, ep_rank, x_ready, hidden_ready, y_ready, push_done_local, barrier_buffer, barrier_target, barrier_multicast_ptr, input_expected_scratch, trap_record_ptr, swiglu_limit, spin_limit, audit_w13);
 }
 
 }  // namespace mok_sm90::warprole::fused

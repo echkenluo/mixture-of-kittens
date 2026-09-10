@@ -26,7 +26,7 @@ dependency left is in the split reference used by the tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
 import torch
@@ -355,6 +355,7 @@ def warprole_forward_leased(
     variant: str = "c2s4",
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     spin_limit: int = DEFAULT_SPIN_LIMIT,
+    audit_w13: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run using a lease already held by the caller on the current stream.
 
@@ -363,6 +364,12 @@ def warprole_forward_leased(
     to caller-owned storage.  This function neither acquires nor releases it.
     Never release after a failed launch; discard the failed workspace/context.
     State creation/rendezvous must finish before entering this transaction.
+
+    Diagnostic-only ``audit_w13`` captures the actual pre-clamp BF16 gate/up
+    rows consumed by the fused epilogue. Supply independent contiguous
+    [state.capacity, 4096] storage, keep it alive through device completion,
+    and inspect only active schedule rows. Inactive capacity is untouched.
+    Capture changes kernel scheduling/traffic and is not a performance mode.
     """
     if not isinstance(schedule, MoKSchedule):
         raise TypeError("schedule must be a MoKSchedule")
@@ -373,6 +380,28 @@ def warprole_forward_leased(
         w13, w13_scale, w2, w2_scale, variant=variant,
         swiglu_limit=swiglu_limit, spin_limit=spin_limit
     )
+    extra = {}
+    if audit_w13 is not None:
+        if variant != "c2s4":
+            raise ValueError("W13 audit currently requires c2s4")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("W13 audit rejects CUDA graph capture")
+        if (not isinstance(audit_w13, torch.Tensor) or not audit_w13.is_cuda
+                or audit_w13.device != x_fp8.device or audit_w13.dtype != torch.bfloat16
+                or not audit_w13.is_contiguous() or audit_w13.shape != (state.capacity, 2 * INTERMEDIATE)):
+            raise ValueError("W13 audit requires independent CUDA BF16 [capacity,4096]")
+        # Reject even disjoint views of the same storage: diagnostic ownership
+        # is deliberately stricter than interval-only overlap checks.
+        for obj in (workspace, state, schedule):
+            values = (getattr(obj, f.name) for f in fields(obj)) if is_dataclass(obj) else vars(obj).values()
+            for value in values:
+                if isinstance(value, torch.Tensor) and torch._C._overlaps(audit_w13, value):
+                    raise ValueError("W13 audit buffer aliases workspace or schedule")
+        for value in (x_fp8, x_scale, router_weights, topk_ids, w13, w13_scale, w2, w2_scale):
+            if torch._C._overlaps(audit_w13, value):
+                raise ValueError("W13 audit buffer aliases model inputs")
+        entry_name = "fp8_block_warprole_c2s4_audit_out"
+        extra["audit_w13"] = audit_w13
 
     # Publish this rank's activations where the peers' comm warpgroups read
     # them.  The kernel's phase-0 rank barrier is what makes the peers wait for
@@ -428,6 +457,7 @@ def warprole_forward_leased(
         trap_record_ptr=workspace.trap_record_ptr,
         swiglu_limit=float(swiglu_limit),
         spin_limit=spin_limit,
+        **extra,
     )
     # The trap record is host-mapped, so this read is a host access: it
     # cannot be captured into a CUDA graph.  During capture the launch is
