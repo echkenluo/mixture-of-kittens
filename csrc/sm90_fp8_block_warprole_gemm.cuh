@@ -6,9 +6,9 @@
 // The producer's warp 0 streams A (M64 x K128), B (N128 x K128 per consumer)
 // and the 64 activation scales of one K128 block into a STAGES-deep ring with
 // TMA; each consumer computes a M64 x N128 WGMMA partial per K128 block,
-// scales it by A_scale[row] * B_scale[block] and accumulates.  The numeric
-// order is identical to fp8_block_pipeline::run_tile so results stay bitwise
-// equal to the split path.
+// promotes it with A_scale[row] * B_scale[block] using one FP32 FMA per later
+// block. This intentionally differs from split's separate multiply and add:
+// rounding the product first can cross a BF16 boundary relative to DeepGEMM.
 //
 // The standalone grouped kernel below launches with the same thread count as
 // the composed kernel (the comm slot immediately hands back its registers) so
@@ -95,12 +95,12 @@ __device__ __forceinline__ void producer_task(
     }
 }
 
-// total += partial with the FP32 adds spelled as __fadd_rn.  The split GEMM
-// (fp8_block_pipeline::run_tile) compiles its per-row scale multiply and the
-// accumulate to FMUL then FADD; with a plain `warpgroup::add` here ptxas fused
-// this loop's pair into FFMA (SASS: 64 FFMA, 0 FADD) and the outputs differed
-// from split in ~0.008% of bf16 elements.  _rn intrinsics are never contracted.
-__device__ __forceinline__ void accumulate_rn(acc_rt &total, const acc_rt &partial) {
+// Promote the unscaled Tensor Core partial with one rounding. Match TK's
+// row-major row_map layout: even packed slots hold the top row, odd slots
+// the row eight positions below; both float2 lanes use that row's scale.
+// Keep the FMA explicit so compiler contraction choices cannot alter it.
+__device__ __forceinline__ void promote_fma(
+        acc_rt &total, const acc_rt &partial, const acc_rt::col_vec &row_scale) {
 #pragma unroll
     for (int i = 0; i < acc_rt::height; ++i) {
 #pragma unroll
@@ -109,46 +109,48 @@ __device__ __forceinline__ void accumulate_rn(acc_rt &total, const acc_rt &parti
             for (int k = 0; k < acc_rt::packed_per_tile; ++k) {
                 float2 &t = total.tiles[i][j].data[k];
                 const float2 &q = partial.tiles[i][j].data[k];
-                t.x = __fadd_rn(t.x, q.x);
-                t.y = __fadd_rn(t.y, q.y);
+                const float scale = (k & 1) ? row_scale[i][0].y : row_scale[i][0].x;
+                t.x = __fmaf_rn(q.x, scale, t.x);
+                t.y = __fmaf_rn(q.y, scale, t.y);
             }
         }
     }
 }
 
 // Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
-// in `total`, scaled per K128 block exactly like fp8_block_pipeline::run_tile.
+// in `total`. W13, W2 and the standalone primitive share this promotion order.
 // `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
 template <int NC, int STAGES>
 __device__ __forceinline__ void consumer_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
         int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
     const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
-    // One K128 block: WGMMA partial into `dst`, then scale by A_scale[row] * B_scale[block].
+    // One K128 block: unscaled WGMMA partial into `dst`, plus rounded row scales.
     // The first block is peeled so that `total` is never the target of a copy-or-add
     // join inside the loop: with `if (kb == 0) copy else add` in the loop body ptxas
     // coalesced `total` with the WGMMA accumulator in one of the two inlined loops of
     // the fused kernel and shuffled/spilled 27 to 64 registers per iteration.
-    auto block = [&](int kb, acc_rt &dst) {
+    auto block = [&](int kb, acc_rt &dst, acc_rt::col_vec &row_scale) {
         const int s = static_cast<int>(stage_counter % STAGES);
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(full[s], phase);
         warpgroup::mm_ABt(dst, smem.stage[s].a, smem.stage[s].b[b_slot]);
         warpgroup::mma_async_wait<0>();
-        typename acc_rt::col_vec row_scale;
         const float b_scale = b_scale_row[kb];
-        row_scale[0][0].x = smem.stage[s].a_scale[local_row] * b_scale;
-        row_scale[0][0].y = smem.stage[s].a_scale[local_row + 8] * b_scale;
+        row_scale[0][0].x = __fmul_rn(smem.stage[s].a_scale[local_row], b_scale);
+        row_scale[0][0].y = __fmul_rn(smem.stage[s].a_scale[local_row + 8], b_scale);
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
-        warpgroup::mul_row(dst, dst, row_scale);
         ++stage_counter;
     };
-    block(0, total);   // block 0 lands directly in `total` (same values as copy-after-scale)
+    acc_rt::col_vec first_scale;
+    block(0, total, first_scale);
+    warpgroup::mul_row(total, total, first_scale);  // no preceding sum for block 0
 #pragma unroll 1
     for (int kb = 1; kb < k_blocks; ++kb) {
         acc_rt partial;
-        block(kb, partial);
-        accumulate_rn(total, partial);
+        acc_rt::col_vec row_scale;
+        block(kb, partial, row_scale);
+        promote_fma(total, partial, row_scale);
     }
 }
 
