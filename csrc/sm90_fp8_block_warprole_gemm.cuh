@@ -61,11 +61,13 @@ template <int NC, int CTAS_PER_SM> constexpr int consumer_regs() {
     static_assert((NC == 1 && CTAS_PER_SM == 1) || (NC == 2 && CTAS_PER_SM == 1)
                   || (NC == 1 && CTAS_PER_SM == 2) || (NC == 4 && CTAS_PER_SM == 1),
                   "supported forms: (1,1) (2,1) (1,2) (4,1)");
-    return NC == 4 ? 96 : ((NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 192 : 184));
+    return NC == 4 ? 88 : ((NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 192 : 184));
 }
 template <int CTAS_PER_SM> constexpr int producer_regs() { return CTAS_PER_SM == 1 ? PRODUCER_REGS : 24; }
 template <int CTAS_PER_SM> constexpr int comm_regs() { return CTAS_PER_SM == 1 ? COMM_REGS : 24; }
-static_assert(4 * 128 * consumer_regs<4, 1>() + 128 * PRODUCER_REGS + 128 * COMM_REGS == 64512);
+// setmaxnreg redistributes the CTA's launch allocation, not the entire SM.
+// c4 compiles at 80 registers/thread: its pool is 768*80 = 61440, not 65536.
+static_assert(4 * 128 * consumer_regs<4, 1>() + 128 * PRODUCER_REGS + 128 * COMM_REGS == 60416);
 
 __device__ __forceinline__ void fence_async_proxy_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -352,6 +354,20 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
     constexpr int SMEM = sizeof(smem_layout<NC, STAGES>) + 1024;
     constexpr int THREADS = num_threads<NC>();
     auto *kernel_ptr = grouped_kernel<NC, STAGES, CTAS_PER_SM>;
+    if constexpr (NC == 4) {
+        // One host check per specialization; no CUDA call in timed steady state.
+        static const bool checked = [kernel_ptr] {
+            cudaFuncAttributes attributes{};
+            CUDACHECK(cudaFuncGetAttributes(&attributes, kernel_ptr));
+            constexpr int requested = 128 * (NC * consumer_regs<NC, CTAS_PER_SM>()
+                + producer_regs<CTAS_PER_SM>() + comm_regs<CTAS_PER_SM>());
+            TORCH_CHECK(requested <= attributes.numRegs * THREADS,
+                        "c4 register redistribution exceeds the CTA launch pool: ", requested,
+                        " > ", attributes.numRegs * THREADS);
+            return true;
+        }();
+        (void)checked;
+    }
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
     CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     int num_sms = 0;
