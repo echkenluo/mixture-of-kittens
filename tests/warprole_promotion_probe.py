@@ -20,13 +20,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tile', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--compile-only', action='store_true',
+                        help='build the diagnostic without launching CUDA kernels')
     parser.add_argument('--kittens-include', type=Path,
                         default=Path(__file__).resolve().parents[1] / 'third_party/ThunderKittens/include')
     args = parser.parse_args()
     expected = '0b4af6af2c25e3d4c29aec53ee4237c04cf38891468a34779c1530893bb0fb2e'
     if digest(args.tile) != expected:
         raise ValueError('frozen input hash mismatch')
-    if torch.cuda.device_count() != 1 or torch.cuda.get_device_capability() != (9, 0):
+    if not args.compile_only and (torch.cuda.device_count() != 1 or torch.cuda.get_device_capability() != (9, 0)):
         raise ValueError('one SM90 device required')
     here = Path(__file__).resolve().parent
     os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0a'
@@ -42,6 +44,18 @@ def main():
             '-D__CUDA_NO_HALF_CONVERSIONS__', '-D__CUDA_NO_BFLOAT16_CONVERSIONS__',
             '-D__CUDA_NO_HALF2_OPERATORS__', '-Xptxas=-v', '-Xptxas=--warn-on-spills'],
         extra_ldflags=['-lcuda'], verbose=True)
+    if args.compile_only:
+        args.output.mkdir(parents=True, exist_ok=True)
+        result = {'compile_only': True, 'gpu_kernels_launched': False,
+            'visible_cuda_devices': torch.cuda.device_count(),
+            'probe_so_sha256': digest(ext.__file__), 'probe_so_path': ext.__file__,
+            'cuda_source_sha256': digest(here / 'warprole_promotion_probe.cu'),
+            'python_source_sha256': digest(__file__), 'torch_version': torch.__version__,
+            'cuda_version': torch.version.cuda, 'numeric_validated': False,
+            'quality_go': False, 'performance_go': False}
+        (args.output / 'compile-result.json').write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(result, indent=2))
+        return
     t = torch.load(args.tile, map_location='cpu', weights_only=True)
     x = t['x'].view(torch.uint8).repeat(128, 1).contiguous().view(torch.float8_e4m3fn).cuda()
     sx = t['x_scale'].repeat(128, 1).contiguous().cuda()
