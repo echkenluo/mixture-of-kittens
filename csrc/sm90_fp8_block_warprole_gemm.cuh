@@ -141,6 +141,21 @@ __device__ __forceinline__ void promote_half_fma(
     }
 }
 
+// A wait instruction has no C++ register operands. Tie the completed partial
+// to the compiler barrier before generic promotion can read or recycle it,
+// as in CUTLASS warpgroup_fence_operand after warpgroup_wait. This emits no
+// extra hardware wait and must only name the partial whose group completed.
+__device__ __forceinline__ void fence_completed_partial(half_acc_rt &partial) {
+#pragma unroll
+    for (int j = 0; j < half_acc_rt::width; ++j) {
+#pragma unroll
+        for (int k = 0; k < half_acc_rt::packed_per_tile; ++k) {
+            asm volatile("" : "+f"(partial.tiles[0][j].data[k].x) :: "memory");
+            asm volatile("" : "+f"(partial.tiles[0][j].data[k].y) :: "memory");
+        }
+    }
+}
+
 // WGMMA's descriptor builder does not honor st_subtile row offsets. For this
 // one-swizzle-wide K128 FP8 layout, the two N64 row ranges are real contiguous
 // shared tiles with identical swizzling; construct descriptors at their actual
@@ -204,6 +219,7 @@ __device__ __forceinline__ void consumer_task(
             // Commit order is left[k], right[k]. Waiting for all but the
             // newest group makes only left[k] available for generic reads.
             warpgroup::mma_async_wait<1>();
+            fence_completed_partial(left);
             promote_half_fma<0>(total, left, scale);
             const int64_t next_counter = stage_counter + 1;
             const int next = static_cast<int>(next_counter % STAGES);
@@ -213,6 +229,7 @@ __device__ __forceinline__ void consumer_task(
             // Now right[k] is the older group and left[k+1] may stay in
             // flight. Release slot k only after both of its halves finish.
             warpgroup::mma_async_wait<1>();
+            fence_completed_partial(right);
             promote_half_fma<1>(total, right, scale);
             if (laneid() == 0) arrive(empty[s]);
             warpgroup::mm_ABt(right, smem.stage[next].a, half_b<1>(smem.stage[next].b[b_slot]));
@@ -221,8 +238,10 @@ __device__ __forceinline__ void consumer_task(
             scale = next_scale;
         }
         warpgroup::mma_async_wait<1>();
+        fence_completed_partial(left);
         promote_half_fma<0>(total, left, scale);
         warpgroup::mma_async_wait<0>();
+        fence_completed_partial(right);
         promote_half_fma<1>(total, right, scale);
         if (laneid() == 0) arrive(empty[s]);
         ++stage_counter;
