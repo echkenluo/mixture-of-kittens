@@ -117,6 +117,44 @@ __device__ __forceinline__ void promote_fma(
     }
 }
 
+using half_acc_rt = rt_fl<16, N_TILE / 2>;
+using half_b_st = st_fp8e4m3<N_TILE / 2, K_TILE>;
+
+// Two independently committed N64 partials use the original N128 partial
+// register footprint. Their lifetimes alternate across K128 blocks.
+template <int HALF>
+__device__ __forceinline__ void promote_half_fma(
+        acc_rt &total, const half_acc_rt &partial, const acc_rt::col_vec &row_scale) {
+    static_assert(HALF == 0 || HALF == 1);
+    static_assert(acc_rt::height == 1 && half_acc_rt::height == 1);
+    static_assert(acc_rt::width == 2 * half_acc_rt::width);
+#pragma unroll
+    for (int j = 0; j < half_acc_rt::width; ++j) {
+#pragma unroll
+        for (int k = 0; k < half_acc_rt::packed_per_tile; ++k) {
+            float2 &t = total.tiles[0][HALF * half_acc_rt::width + j].data[k];
+            const float2 &q = partial.tiles[0][j].data[k];
+            const float scale = (k & 1) ? row_scale[0][0].y : row_scale[0][0].x;
+            t.x = __fmaf_rn(q.x, scale, t.x);
+            t.y = __fmaf_rn(q.y, scale, t.y);
+        }
+    }
+}
+
+// WGMMA's descriptor builder does not honor st_subtile row offsets. For this
+// one-swizzle-wide K128 FP8 layout, the two N64 row ranges are real contiguous
+// shared tiles with identical swizzling; construct descriptors at their actual
+// addresses instead of passing an st_subtile view.
+template <int HALF>
+__device__ __forceinline__ half_b_st &half_b(b_st &b) {
+    static_assert(HALF == 0 || HALF == 1);
+    static_assert(N_TILE == 128 && K_TILE == 128);
+    static_assert(b_st::swizzle_bytes == 128 && half_b_st::swizzle_bytes == 128);
+    static_assert(sizeof(b_st::dtype) == 1 && sizeof(b_st) == 2 * sizeof(half_b_st));
+    static_assert((N_TILE / 2 * K_TILE) % 1024 == 0);
+    return *reinterpret_cast<half_b_st *>(&b.data[HALF * (N_TILE / 2) * K_TILE]);
+}
+
 // Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
 // in `total`. W13, W2 and the standalone primitive share this promotion order.
 // `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
@@ -145,12 +183,57 @@ __device__ __forceinline__ void consumer_task(
     acc_rt::col_vec first_scale;
     block(0, total, first_scale);
     warpgroup::mul_row(total, total, first_scale);  // no preceding sum for block 0
+    if constexpr (NC == 2) {
+        if (k_blocks == 1) return;
+        static_assert(STAGES >= 2, "cross-block queue holds two ring slots");
+        half_acc_rt left, right;
+        auto scale_at = [&](int s, int kb) {
+            acc_rt::col_vec scale;
+            const float bs = b_scale_row[kb];
+            scale[0][0].x = __fmul_rn(smem.stage[s].a_scale[local_row], bs);
+            scale[0][0].y = __fmul_rn(smem.stage[s].a_scale[local_row + 8], bs);
+            return scale;
+        };
+        int s = static_cast<int>(stage_counter % STAGES);
+        wait(full[s], static_cast<int>((stage_counter / STAGES) & 1));
+        auto scale = scale_at(s, 1);
+        warpgroup::mm_ABt(left, smem.stage[s].a, half_b<0>(smem.stage[s].b[b_slot]));
+        warpgroup::mm_ABt(right, smem.stage[s].a, half_b<1>(smem.stage[s].b[b_slot]));
 #pragma unroll 1
-    for (int kb = 1; kb < k_blocks; ++kb) {
-        acc_rt partial;
-        acc_rt::col_vec row_scale;
-        block(kb, partial, row_scale);
-        promote_fma(total, partial, row_scale);
+        for (int kb = 1; kb + 1 < k_blocks; ++kb) {
+            // Commit order is left[k], right[k]. Waiting for all but the
+            // newest group makes only left[k] available for generic reads.
+            warpgroup::mma_async_wait<1>();
+            promote_half_fma<0>(total, left, scale);
+            const int64_t next_counter = stage_counter + 1;
+            const int next = static_cast<int>(next_counter % STAGES);
+            wait(full[next], static_cast<int>((next_counter / STAGES) & 1));
+            auto next_scale = scale_at(next, kb + 1);
+            warpgroup::mm_ABt(left, smem.stage[next].a, half_b<0>(smem.stage[next].b[b_slot]));
+            // Now right[k] is the older group and left[k+1] may stay in
+            // flight. Release slot k only after both of its halves finish.
+            warpgroup::mma_async_wait<1>();
+            promote_half_fma<1>(total, right, scale);
+            if (laneid() == 0) arrive(empty[s]);
+            warpgroup::mm_ABt(right, smem.stage[next].a, half_b<1>(smem.stage[next].b[b_slot]));
+            stage_counter = next_counter;
+            s = next;
+            scale = next_scale;
+        }
+        warpgroup::mma_async_wait<1>();
+        promote_half_fma<0>(total, left, scale);
+        warpgroup::mma_async_wait<0>();
+        promote_half_fma<1>(total, right, scale);
+        if (laneid() == 0) arrive(empty[s]);
+        ++stage_counter;
+    } else {
+#pragma unroll 1
+        for (int kb = 1; kb < k_blocks; ++kb) {
+            acc_rt partial;
+            acc_rt::col_vec row_scale;
+            block(kb, partial, row_scale);
+            promote_fma(total, partial, row_scale);
+        }
     }
 }
 
