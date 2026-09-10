@@ -116,6 +116,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
           pybind11::arg("output"));
+    m.def("fp8_block_warprole_gemm_c2s4_tail16_out",
+          &mok_sm90::warprole::gemm::standalone::entry_tail_out<16>, "Uniform M16-tail component prototype");
+    m.def("fp8_block_warprole_gemm_c2s4_tail32_out",
+          &mok_sm90::warprole::gemm::standalone::entry_tail_out<32>, "Uniform M32-tail component prototype");
     m.def("fp8_block_warprole_gemm_c2s4_out",
           &mok_sm90::warprole::gemm::standalone::entry_out<2, 4, 1>,
           "", pybind11::arg("input"), pybind11::arg("weight"),

@@ -154,6 +154,49 @@ __device__ __forceinline__ void consumer_task(
     }
 }
 
+// Component prototype for M64 tiles with only the first ROWS rows active.
+// Each active warp owns M16 x N128. The producer and shared-memory ring are
+// unchanged; all four warps still release every slot. Only the math and its
+// register operand loads are predicated. Production fused callers do not use
+// this path until the component tradeoff has been measured.
+template <int NC, int STAGES, int ROWS>
+__device__ __forceinline__ void consumer_tail_task(
+        smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
+        int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
+    static_assert(ROWS == 16 || ROWS == 32);
+    const int warp_idx = warpgroup::warpid();
+    const int local_row = warp_idx * 16 + laneid() / 4;
+    warp::zero(total);
+#pragma unroll 1
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        const int s = static_cast<int>(stage_counter % STAGES);
+        wait(full[s], static_cast<int>((stage_counter / STAGES) & 1));
+        if (warp_idx < ROWS / 16) {
+            acc_rt partial;
+            warp::zero(partial);
+#pragma unroll
+            for (int kc = 0; kc < K_TILE / 32; ++kc) {
+                rt_fp8e4m3<16, 32> a;
+                rt_fp8e4m3<N_TILE, 32> b;
+                warp::load(a, smem.stage[s].a.template subtile<16, 32>({warp_idx, kc}));
+                warp::load(b, smem.stage[s].b[b_slot].template subtile<N_TILE, 32>({0, kc}));
+                warp::mma_ABt(partial, a, b, partial);
+            }
+            acc_rt::col_vec row_scale;
+            const float bs = b_scale_row[kb];
+            row_scale[0][0].x = __fmul_rn(smem.stage[s].a_scale[local_row], bs);
+            row_scale[0][0].y = __fmul_rn(smem.stage[s].a_scale[local_row + 8], bs);
+            if (kb == 0) warp::mul_row(total, partial, row_scale);
+            else promote_fma(total, partial, row_scale);
+        }
+        // MMA is synchronous and all lanes finish their operand loads before
+        // this warp releases the slot. Inactive warps contribute their arrive.
+        __syncwarp();
+        if (laneid() == 0) arrive(empty[s]);
+        ++stage_counter;
+    }
+}
+
 // Stage the B block-scale row of one (expert, n_tile) task into shared memory.
 // Called by all 128 threads of one consumer; followed by a warpgroup barrier by the caller.
 template <int NC, int STAGES>
@@ -211,7 +254,7 @@ struct globals {
 // Producer + consumer roles of the standalone grouped GEMM over the static
 // task stream (m_tile, n_group).  `role` is the caller's warpgroup index; the
 // comm slot (role NC+1) must not call this.
-template <int NC, int STAGES, int CTAS_PER_SM>
+template <int NC, int STAGES, int CTAS_PER_SM, int ROWS = 64>
 __device__ __forceinline__ void run_gemm_roles(
         const globals &g, smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES],
         semaphore (&empty)[STAGES], int role) {
@@ -242,7 +285,10 @@ __device__ __forceinline__ void run_gemm_roles(
         stage_b_scale_row<NC, STAGES>(smem, role, g.B_scale, expert, n_tiles_128, n_tile, g.k_blocks);
         warpgroup::sync(barrier_id);
         acc_rt total_acc;
-        consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], g.k_blocks, total_acc);
+        if constexpr (ROWS == 64)
+            consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], g.k_blocks, total_acc);
+        else
+            consumer_tail_task<NC, STAGES, ROWS>(smem, full, empty, stage_counter, role, smem.b_scale[role], g.k_blocks, total_acc);
         store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.D, total_acc, m_tile, n_tile);
     }
     if (warpgroup::laneid() == 0) tma::store_async_wait();
@@ -276,7 +322,24 @@ void grouped_kernel(const __grid_constant__ globals g) {
     run_gemm_roles<NC, STAGES, CTAS_PER_SM>(g, smem, full, empty, role);
 }
 
-template <int NC, int STAGES, int CTAS_PER_SM>
+template <int NC, int STAGES, int ROWS>
+__global__ __launch_bounds__(num_threads<NC>(), 1)
+void grouped_tail_kernel(const __grid_constant__ globals g) {
+    extern __shared__ int __shm[];
+    auto &smem = *reinterpret_cast<smem_layout<NC, STAGES> *>(
+        ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
+    __shared__ semaphore full[STAGES];
+    __shared__ semaphore empty[STAGES];
+    init_ring<NC, STAGES>(full, empty);
+    const int role = warpgroup::groupid();
+    if (role == NC + 1) {
+        warpgroup::decrease_registers<comm_regs<1>()>();
+        return;
+    }
+    run_gemm_roles<NC, STAGES, 1, ROWS>(g, smem, full, empty, role);
+}
+
+template <int NC, int STAGES, int CTAS_PER_SM, int ROWS = 64>
 inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale,
                                  at::Tensor m_indices, const at::Tensor *num_tokens, at::Tensor D) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 3, "A and B must have shapes [M,K] and [E,N,K]");
@@ -338,7 +401,13 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
     };
     constexpr int SMEM = sizeof(smem_layout<NC, STAGES>) + 1024;
     constexpr int THREADS = num_threads<NC>();
-    auto *kernel_ptr = grouped_kernel<NC, STAGES, CTAS_PER_SM>;
+    auto *kernel_ptr = [] {
+        if constexpr (ROWS == 64) return grouped_kernel<NC, STAGES, CTAS_PER_SM>;
+        else {
+            static_assert(CTAS_PER_SM == 1);
+            return grouped_tail_kernel<NC, STAGES, ROWS>;
+        }
+    }();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
     CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     int num_sms = 0;
@@ -359,6 +428,14 @@ template <int NC, int STAGES, int CTAS_PER_SM>
 inline at::Tensor entry_out(at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale,
                             at::Tensor m_indices, at::Tensor num_tokens, at::Tensor D) {
     return entry_out_impl<NC, STAGES, CTAS_PER_SM>(A, B, A_scale, B_scale, m_indices, &num_tokens, D);
+}
+
+// The caller must zero the unused rows in every M64 input tile. This entry
+// is an isolated uniform-tail prototype, not a general routed dispatch API.
+template <int ROWS>
+inline at::Tensor entry_tail_out(at::Tensor A, at::Tensor B, at::Tensor A_scale, at::Tensor B_scale,
+                                 at::Tensor m_indices, at::Tensor num_tokens, at::Tensor D) {
+    return entry_out_impl<2, 4, 1, ROWS>(A, B, A_scale, B_scale, m_indices, &num_tokens, D);
 }
 
 }  // namespace standalone
