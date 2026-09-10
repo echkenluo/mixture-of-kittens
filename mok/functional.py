@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from .route_arena import fp8_route_arena_layout
+
 from .ops import (
     all_gather_top_experts,
     barrier_all,
@@ -46,6 +48,8 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    # Experimental: one rendezvous for the five SM90 route buffers.
+    fp8_route_coallocate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +498,8 @@ def create_fp8_route_workspace(
         raise NotImplementedError("the production FP8 route workspace requires SM90")
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
+    if type(config.fp8_route_coallocate) is not bool:
+        raise ValueError("fp8_route_coallocate must be a bool")
     group_name = group.group_name
     ep_rank = dist.get_rank(group=group)
     ep_size = dist.get_world_size(group=group)
@@ -503,7 +509,8 @@ def create_fp8_route_workspace(
     schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
 
     local_shape = torch.tensor(
-        [num_local_tokens, hidden_size, topk, num_local_experts],
+        [num_local_tokens, hidden_size, topk, num_local_experts,
+         int(config.fp8_route_coallocate)],
         dtype=torch.int64,
         device=device,
     )
@@ -514,45 +521,43 @@ def create_fp8_route_workspace(
     gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
     if not torch.all(gathered_shapes == local_shape).item():
         raise ValueError(
-            "MoK requires identical token, hidden, top-k, and local-expert "
-            "shapes on every EP rank"
+            "MoK requires identical token, hidden, top-k, local-expert "
+            "shapes and route allocation mode on every EP rank"
         )
 
-    x_buffer = symm_mem.empty(
-        num_local_tokens,
-        hidden_size,
-        dtype=torch.float8_e4m3fn,
-        device=device,
+    arena = arena_handle = None
+    layout, arena_bytes = fp8_route_arena_layout(
+        num_local_tokens, hidden_size, topk, ep_size
     )
-    x_buffer_handle = symm_mem.rendezvous(x_buffer, group_name)
-    x_buffer_ptrs = [
-        int(x_buffer_handle.buffer_ptrs[peer_rank])
-        for peer_rank in range(ep_size)
-    ]
+    if config.fp8_route_coallocate:
+        arena = symm_mem.empty(arena_bytes, dtype=torch.uint8, device=device)
+        arena_handle = symm_mem.rendezvous(arena, group_name)
 
-    x_scale_buffer = symm_mem.empty(
-        num_local_tokens,
-        hidden_size // 128,
-        dtype=torch.float32,
-        device=device,
-    )
-    x_scale_buffer_handle = symm_mem.rendezvous(x_scale_buffer, group_name)
-    x_scale_buffer_ptrs = [
-        int(x_scale_buffer_handle.buffer_ptrs[peer_rank])
-        for peer_rank in range(ep_size)
-    ]
+    def allocate_symmetric(index, shape, dtype):
+        if arena is None:
+            buffer = symm_mem.empty(*shape, dtype=dtype, device=device)
+            handle = symm_mem.rendezvous(buffer, group_name)
+            offset = 0
+        else:
+            offset, size = layout[index]
+            buffer = arena.narrow(0, offset, size).view(dtype).view(shape)
+            # The view retains the arena storage. Each workspace handle field
+            # also retains the same rendezvous object; consumers use adjusted
+            # pointer fields below, never handle.get_buffer() for a slice.
+            handle = arena_handle
+        pointers = [int(handle.buffer_ptrs[peer]) + offset for peer in range(ep_size)]
+        multicast = int(handle.multicast_ptr) if index >= 3 else 0
+        return buffer, handle, pointers, (multicast + offset if multicast else 0)
 
-    combine_buffer = symm_mem.empty(
-        num_local_tokens * topk,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
+    x_buffer, x_buffer_handle, x_buffer_ptrs, _ = allocate_symmetric(
+        0, (num_local_tokens, hidden_size), torch.float8_e4m3fn
     )
-    combine_buffer_handle = symm_mem.rendezvous(combine_buffer, group_name)
-    combine_buffer_ptrs = [
-        int(combine_buffer_handle.buffer_ptrs[peer_rank])
-        for peer_rank in range(ep_size)
-    ]
+    x_scale_buffer, x_scale_buffer_handle, x_scale_buffer_ptrs, _ = allocate_symmetric(
+        1, (num_local_tokens, hidden_size // 128), torch.float32
+    )
+    combine_buffer, combine_buffer_handle, combine_buffer_ptrs, _ = allocate_symmetric(
+        2, (num_local_tokens * topk, hidden_size), torch.bfloat16
+    )
 
     output = torch.empty(
         num_local_tokens,
@@ -588,28 +593,13 @@ def create_fp8_route_workspace(
         num_local_experts * ep_size, dtype=torch.int32, device=device
     )
 
-    all_gather_top_experts_buffer = symm_mem.empty(
-        ep_size,
-        num_local_tokens,
-        topk,
-        dtype=torch.int32,
-        device=device,
+    (all_gather_top_experts_buffer, all_gather_top_experts_buffer_handle,
+     _, all_gather_top_experts_buffer_multicast_ptr) = allocate_symmetric(
+        3, (ep_size, num_local_tokens, topk), torch.int32
     )
-    all_gather_top_experts_buffer_handle = symm_mem.rendezvous(
-        all_gather_top_experts_buffer, group_name
-    )
-    all_gather_top_experts_buffer_multicast_ptr = int(
-        all_gather_top_experts_buffer_handle.multicast_ptr
-    )
-
-    barrier_buffer = symm_mem.empty(1, dtype=torch.int32, device=device)
+    (barrier_buffer, barrier_buffer_handle, barrier_buffer_ptrs,
+     barrier_buffer_multicast_ptr) = allocate_symmetric(4, (1,), torch.int32)
     barrier_buffer.zero_()
-    barrier_buffer_handle = symm_mem.rendezvous(barrier_buffer, group_name)
-    barrier_buffer_ptrs = [
-        int(barrier_buffer_handle.buffer_ptrs[peer_rank])
-        for peer_rank in range(ep_size)
-    ]
-    barrier_buffer_multicast_ptr = int(barrier_buffer_handle.multicast_ptr)
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
     combine_completion = torch.zeros(1, dtype=torch.int32, device=device)
     barrier_expected_scratch = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1176,6 +1166,8 @@ def get_fp8_route_workspace(
         min_num_local_tokens=2,
         num_local_tokens_alignment=2,
     )
+    if type(config.fp8_route_coallocate) is not bool:
+        raise ValueError("fp8_route_coallocate must be a bool")
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
@@ -1193,6 +1185,7 @@ def get_fp8_route_workspace(
         topk,
         num_local_experts,
         schedule_capacity_factor,
+        config.fp8_route_coallocate,
     )
     cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
     if cached_workspace is not None:
