@@ -12,7 +12,7 @@ from .test_warprole_ep4 import (
     CASES, EP_SIZE, LOCAL_EXPERTS, EXPERT_PADDING, SWIGLU_LIMIT,
     build_harness, run_warprole, require_warprole, sglang_activation,
 )
-from .warprole_assertions import assert_bitwise
+from .warprole_assertions import assert_activation_bitwise, assert_bitwise
 
 
 @pytest.mark.parametrize('case_name', ['small_64', 'skew_512', 'all_padding_256'])
@@ -62,5 +62,5 @@ def test_actual_fused_w13_capture(context, case_name):
             transposed=False, swiglu_limit=SWIGLU_LIMIT, swizzle=False)
         torch.cuda.synchronize(); dist.barrier()
         assert_bitwise('actual fused W13 versus primitive', capture[:n], replay[:n])
-        assert_bitwise('actual gate/up reproduce hidden', hidden[:n], ref_hidden[:n])
-        assert_bitwise('actual gate/up reproduce scales', scale[:n], ref_scale[:n])
+        assert_activation_bitwise('actual gate/up reproduce hidden', hidden[:n], ref_hidden[:n])
+        assert_activation_bitwise('actual gate/up reproduce scales', scale[:n], ref_scale[:n])
