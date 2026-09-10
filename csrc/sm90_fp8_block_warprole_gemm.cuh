@@ -24,6 +24,15 @@
 namespace mok_sm90::warprole::gemm {
 using namespace kittens;
 
+// The c4 screen keeps N256 per CTA while giving four independent consumers
+// N64 each. Existing c1/c2 types and arithmetic remain N128.
+template <int NC> constexpr int consumer_n() { return NC == 4 ? 64 : N_TILE; }
+template <int NT> using b_st_for = st_fp8e4m3<NT, K_TILE>;
+template <int NT> using d_st_for = st_bf<M_TILE, NT>;
+template <int NT> using acc_rt_for = rt_fl<16, NT>;
+template <int NT> using b_gl_for = gl<fp8e4m3, 1, -1, -1, -1, b_st_for<NT>>;
+template <int NT> using d_gl_for = gl<bf16, 1, 1, -1, -1, d_st_for<NT>>;
+
 using a_st = st_fp8e4m3<M_TILE, K_TILE>;   // 8 KB
 using b_st = st_fp8e4m3<N_TILE, K_TILE>;   // 16 KB
 using d_st = st_bf<M_TILE, N_TILE>;        // 16 KB
@@ -34,13 +43,13 @@ using d_gl = gl<bf16, 1, 1, -1, -1, d_st>;      // [M, N]
 
 template <int NC> struct stage_smem {
     a_st a;
-    b_st b[NC];
+    b_st_for<consumer_n<NC>()> b[NC];
     float a_scale[M_TILE];   // activation scale of this K128 block, one per row
 };
 template <int NC, int STAGES> struct smem_layout {
     stage_smem<NC> stage[STAGES];
-    d_st d[2];                        // per-consumer staging (GEMM) or gate/up pair (fused W13)
-    float b_scale[2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
+    d_st_for<consumer_n<NC>()> d[NC > 2 ? NC : 2]; // c1/c2 retain their gate/up pair
+    float b_scale[NC > 2 ? NC : 2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
 };
 
 // 56 (not 40): warps 1-3 of the producer warpgroup run the fused W13 epilogue in
@@ -50,12 +59,13 @@ constexpr int COMM_REGS = 64;
 template <int NC> constexpr int num_threads() { return 128 * (NC + 2); }
 template <int NC, int CTAS_PER_SM> constexpr int consumer_regs() {
     static_assert((NC == 1 && CTAS_PER_SM == 1) || (NC == 2 && CTAS_PER_SM == 1)
-                  || (NC == 1 && CTAS_PER_SM == 2),
-                  "supported forms: (1,1) (2,1) (1,2)");
-    return (NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 192 : 184);
+                  || (NC == 1 && CTAS_PER_SM == 2) || (NC == 4 && CTAS_PER_SM == 1),
+                  "supported forms: (1,1) (2,1) (1,2) (4,1)");
+    return NC == 4 ? 96 : ((NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 192 : 184));
 }
 template <int CTAS_PER_SM> constexpr int producer_regs() { return CTAS_PER_SM == 1 ? PRODUCER_REGS : 24; }
 template <int CTAS_PER_SM> constexpr int comm_regs() { return CTAS_PER_SM == 1 ? COMM_REGS : 24; }
+static_assert(4 * 128 * consumer_regs<4, 1>() + 128 * PRODUCER_REGS + 128 * COMM_REGS == 64512);
 
 __device__ __forceinline__ void fence_async_proxy_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -79,7 +89,7 @@ __device__ __forceinline__ void producer_task(
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(empty[s], phase ^ 1);   // a fresh ring passes immediately
         if (lane == 0) {
-            tma::expect_bytes(full[s], sizeof(a_st) + NC * sizeof(b_st));
+            tma::expect_bytes(full[s], sizeof(a_st) + sizeof(smem.stage[s].b));
             tma::load_async(smem.stage[s].a, A, {m_tile, kb}, full[s]);
 #pragma unroll
             for (int c = 0; c < NC; ++c)
@@ -99,14 +109,15 @@ __device__ __forceinline__ void producer_task(
 // row-major row_map layout: even packed slots hold the top row, odd slots
 // the row eight positions below; both float2 lanes use that row's scale.
 // Keep the FMA explicit so compiler contraction choices cannot alter it.
+template <typename ACC>
 __device__ __forceinline__ void promote_fma(
-        acc_rt &total, const acc_rt &partial, const acc_rt::col_vec &row_scale) {
+        ACC &total, const ACC &partial, const typename ACC::col_vec &row_scale) {
 #pragma unroll
-    for (int i = 0; i < acc_rt::height; ++i) {
+    for (int i = 0; i < ACC::height; ++i) {
 #pragma unroll
-        for (int j = 0; j < acc_rt::width; ++j) {
+        for (int j = 0; j < ACC::width; ++j) {
 #pragma unroll
-            for (int k = 0; k < acc_rt::packed_per_tile; ++k) {
+            for (int k = 0; k < ACC::packed_per_tile; ++k) {
                 float2 &t = total.tiles[i][j].data[k];
                 const float2 &q = partial.tiles[i][j].data[k];
                 const float scale = (k & 1) ? row_scale[i][0].y : row_scale[i][0].x;
@@ -117,20 +128,21 @@ __device__ __forceinline__ void promote_fma(
     }
 }
 
-// Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
-// in `total`. W13, W2 and the standalone primitive share this promotion order.
+// Consumer side of one task: M64 x consumer_n<NC>() FP32 result in `total`.
+// W13, W2 and the standalone primitive share this promotion order.
 // `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
 template <int NC, int STAGES>
 __device__ __forceinline__ void consumer_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
-        int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
+        int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt_for<consumer_n<NC>()> &total) {
+    using acc_t = acc_rt_for<consumer_n<NC>()>;
     const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
     // One K128 block: unscaled WGMMA partial into `dst`, plus rounded row scales.
     // The first block is peeled so that `total` is never the target of a copy-or-add
     // join inside the loop: with `if (kb == 0) copy else add` in the loop body ptxas
     // coalesced `total` with the WGMMA accumulator in one of the two inlined loops of
     // the fused kernel and shuffled/spilled 27 to 64 registers per iteration.
-    auto block = [&](int kb, acc_rt &dst, acc_rt::col_vec &row_scale) {
+    auto block = [&](int kb, acc_t &dst, typename acc_t::col_vec &row_scale) {
         const int s = static_cast<int>(stage_counter % STAGES);
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(full[s], phase);
@@ -142,13 +154,13 @@ __device__ __forceinline__ void consumer_task(
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
         ++stage_counter;
     };
-    acc_rt::col_vec first_scale;
+    typename acc_t::col_vec first_scale;
     block(0, total, first_scale);
     warpgroup::mul_row(total, total, first_scale);  // no preceding sum for block 0
 #pragma unroll 1
     for (int kb = 1; kb < k_blocks; ++kb) {
-        acc_rt partial;
-        acc_rt::col_vec row_scale;
+        acc_t partial;
+        typename acc_t::col_vec row_scale;
         block(kb, partial, row_scale);
         promote_fma(total, partial, row_scale);
     }
@@ -165,14 +177,14 @@ __device__ __forceinline__ void stage_b_scale_row(
         smem.b_scale[slot][t] = B_scale[(static_cast<size_t>(expert) * n_tiles_128 + n_tile) * k_blocks + t];
 }
 
-// Write a finished M64 x N128 tile to global memory through the consumer's own
+// Write a finished M64 x N64/N128 tile through the consumer's own
 // staging tile with a TMA store.  All 128 threads of consumer `c` call this.
-template <typename D_GL>
+template <typename D_ST, typename D_GL, typename ACC>
 __device__ __forceinline__ void store_bf16_tile_via(
-        d_st &staging, int barrier_id, const D_GL &D, const acc_rt &total, int m_tile, int n_tile) {
+        D_ST &staging, int barrier_id, const D_GL &D, const ACC &total, int m_tile, int n_tile) {
     if (warpgroup::laneid() == 0) tma::store_async_read_wait();   // the previous store has read staging
     warpgroup::sync(barrier_id);
-    rt_bf<16, N_TILE> out;
+    rt_bf<16, ACC::cols> out;
     warp::copy(out, total);
     warpgroup::store(staging, out);
     fence_async_proxy_shared();          // make generic-proxy smem writes visible to the TMA unit
@@ -184,21 +196,21 @@ __device__ __forceinline__ void store_bf16_tile_via(
 }
 template <int NC, int STAGES, typename D_GL>
 __device__ __forceinline__ void store_bf16_tile(
-        smem_layout<NC, STAGES> &smem, int c, int barrier_id, const D_GL &D, const acc_rt &total,
+        smem_layout<NC, STAGES> &smem, int c, int barrier_id, const D_GL &D, const acc_rt_for<consumer_n<NC>()> &total,
         int m_tile, int n_tile) {
     store_bf16_tile_via(smem.d[c], barrier_id, D, total, m_tile, n_tile);
 }
 
 // ---------------------------------------------------------------------------
 // Standalone grouped-contiguous kernel (step 1 microbenchmark).
-// Tasks: (m_tile, n_group) with n_group covering NC adjacent N128 tiles.
+// Tasks: (m_tile, n_group) covering NC adjacent consumer_n<NC>()-wide tiles.
 // ---------------------------------------------------------------------------
 namespace standalone {
 
-struct globals {
+template <int NT> struct globals_for {
     a_gl A;
-    b_gl B;
-    d_gl D;
+    b_gl_for<NT> B;
+    d_gl_for<NT> D;
     const float *A_scale;
     const float *B_scale;
     const int *m_indices;
@@ -207,15 +219,16 @@ struct globals {
     int k_blocks;
     int m_tiles;
 };
+using globals = globals_for<N_TILE>; // existing communication benchmark uses N128
 
 // Producer + consumer roles of the standalone grouped GEMM over the static
 // task stream (m_tile, n_group).  `role` is the caller's warpgroup index; the
 // comm slot (role NC+1) must not call this.
 template <int NC, int STAGES, int CTAS_PER_SM>
 __device__ __forceinline__ void run_gemm_roles(
-        const globals &g, smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES],
+        const globals_for<consumer_n<NC>()> &g, smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES],
         semaphore (&empty)[STAGES], int role) {
-    const int n_tasks_per_m = g.n / (N_TILE * NC);
+    const int n_tasks_per_m = g.n / (consumer_n<NC>() * NC);
     const int64_t total = static_cast<int64_t>(g.m_tiles) * n_tasks_per_m;
     int64_t stage_counter = 0;
     if (role == NC) {
@@ -239,9 +252,9 @@ __device__ __forceinline__ void run_gemm_roles(
         if (g.num_tokens != nullptr && m_tile * M_TILE >= g.num_tokens[0]) break;
         const int n_tile = static_cast<int>(t % n_tasks_per_m) * NC + role;
         const int expert = g.m_indices[m_tile * M_TILE];
-        stage_b_scale_row<NC, STAGES>(smem, role, g.B_scale, expert, n_tiles_128, n_tile, g.k_blocks);
+        stage_b_scale_row<NC, STAGES>(smem, role, g.B_scale, expert, n_tiles_128, n_tile * consumer_n<NC>() / N_TILE, g.k_blocks);
         warpgroup::sync(barrier_id);
-        acc_rt total_acc;
+        acc_rt_for<consumer_n<NC>()> total_acc;
         consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], g.k_blocks, total_acc);
         store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.D, total_acc, m_tile, n_tile);
     }
@@ -261,7 +274,7 @@ __device__ __forceinline__ void init_ring(semaphore (&full)[STAGES], semaphore (
 
 template <int NC, int STAGES, int CTAS_PER_SM>
 __global__ __launch_bounds__(num_threads<NC>(), CTAS_PER_SM)
-void grouped_kernel(const __grid_constant__ globals g) {
+void grouped_kernel(const __grid_constant__ globals_for<consumer_n<NC>()> g) {
     extern __shared__ int __shm[];
     auto &smem = *reinterpret_cast<smem_layout<NC, STAGES> *>(
         ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
@@ -281,15 +294,15 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
                                  at::Tensor m_indices, const at::Tensor *num_tokens, at::Tensor D) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 3, "A and B must have shapes [M,K] and [E,N,K]");
     kittens::py::tensor_check<a_gl>(A);
-    kittens::py::tensor_check<b_gl>(B);
+    kittens::py::tensor_check<b_gl_for<consumer_n<NC>()>>(B);
     const int total_m = (int)A.size(0);
     const int experts = (int)B.size(0);
     const int n = (int)B.size(1);
     const int k = (int)A.size(1);
     TORCH_CHECK(experts > 0 && B.size(2) == k, "A and B K dimensions must match");
     TORCH_CHECK(total_m >= 64 && total_m % 64 == 0, "M must be positive and divisible by 64");
-    TORCH_CHECK(n >= 128 * NC && n % (128 * NC) == 0,
-                "N must be positive and divisible by 128 * NUM_CONSUMERS");
+    TORCH_CHECK(n >= consumer_n<NC>() * NC && n % (consumer_n<NC>() * NC) == 0,
+                "N must be positive and divisible by the per-CTA column coverage");
     TORCH_CHECK(k >= 128 && k % 128 == 0 && k / 128 <= W13_K_BLOCKS,
                 "K must be a positive multiple of 128 and at most 4096");
     TORCH_CHECK(A_scale.is_cuda() && B_scale.is_cuda() && m_indices.is_cuda(),
@@ -311,7 +324,7 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
     TORCH_CHECK(D.is_cuda() && D.scalar_type() == at::ScalarType::BFloat16,
                 "D must be a CUDA bfloat16 tensor");
     TORCH_CHECK(D.is_contiguous(), "D must be contiguous");
-    kittens::py::tensor_check<d_gl>(D);
+    kittens::py::tensor_check<d_gl_for<consumer_n<NC>()>>(D);
     kittens::py::device_check(A, B, A_scale, B_scale, m_indices);
     kittens::py::device_check(A, D);
     if (num_tokens != nullptr) {
@@ -324,10 +337,10 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
 
     c10::cuda::CUDAGuard device_guard(A.device());
     const int m_tiles = total_m / 64;
-    globals g{
+    globals_for<consumer_n<NC>()> g{
         kittens::py::tensor_to_gl<a_gl>(A),
-        kittens::py::tensor_to_gl<b_gl>(B),
-        kittens::py::tensor_to_gl<d_gl>(D),
+        kittens::py::tensor_to_gl<b_gl_for<consumer_n<NC>()>>(B),
+        kittens::py::tensor_to_gl<d_gl_for<consumer_n<NC>()>>(D),
         A_scale.data_ptr<float>(),
         B_scale.data_ptr<float>(),
         m_indices.data_ptr<int>(),
@@ -348,7 +361,7 @@ inline at::Tensor entry_out_impl(at::Tensor A, at::Tensor B, at::Tensor A_scale,
     TORCH_CHECK(blocks_per_sm >= CTAS_PER_SM,
                 "warprole gemm occupancy below target: ", blocks_per_sm, " < ", CTAS_PER_SM,
                 " CTAs per SM (smem ", SMEM, " bytes, ", THREADS, " threads)");
-    const int64_t total_tasks = static_cast<int64_t>(m_tiles) * (n / (128 * NC));
+    const int64_t total_tasks = static_cast<int64_t>(m_tiles) * (n / (consumer_n<NC>() * NC));
     const int grid = static_cast<int>(std::min<int64_t>(total_tasks, static_cast<int64_t>(num_sms) * CTAS_PER_SM));
     kernel_ptr<<<grid, THREADS, SMEM, stream>>>(g);
     CUDACHECK(cudaGetLastError());

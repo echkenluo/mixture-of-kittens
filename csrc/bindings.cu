@@ -122,6 +122,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
           pybind11::arg("output"));
+    // Compute-only c4 feasibility screen; not a fused MoE entry yet.
+    m.def("fp8_block_warprole_gemm_c4s4_out",
+          &mok_sm90::warprole::gemm::standalone::entry_out<4, 4, 1>,
+          "", pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("output"));
     // two-CTA-per-SM retreat form disabled: ptxas refuses the 80-register launch budget
     // (C7602) for the N128 WGMMA even with setmaxnreg; see benchmarks/warprole/README.md.
     //     m.def("fp8_block_warprole_gemm_c1s3x2_out",
@@ -144,6 +151,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
           pybind11::arg("hidden"), pybind11::arg("hidden_scale"),
           pybind11::arg("swiglu_limit"));
+    // Compute-only c4 feasibility screen; not a fused MoE entry yet.
+    m.def("fp8_block_warprole_gemm_c4s4_out",
+          &mok_sm90::warprole::gemm::standalone::entry_out<4, 4, 1>,
+          "", pybind11::arg("input"), pybind11::arg("weight"),
+          pybind11::arg("input_scale"), pybind11::arg("weight_scale"),
+          pybind11::arg("m_indices"), pybind11::arg("num_tokens"),
+          pybind11::arg("output"));
     // two-CTA-per-SM retreat form disabled: ptxas refuses the 80-register launch budget
     // (C7602) for the N128 WGMMA even with setmaxnreg; see benchmarks/warprole/README.md.
     //     m.def("fp8_block_warprole_w13_c1s3x2_out",
