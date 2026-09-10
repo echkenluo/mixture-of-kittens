@@ -242,7 +242,7 @@ void kernel(const __grid_constant__ globals g) {
 
     if (role == NC + 1) {
         // ------------------------------------------------ comm warpgroup
-        warpgroup::decrease_registers<gemm::comm_regs<1>()>();
+        warpgroup::decrease_registers<gemm::comm_regs<1, NC>()>();
         if (!g.comm_off) {   // MOK_WARPROLE_COMM_OFF: benchmark-only, the warpgroup idles
             rank_barrier(g);
             if (warpgroup::laneid() == 0) stamp(g, 1);

@@ -43,8 +43,9 @@ template <int NC, int STAGES> struct smem_layout {
     float b_scale[2][W13_K_BLOCKS];   // weight block-scale rows of the task in flight (K/128 <= 32)
 };
 
-// 56 (not 40): warps 1-3 of the producer warpgroup run the fused W13 epilogue in
-// the fused kernel and need the room; 2*128*192 + 128*56 + 128*64 = 64512 <= 64K.
+// Warps 1-3 of the producer run the fused W13 epilogue and retain 56 registers.
+// c2s4's two partial accumulators need a larger consumer allocation; give back
+// communication registers: 2*128*208 + 128*56 + 128*32 = 64512 <= 64K.
 constexpr int PRODUCER_REGS = 56;
 constexpr int COMM_REGS = 64;
 template <int NC> constexpr int num_threads() { return 128 * (NC + 2); }
@@ -52,10 +53,15 @@ template <int NC, int CTAS_PER_SM> constexpr int consumer_regs() {
     static_assert((NC == 1 && CTAS_PER_SM == 1) || (NC == 2 && CTAS_PER_SM == 1)
                   || (NC == 1 && CTAS_PER_SM == 2),
                   "supported forms: (1,1) (2,1) (1,2)");
-    return (NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 192 : 184);
+    return (NC == 1 && CTAS_PER_SM == 1) ? 232 : (NC == 2 ? 208 : 184);
 }
 template <int CTAS_PER_SM> constexpr int producer_regs() { return CTAS_PER_SM == 1 ? PRODUCER_REGS : 24; }
-template <int CTAS_PER_SM> constexpr int comm_regs() { return CTAS_PER_SM == 1 ? COMM_REGS : 24; }
+template <int CTAS_PER_SM, int NC> constexpr int comm_regs() {
+    return CTAS_PER_SM == 1 ? (NC == 2 ? 32 : COMM_REGS) : 24;
+}
+static_assert(2 * 128 * consumer_regs<2, 1>() + 128 * producer_regs<1>()
+              + 128 * comm_regs<1, 2>() <= 65536);
+
 
 __device__ __forceinline__ void fence_async_proxy_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -117,6 +123,60 @@ __device__ __forceinline__ void promote_fma(
     }
 }
 
+// Only one WGMMA group is outstanding at a time. While it writes the next
+// partial, FP32 promotes the completed previous partial. Named alternating
+// accumulators avoid a dynamically indexed register array. Each ring slot is
+// released after its scale reads AND its WGMMA completion; arithmetic promotion
+// remains first-block multiply followed by ascending-K explicit FP32 FMAs.
+template <int NC, int STAGES>
+__device__ __forceinline__ void consumer_task_pipelined(
+        smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
+        int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
+    static_assert(NC == 2);
+    const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
+    auto issue = [&](int kb, acc_rt &dst, acc_rt::col_vec &row_scale) {
+        const int s = static_cast<int>(stage_counter % STAGES);
+        const int phase = static_cast<int>((stage_counter / STAGES) & 1);
+        wait(full[s], phase);
+        warpgroup::mm_ABt(dst, smem.stage[s].a, smem.stage[s].b[b_slot]);
+        const float b_scale = b_scale_row[kb];
+        row_scale[0][0].x = __fmul_rn(smem.stage[s].a_scale[local_row], b_scale);
+        row_scale[0][0].y = __fmul_rn(smem.stage[s].a_scale[local_row + 8], b_scale);
+        ++stage_counter;
+        return s;
+    };
+    auto finish = [&](int s) {
+        warpgroup::mma_async_wait<0>();
+        if (laneid() == 0) arrive(empty[s]);
+    };
+    acc_rt::col_vec first_scale;
+    finish(issue(0, total, first_scale));
+    warpgroup::mul_row(total, total, first_scale);
+    if (k_blocks == 1) return;
+
+    acc_rt partial_a, partial_b;
+    acc_rt::col_vec scale_a, scale_b;
+    finish(issue(1, partial_a, scale_a));
+    int kb = 2;
+#pragma unroll 1
+    for (; kb + 1 < k_blocks; kb += 2) {
+        const int slot_b = issue(kb, partial_b, scale_b);
+        promote_fma(total, partial_a, scale_a);
+        finish(slot_b);
+        const int slot_a = issue(kb + 1, partial_a, scale_a);
+        promote_fma(total, partial_b, scale_b);
+        finish(slot_a);
+    }
+    if (kb < k_blocks) {
+        const int slot_b = issue(kb, partial_b, scale_b);
+        promote_fma(total, partial_a, scale_a);
+        finish(slot_b);
+        promote_fma(total, partial_b, scale_b);
+    } else {
+        promote_fma(total, partial_a, scale_a);
+    }
+}
+
 // Consumer side of one task for consumer warpgroup `c`: M64 x N128 fp32 result
 // in `total`. W13, W2 and the standalone primitive share this promotion order.
 // `b_slot` selects the B tile of each stage, `b_scale_row` the staged block-scale row.
@@ -124,6 +184,11 @@ template <int NC, int STAGES>
 __device__ __forceinline__ void consumer_task(
         smem_layout<NC, STAGES> &smem, semaphore (&full)[STAGES], semaphore (&empty)[STAGES],
         int64_t &stage_counter, int b_slot, const float *b_scale_row, int k_blocks, acc_rt &total) {
+    if constexpr (NC == 2) {
+        consumer_task_pipelined<NC, STAGES>(
+            smem, full, empty, stage_counter, b_slot, b_scale_row, k_blocks, total);
+        return;
+    }
     const int local_row = warpgroup::warpid() * 16 + laneid() / 4;
     // One K128 block: unscaled WGMMA partial into `dst`, plus rounded row scales.
     // The first block is peeled so that `total` is never the target of a copy-or-add
@@ -270,7 +335,7 @@ void grouped_kernel(const __grid_constant__ globals g) {
     init_ring<NC, STAGES>(full, empty);
     const int role = warpgroup::groupid();   // 0..NC-1 consumers, NC producer, NC+1 comm slot
     if (role == NC + 1) {
-        warpgroup::decrease_registers<comm_regs<CTAS_PER_SM>()>();
+        warpgroup::decrease_registers<comm_regs<CTAS_PER_SM, NC>()>();
         return;   // standalone GEMM: the comm slot only gives its registers back
     }
     run_gemm_roles<NC, STAGES, CTAS_PER_SM>(g, smem, full, empty, role);

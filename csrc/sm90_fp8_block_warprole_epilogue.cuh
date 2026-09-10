@@ -222,7 +222,7 @@ void w13_kernel(const __grid_constant__ globals g) {
     int64_t stage_counter = 0;
 
     if (role == NC + 1) {
-        warpgroup::decrease_registers<gemm::comm_regs<CTAS_PER_SM>()>();
+        warpgroup::decrease_registers<gemm::comm_regs<CTAS_PER_SM, NC>()>();
         return;
     }
     if (role == NC) {

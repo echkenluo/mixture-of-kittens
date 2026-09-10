@@ -163,7 +163,7 @@ void comm_bench_kernel(const __grid_constant__ P p) {
     gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
     const int role = warpgroup::groupid();
     if (role == NC + 1) {
-        warpgroup::decrease_registers<gemm::comm_regs<CTAS_PER_SM>()>();
+        warpgroup::decrease_registers<gemm::comm_regs<CTAS_PER_SM, NC>()>();
         const shape s = active_shape(p.c);
         if constexpr (MODE == 0 || MODE == 2) {
             for (int q = 0; q < minibatches(s); ++q) dispatch_minibatch(p.c, s, q, expert_row_end);
