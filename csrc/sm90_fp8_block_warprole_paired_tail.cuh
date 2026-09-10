@@ -221,7 +221,7 @@ __device__ __forceinline__ void consumer(const G &g,Shared &s,
         if(threadIdx.x%32==0)arrive(empty[slot]);
     }
     int lane=threadIdx.x%32,warp=(threadIdx.x%128)/32;
-    auto *out=reinterpret_cast<bf16*>(g.c.routed_y);
+    auto *out=g.routed_y_gl.raw_ptr;
 #pragma unroll
     for(int j=0;j<8;++j) {
 #pragma unroll
