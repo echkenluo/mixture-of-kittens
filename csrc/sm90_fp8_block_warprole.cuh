@@ -25,6 +25,7 @@
 #include "sm90_fp8_block_warprole_comm.cuh"
 #include "sm90_fp8_block_warprole_epilogue.cuh"
 #include "utils.cuh"
+#include "sm90_fp8_block_warprole_paired_tail.cuh"
 
 namespace mok_sm90::warprole::fused {
 using namespace kittens;
@@ -91,6 +92,13 @@ struct globals {
     __host__ globals(const gemm::a_gl &rx, const gemm::a_gl &h, const gemm::b_gl &w13_, const gemm::b_gl &w2_,
                      const gemm::d_gl &ry)
         : routed_x_gl(rx), hidden_gl(h), w13(w13_), w2(w2_), routed_y_gl(ry) {}
+};
+
+// Keep the default kernel parameter layout and TMA creation unchanged.
+struct paired_globals : globals {
+    paired_tail::XGL hidden_half_gl;
+    __host__ paired_globals(const globals &base, const paired_tail::XGL &half)
+        : globals(base), hidden_half_gl(half) {}
 };
 
 __device__ __forceinline__ void trap(const globals &g, unsigned long long code, unsigned long long site,
@@ -211,13 +219,17 @@ __device__ __forceinline__ void rank_barrier(const globals &g) {
     warpgroup::sync(BAR_COMM);
 }
 
-template <int NC, int STAGES, bool RETAIN_W2_D = false>
+template <int NC, int STAGES, bool RETAIN_W2_D = false, bool PAIR_W2 = false>
 __global__ __launch_bounds__(gemm::num_threads<NC>(), 1)
-void kernel(const __grid_constant__ globals g) {
+void kernel(const __grid_constant__ std::conditional_t<PAIR_W2, paired_globals, globals> g) {
+    static_assert(!PAIR_W2 || (NC == 2 && STAGES == 4 && RETAIN_W2_D));
     using smem_t = gemm::smem_layout<NC, STAGES>;
     extern __shared__ int __shm[];
     auto &smem = *reinterpret_cast<smem_t *>(
         ((reinterpret_cast<uint64_t>(&__shm[0])) + 1023) & ~static_cast<uint64_t>(1023));
+    auto &paired_smem = *reinterpret_cast<paired_tail::Shared *>(&smem);
+    __shared__ semaphore pair_full[PAIR_W2 ? 2 : 1], pair_empty[PAIR_W2 ? 2 : 1];
+    __shared__ int pair_partner[PAIR_W2 ? 256 : 1], pair_length[PAIR_W2 ? 256 : 1];
     __shared__ semaphore full[STAGES];
     __shared__ semaphore empty[STAGES];
     __shared__ semaphore reduce_full[reduce_stages<NC, STAGES>()];
@@ -233,6 +245,8 @@ void kernel(const __grid_constant__ globals g) {
     }
     gemm::standalone::init_ring<NC, STAGES>(full, empty);   // ends with __syncthreads
 
+    if constexpr (PAIR_W2)
+        paired_tail::build_pairs(g.c, expert_row_end, pair_partner, pair_length);
     const shape s = comm::active_shape(g.c);
     if (blockIdx.x == 0 && threadIdx.x == 0 && (s.num_rows % M_TILE != 0 || s.num_rows < 0))
         trap(g, ERR_CONTRACT, SITE_WARPROLE_CONTRACT, 0, 0, static_cast<unsigned long long>(s.num_rows), 0);
@@ -301,6 +315,7 @@ void kernel(const __grid_constant__ globals g) {
             }
         } else {
             int64_t stage_counter = 0;
+            bool pair_mode = false;
             // Lane 0 claims one task ahead: the atomic's round trip then hides behind the
             // loads of the task in flight instead of stalling the producer at every task start.
             int next = 0;
@@ -310,8 +325,20 @@ void kernel(const __grid_constant__ globals g) {
                 // is not rewritten before task k + 2 starts, and the producer cannot get
                 // there until every consumer has drained task k + 1 down to STAGES stages
                 // (STAGES < K blocks of any task), so entry k was read long before its reuse.
-                const int t = __shfl_sync(0xffffffffu, next, 0);
-                const task tk = decode_task<NC>(static_cast<int64_t>(t), s);
+                int t = __shfl_sync(0xffffffffu, next, 0);
+                task tk = decode_task<NC>(static_cast<int64_t>(t), s);
+                paired_tail::Task pt{};
+                if constexpr (PAIR_W2) {
+                    // Only the lower tile's W2 task executes. Skipped claims do
+                    // not publish a mailbox entry or consume a sequence number.
+                    while (tk.kind == task_kind::w2) {
+                        pt = paired_tail::lookup(tk.m_tile, g.c.num_local_experts, expert_row_end, pair_partner, pair_length);
+                        if (pt.m1 < 0 || pt.m0 < pt.m1) break;
+                        if (laneid() == 0) next = static_cast<int>(atomicAdd(g.task_cursor, 1u));
+                        t = __shfl_sync(0xffffffffu, next, 0);
+                        tk = decode_task<NC>(static_cast<int64_t>(t), s);
+                    }
+                }
                 if (laneid() == 0) {
                     *reinterpret_cast<volatile int *>(&task_box[k & 1u]) = tk.kind == task_kind::none ? -1 : t;
                     __threadfence_block();
@@ -319,6 +346,33 @@ void kernel(const __grid_constant__ globals g) {
                 }
                 if (tk.kind == task_kind::none) break;
                 if (laneid() == 0) next = static_cast<int>(atomicAdd(g.task_cursor, 1u));
+                if constexpr (PAIR_W2) {
+                    const bool target = tk.kind == task_kind::w2 && pt.m1 >= 0;
+                    if (target != pair_mode) {
+                        // The new ring is inactive. It can be reset before
+                        // consumers finish the old mode and acquire D ownership.
+                        if (laneid() == 0) {
+                            if (target) {
+                                for (int i=0;i<2;++i) { init_semaphore(pair_full[i],1,1); init_semaphore(pair_empty[i],8,0); }
+                            } else {
+                                for (int i=0;i<STAGES;++i) { init_semaphore(full[i],1,1); init_semaphore(empty[i],NC*4,0); }
+                            }
+                        }
+                        asm volatile("bar.sync %0, %1;" :: "n"(BAR_PAIR_MODE), "n"(NC*128+32) : "memory");
+                        stage_counter = 0;
+                        pair_mode = target;
+                    }
+                    if (target) {
+                        if (laneid() == 0) {
+                            wait_geq_or_trap<false>(g,g.hidden_ready+pt.m0,hidden_ready_target<NC>(),SITE_WARPROLE_HIDDEN_READY,pt.m0);
+                            wait_geq_or_trap<false>(g,g.hidden_ready+pt.m1,hidden_ready_target<NC>(),SITE_WARPROLE_HIDDEN_READY,pt.m1);
+                        }
+                        __syncwarp();
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                        paired_tail::producer(g,paired_smem,pair_full,pair_empty,pt,tk.n_index);
+                        continue;
+                    }
+                }
                 if (tk.kind == task_kind::w13) {
                     if (laneid() == 0)
                         wait_geq_or_trap<false>(g, g.c.x_ready + tk.minibatch,
@@ -352,6 +406,7 @@ void kernel(const __grid_constant__ globals g) {
         // consumer waits for its own TMA read before reuse. The next W13
         // hands both tiles back to the epilogue, or the final sentinel ends it.
         bool owns_d = false;
+        bool pair_mode = false;
         for (unsigned int k = 0;; ++k) {
             unsigned long long iters = 0;
             while (*reinterpret_cast<volatile unsigned int *>(&task_seq) < k + 1u) {
@@ -362,6 +417,28 @@ void kernel(const __grid_constant__ globals g) {
             const int t = *reinterpret_cast<volatile int *>(&task_box[k & 1u]);
             if (t < 0) break;
             const task tk = decode_task<NC>(static_cast<int64_t>(t), s);
+            if constexpr (PAIR_W2) {
+                paired_tail::Task pt{};
+                if (tk.kind == task_kind::w2)
+                    pt = paired_tail::lookup(tk.m_tile,g.c.num_local_experts,expert_row_end,pair_partner,pair_length);
+                const bool target = tk.kind == task_kind::w2 && pt.m1 >= 0;
+                if (target != pair_mode) {
+                    // Paired raw/packed tiles alias normal D staging. Join only
+                    // after the last W13 epilogue is finished and parked.
+                    if (!owns_d)
+                        asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                    owns_d = true;
+                    asm volatile("bar.sync %0, %1;" :: "n"(BAR_PAIR_MODE), "n"(NC*128+32) : "memory");
+                    stage_counter = 0;
+                    pair_mode = target;
+                }
+                if (target) {
+                    // Producer's acquire and full-ring publication carry both
+                    // hidden dependencies to consumers, as in the dense ring.
+                    paired_tail::consumer(g,paired_smem,pair_full,pair_empty,pt,tk.n_index,role);
+                    continue;
+                }
+            }
             if (tk.kind == task_kind::w13) {
                 if (warpgroup::laneid() == 0)
                     wait_geq_or_trap<false>(g, g.c.x_ready + tk.minibatch,
@@ -721,25 +798,39 @@ inline void entry_out(
     constexpr int THREADS = gemm::num_threads<NC>();
     // Experimental scheduling change, default off; both variants preserve
     // the same arithmetic, shared-memory allocation and readiness counters.
+    const bool pair_w2 = env_flag("MOK_WARPROLE_PAIR_W2_TAILS");
+    TORCH_CHECK(!pair_w2 || (NC == 2 && STAGES == 4 && env_flag("MOK_WARPROLE_RETAIN_W2_D")),
+                "MOK_WARPROLE_PAIR_W2_TAILS=1 requires c2s4 and MOK_WARPROLE_RETAIN_W2_D=1");
     auto *kernel_ptr = env_flag("MOK_WARPROLE_RETAIN_W2_D")
         ? kernel<NC, STAGES, true> : kernel<NC, STAGES, false>;
-    CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-    int num_sms = 0;
-    CUDACHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.get_device()));
-    int blocks_per_sm = 0;
-    CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel_ptr, THREADS, SMEM));
-    TORCH_CHECK(blocks_per_sm >= 1, "warprole kernel does not fit one CTA per SM (smem ", SMEM, " bytes)");
-    if (env_flag("MOK_WARPROLE_PROBE")) {
-        at::Tensor &buffer = probe_buffer();
-        if (!buffer.defined() || buffer.numel() != static_cast<int64_t>(num_sms) * PROBE_SLOTS
-            || buffer.device() != x.device())
-            buffer = at::zeros({num_sms, PROBE_SLOTS}, x.options().dtype(at::kLong));
-        buffer.zero_();
-        g.probe = reinterpret_cast<unsigned long long *>(buffer.data_ptr<int64_t>());
+    auto launch = [&](auto *kernel_ptr, auto &launch_g, int launch_smem) {
+        CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, launch_smem));
+        int num_sms = 0;
+        CUDACHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.get_device()));
+        int blocks_per_sm = 0;
+        CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel_ptr, THREADS, launch_smem));
+        TORCH_CHECK(blocks_per_sm >= 1, "warprole kernel does not fit one CTA per SM (smem ", launch_smem, " bytes)");
+        if (env_flag("MOK_WARPROLE_PROBE")) {
+            at::Tensor &buffer = probe_buffer();
+            if (!buffer.defined() || buffer.numel() != static_cast<int64_t>(num_sms) * PROBE_SLOTS
+                || buffer.device() != x.device())
+                buffer = at::zeros({num_sms, PROBE_SLOTS}, x.options().dtype(at::kLong));
+            buffer.zero_();
+            launch_g.probe = reinterpret_cast<unsigned long long *>(buffer.data_ptr<int64_t>());
+        }
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
+        kernel_ptr<<<num_sms, THREADS, launch_smem, stream>>>(launch_g);
+        CUDACHECK(cudaGetLastError());
+    };
+    if constexpr (NC == 2 && STAGES == 4) {
+        if (pair_w2) {
+            paired_globals pg(g, kittens::py::tensor_to_gl<paired_tail::XGL>(hidden));
+            constexpr int paired_bytes = sizeof(paired_tail::Shared) + 1024;
+            launch(kernel<NC, STAGES, true, true>, pg, std::max(SMEM, paired_bytes));
+            return;
+        }
     }
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
-    kernel_ptr<<<num_sms, THREADS, SMEM, stream>>>(g);
-    CUDACHECK(cudaGetLastError());
+    launch(kernel_ptr, g, SMEM);
 }
 
 }  // namespace mok_sm90::warprole::fused

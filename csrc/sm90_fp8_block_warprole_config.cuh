@@ -19,6 +19,9 @@ constexpr int BAR_D_FULL = 5;
 constexpr int BAR_D_EMPTY = 6;
 constexpr int BAR_EPI = 7;
 constexpr int BAR_COMM = 8;
+// Pair-mode transitions: two consumers plus the producer's TMA warp.
+constexpr int BAR_PAIR_MODE = 9;
+static_assert(BAR_PAIR_MODE > BAR_COMM && BAR_PAIR_MODE < 16);
 static_assert(BAR_COMM != BAR_EPI && BAR_COMM != BAR_D_FULL &&
               BAR_COMM != BAR_D_EMPTY && BAR_COMM > 4 && BAR_COMM < 16);
 static_assert(MINIBATCH_ROWS % M_TILE == 0 && MINIBATCH_ROWS % DISPATCH_TICKET_ROWS == 0);
