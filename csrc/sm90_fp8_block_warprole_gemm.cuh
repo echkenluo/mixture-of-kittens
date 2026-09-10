@@ -122,7 +122,7 @@ using half_b_st = st_fp8e4m3<N_TILE / 2, K_TILE>;
 
 // Two independently committed N64 partials use the original N128 partial
 // register footprint. Their lifetimes alternate across K128 blocks.
-template <int HALF>
+template <int HALF, bool FIRST = false>
 __device__ __forceinline__ void promote_half_fma(
         acc_rt &total, const half_acc_rt &partial, const acc_rt::col_vec &row_scale) {
     static_assert(HALF == 0 || HALF == 1);
@@ -135,8 +135,13 @@ __device__ __forceinline__ void promote_half_fma(
             float2 &t = total.tiles[0][HALF * half_acc_rt::width + j].data[k];
             const float2 &q = partial.tiles[0][j].data[k];
             const float scale = (k & 1) ? row_scale[0][0].y : row_scale[0][0].x;
-            t.x = __fmaf_rn(q.x, scale, t.x);
-            t.y = __fmaf_rn(q.y, scale, t.y);
+            if constexpr (FIRST) {
+                t.x = __fmul_rn(q.x, scale);
+                t.y = __fmul_rn(q.y, scale);
+            } else {
+                t.x = __fmaf_rn(q.x, scale, t.x);
+                t.y = __fmaf_rn(q.y, scale, t.y);
+            }
         }
     }
 }
@@ -195,11 +200,7 @@ __device__ __forceinline__ void consumer_task(
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
         ++stage_counter;
     };
-    acc_rt::col_vec first_scale;
-    block(0, total, first_scale);
-    warpgroup::mul_row(total, total, first_scale);  // no preceding sum for block 0
     if constexpr (NC == 2) {
-        if (k_blocks == 1) return;
         static_assert(STAGES >= 2, "cross-block queue holds two ring slots");
         half_acc_rt left, right;
         auto scale_at = [&](int s, int kb) {
@@ -211,9 +212,33 @@ __device__ __forceinline__ void consumer_task(
         };
         int s = static_cast<int>(stage_counter % STAGES);
         wait(full[s], static_cast<int>((stage_counter / STAGES) & 1));
-        auto scale = scale_at(s, 1);
+        auto first_scale = scale_at(s, 0);
+        // Keep total out of every WGMMA destination tuple, including the
+        // peeled first block. Only these two half partials are async outputs.
         warpgroup::mm_ABt(left, smem.stage[s].a, half_b<0>(smem.stage[s].b[b_slot]));
         warpgroup::mm_ABt(right, smem.stage[s].a, half_b<1>(smem.stage[s].b[b_slot]));
+        warpgroup::mma_async_wait<1>();
+        fence_completed_partial(left);
+        promote_half_fma<0, true>(total, left, first_scale);
+        if (k_blocks == 1) {
+            warpgroup::mma_async_wait<0>();
+            fence_completed_partial(right);
+            promote_half_fma<1, true>(total, right, first_scale);
+            if (laneid() == 0) arrive(empty[s]);
+            ++stage_counter;
+            return;
+        }
+        const int first_next = static_cast<int>((stage_counter + 1) % STAGES);
+        wait(full[first_next], static_cast<int>(((stage_counter + 1) / STAGES) & 1));
+        auto scale = scale_at(first_next, 1);
+        warpgroup::mm_ABt(left, smem.stage[first_next].a, half_b<0>(smem.stage[first_next].b[b_slot]));
+        warpgroup::mma_async_wait<1>();
+        fence_completed_partial(right);
+        promote_half_fma<1, true>(total, right, first_scale);
+        if (laneid() == 0) arrive(empty[s]);
+        warpgroup::mm_ABt(right, smem.stage[first_next].a, half_b<1>(smem.stage[first_next].b[b_slot]));
+        ++stage_counter;
+        s = first_next;
 #pragma unroll 1
         for (int kb = 1; kb + 1 < k_blocks; ++kb) {
             // Commit order is left[k], right[k]. Waiting for all but the
@@ -246,6 +271,9 @@ __device__ __forceinline__ void consumer_task(
         if (laneid() == 0) arrive(empty[s]);
         ++stage_counter;
     } else {
+        acc_rt::col_vec first_scale;
+        block(0, total, first_scale);
+        warpgroup::mul_row(total, total, first_scale);
 #pragma unroll 1
         for (int kb = 1; kb < k_blocks; ++kb) {
             acc_rt partial;
