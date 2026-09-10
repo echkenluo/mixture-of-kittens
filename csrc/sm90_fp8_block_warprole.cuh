@@ -211,7 +211,7 @@ __device__ __forceinline__ void rank_barrier(const globals &g) {
     warpgroup::sync(BAR_COMM);
 }
 
-template <int NC, int STAGES>
+template <int NC, int STAGES, bool RETAIN_W2_D = false>
 __global__ __launch_bounds__(gemm::num_threads<NC>(), 1)
 void kernel(const __grid_constant__ globals g) {
     using smem_t = gemm::smem_layout<NC, STAGES>;
@@ -348,6 +348,10 @@ void kernel(const __grid_constant__ globals g) {
         int64_t stage_counter = 0;
         const int barrier_id = role + 1;
         bool first_task = true;
+        // Once a W2 task takes d[], consecutive W2 tasks can keep it. Each
+        // consumer waits for its own TMA read before reuse. The next W13
+        // hands both tiles back to the epilogue, or the final sentinel ends it.
+        bool owns_d = false;
         for (unsigned int k = 0;; ++k) {
             unsigned long long iters = 0;
             while (*reinterpret_cast<volatile unsigned int *>(&task_seq) < k + 1u) {
@@ -371,13 +375,17 @@ void kernel(const __grid_constant__ globals g) {
                 const int expert = g.c.m_indices[tk.m_tile * M_TILE];
                 epilogue::consumer_w13_gemm_to_d<NC, STAGES>(
                     smem, full, empty, stage_counter, role, g.w13_scale, expert, tk.n_index,
-                    [] { asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory"); });
+                    [&] {
+                        if (!RETAIN_W2_D || !owns_d)
+                            asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                    });
                 if (threadIdx.x == 0) {
                     *reinterpret_cast<volatile int *>(&epi_task[0]) = tk.m_tile;
                     *reinterpret_cast<volatile int *>(&epi_task[1]) = tk.n_index;
                 }
                 // the epilogue warps take it from here (SwiGLU/quant + hidden_ready)
                 asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
+                if constexpr (RETAIN_W2_D) owns_d = false;
             } else {
                 if (warpgroup::laneid() == 0)
                     wait_geq_or_trap<false>(g, g.hidden_ready + tk.m_tile,
@@ -390,14 +398,18 @@ void kernel(const __grid_constant__ globals g) {
                 warpgroup::sync(barrier_id);
                 gemm::acc_rt acc;
                 gemm::consumer_task<NC, STAGES>(smem, full, empty, stage_counter, role, smem.b_scale[role], W2_K_BLOCKS, acc);
-                // The store stages through smem.d[role], which the W13 hand-off owns: take the
-                // token, and give it back through a skip entry once the TMA unit has read d.
-                asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                // Take d[] from the epilogue once per W2 run. The opt-in
+                // variant retains ownership until the next W13 or sentinel.
+                if (!RETAIN_W2_D || !owns_d)
+                    asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+                if constexpr (RETAIN_W2_D) owns_d = true;
                 gemm::store_bf16_tile<NC, STAGES>(smem, role, barrier_id, g.routed_y_gl, acc, tk.m_tile, n_tile);
                 if (warpgroup::laneid() == 0) tma::store_async_read_wait();   // d[role] read by the TMA unit
                 warpgroup::sync(barrier_id);
-                if (threadIdx.x == 0) *reinterpret_cast<volatile int *>(&epi_task[0]) = -2;
-                asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
+                if constexpr (!RETAIN_W2_D) {
+                    if (threadIdx.x == 0) *reinterpret_cast<volatile int *>(&epi_task[0]) = -2;
+                    asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
+                }
                 if (warpgroup::laneid() == 0) {
                     tma::store_async_wait();                                   // routed_y tile landed
                     asm volatile("{fence.proxy.async.global;}" ::: "memory");
@@ -407,8 +419,10 @@ void kernel(const __grid_constant__ globals g) {
             }
         }
         if (threadIdx.x == 0) stamp(g, 4);
-        // end of stream: release the epilogue warps with the sentinel
-        asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
+        // End of stream: held W2 ownership already includes the empty token.
+        // BAR_D_FULL joins all consumers before the epilogue sees the sentinel.
+        if (!RETAIN_W2_D || !owns_d)
+            asm volatile("bar.sync %0, %1;" :: "n"(BAR_D_EMPTY), "n"(handoff_threads<NC>()) : "memory");
         if (threadIdx.x == 0) *reinterpret_cast<volatile int *>(&epi_task[0]) = -1;
         asm volatile("bar.arrive %0, %1;" :: "n"(BAR_D_FULL), "n"(handoff_threads<NC>()) : "memory");
     }
@@ -705,7 +719,10 @@ inline void entry_out(
 
     constexpr int SMEM = sizeof(gemm::smem_layout<NC, STAGES>) + 1024;
     constexpr int THREADS = gemm::num_threads<NC>();
-    auto *kernel_ptr = kernel<NC, STAGES>;
+    // Experimental scheduling change, default off; both variants preserve
+    // the same arithmetic, shared-memory allocation and readiness counters.
+    auto *kernel_ptr = env_flag("MOK_WARPROLE_RETAIN_W2_D")
+        ? kernel<NC, STAGES, true> : kernel<NC, STAGES, false>;
     CUDACHECK(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     int num_sms = 0;
     CUDACHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.get_device()));
