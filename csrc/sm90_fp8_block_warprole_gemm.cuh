@@ -135,10 +135,13 @@ __device__ __forceinline__ void consumer_task(
         const int phase = static_cast<int>((stage_counter / STAGES) & 1);
         wait(full[s], phase);
         warpgroup::mm_ABt(dst, smem.stage[s].a, smem.stage[s].b[b_slot]);
-        warpgroup::mma_async_wait<0>();
+        // These scale reads do not use the asynchronous accumulator. Issue
+        // them while WGMMA is running; keep the ring slot until both the reads
+        // and WGMMA have completed so the producer cannot overwrite the stage.
         const float b_scale = b_scale_row[kb];
         row_scale[0][0].x = __fmul_rn(smem.stage[s].a_scale[local_row], b_scale);
         row_scale[0][0].y = __fmul_rn(smem.stage[s].a_scale[local_row + 8], b_scale);
+        warpgroup::mma_async_wait<0>();
         if (laneid() == 0) arrive(empty[s]);   // this warp's WGMMA reads of slot s are complete
         ++stage_counter;
     };
