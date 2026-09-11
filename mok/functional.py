@@ -46,6 +46,9 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    # Optional physical row count for the SM90 FP8 route workspace only.
+    # Callers must include their global routing and expert-padding bound.
+    schedule_capacity_rows: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +467,23 @@ def create_workspace(
     return workspace
 
 
+def _fp8_route_capacity(
+    config: MoKConfig, num_local_tokens: int, topk: int, ep_size: int
+) -> int:
+    base_rows = num_local_tokens * topk
+    if config.schedule_capacity_rows is None:
+        return base_rows * max(
+            2, math.ceil(ep_size * config.schedule_capacity_multiplier)
+        )
+    rows = config.schedule_capacity_rows
+    if type(rows) is not int or rows < base_rows or rows <= 0 or rows % 256:
+        raise ValueError(
+            "schedule_capacity_rows must be a positive M256-aligned integer "
+            "holding at least all local routes"
+        )
+    return rows
+
+
 def create_fp8_route_workspace(
     config: MoKConfig,
     group: dist.ProcessGroup,
@@ -497,13 +517,10 @@ def create_fp8_route_workspace(
     group_name = group.group_name
     ep_rank = dist.get_rank(group=group)
     ep_size = dist.get_world_size(group=group)
-    schedule_capacity_factor = max(
-        2, math.ceil(ep_size * config.schedule_capacity_multiplier)
-    )
-    schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
+    schedule_capacity = _fp8_route_capacity(config, num_local_tokens, topk, ep_size)
 
     local_shape = torch.tensor(
-        [num_local_tokens, hidden_size, topk, num_local_experts],
+        [num_local_tokens, hidden_size, topk, num_local_experts, schedule_capacity],
         dtype=torch.int64,
         device=device,
     )
@@ -515,7 +532,7 @@ def create_fp8_route_workspace(
     if not torch.all(gathered_shapes == local_shape).item():
         raise ValueError(
             "MoK requires identical token, hidden, top-k, and local-expert "
-            "shapes on every EP rank"
+            "shapes and route capacity on every EP rank"
         )
 
     x_buffer = symm_mem.empty(
@@ -1182,9 +1199,7 @@ def get_fp8_route_workspace(
     ep_size = dist.get_world_size(group=group)
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
-    schedule_capacity_factor = max(
-        2, math.ceil(ep_size * config.schedule_capacity_multiplier)
-    )
+    schedule_capacity = _fp8_route_capacity(config, num_local_tokens, topk, ep_size)
     cache_key = (
         group.group_name,
         device_index,
@@ -1192,7 +1207,7 @@ def get_fp8_route_workspace(
         hidden_size,
         topk,
         num_local_experts,
-        schedule_capacity_factor,
+        schedule_capacity,
     )
     cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
     if cached_workspace is not None:
