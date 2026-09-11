@@ -97,10 +97,10 @@ class WarpRoleState:
     push_done_ptrs: list[int]
 
 
-# (id(workspace), capacity) -> (workspace, state).  The workspace is kept alive
-# by the cache so its id cannot be recycled under a live state.
+# (id(workspace), capacity, memory_pool) -> (workspace, state). The cache keeps
+# both workspace and pool alive for as long as the cached state exists.
 _WARPROLE_STATE_CACHE: dict[
-    tuple[int, int], tuple[MoKFP8RouteWorkspace, WarpRoleState]
+    tuple[int, int, Any], tuple[MoKFP8RouteWorkspace, WarpRoleState]
 ] = {}
 
 
@@ -217,6 +217,7 @@ def get_warprole_state(
     *,
     device: torch.device,
     capacity: int,
+    memory_pool: torch.cuda.MemPool | None = None,
 ) -> WarpRoleState:
     """Return a cached launch state, creating one on first use.
 
@@ -225,13 +226,20 @@ def get_warprole_state(
     """
     if not isinstance(workspace, MoKFP8RouteWorkspace):
         raise TypeError("workspace must be a MoKFP8RouteWorkspace")
-    cache_key = (id(workspace), capacity)
+    cache_key = (id(workspace), capacity, memory_pool)
     cached = _WARPROLE_STATE_CACHE.get(cache_key)
     if cached is not None:
         return cached[1]
-    state = create_warprole_state(
-        workspace, group, device=device, capacity=capacity
-    )
+    from contextlib import nullcontext
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    with (
+        torch.cuda.use_mem_pool(memory_pool, device=device_index)
+        if memory_pool is not None else nullcontext()
+    ):
+        state = create_warprole_state(
+            workspace, group, device=device, capacity=capacity
+        )
     _WARPROLE_STATE_CACHE[cache_key] = (workspace, state)
     return state
 

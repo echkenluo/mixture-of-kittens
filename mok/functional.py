@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -247,7 +248,7 @@ class MoKFP8TerminalWorkspace:
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
 _FP8_ROUTE_WORKSPACE_CACHE: dict[
-    tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
+    tuple[str, int, int, int, int, int, int, Any], MoKFP8RouteWorkspace
 ] = {}
 _FP8_TERMINAL_WORKSPACE_CACHE: dict[
     tuple[str, int, int, int, int, int, int], MoKFP8TerminalWorkspace
@@ -1181,6 +1182,7 @@ def get_fp8_route_workspace(
     hidden_size: int,
     topk: int,
     num_local_experts: int,
+    memory_pool: torch.cuda.MemPool | None = None,
 ) -> MoKFP8RouteWorkspace:
     """Return a cached production FP8 route workspace."""
     validate_workspace_args(
@@ -1208,20 +1210,27 @@ def get_fp8_route_workspace(
         topk,
         num_local_experts,
         schedule_capacity,
+        memory_pool,
     )
     cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
     if cached_workspace is not None:
         return cached_workspace
 
-    workspace = create_fp8_route_workspace(
-        config,
-        group,
-        device=device,
-        num_local_tokens=num_local_tokens,
-        hidden_size=hidden_size,
-        topk=topk,
-        num_local_experts=num_local_experts,
-    )
+    # Keep the pool alive in the cache key. Only persistent workspace creation
+    # enters it; callers' inputs, outputs and per-forward temporaries do not.
+    with (
+        torch.cuda.use_mem_pool(memory_pool, device=device_index)
+        if memory_pool is not None else nullcontext()
+    ):
+        workspace = create_fp8_route_workspace(
+            config,
+            group,
+            device=device,
+            num_local_tokens=num_local_tokens,
+            hidden_size=hidden_size,
+            topk=topk,
+            num_local_experts=num_local_experts,
+        )
     _FP8_ROUTE_WORKSPACE_CACHE[cache_key] = workspace
     return workspace
 
