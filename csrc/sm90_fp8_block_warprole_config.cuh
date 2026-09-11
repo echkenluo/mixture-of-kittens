@@ -10,8 +10,10 @@ constexpr int HIDDEN = 4096, INTER = 2048, TOPK = 6;
 constexpr int M_TILE = 64, N_TILE = 128, K_TILE = 128;
 constexpr int W13_K_BLOCKS = HIDDEN / K_TILE;   // 32
 constexpr int W2_K_BLOCKS = INTER / K_TILE;     // 16
-constexpr int MINIBATCH_ROWS = 1024;
-constexpr int MINIBATCH_TILES = MINIBATCH_ROWS / M_TILE;   // 16
+// Experimental larger compute phase: preserve one-phase W13 lookahead and
+// all per-tile readiness dependencies; change only scheduling granularity.
+constexpr int MINIBATCH_ROWS = 2048;
+constexpr int MINIBATCH_TILES = MINIBATCH_ROWS / M_TILE;   // 32
 constexpr int DISPATCH_TICKET_ROWS = 8;
 // Named barriers are CTA-wide, not private to a warpgroup.  Reserve 1-4 for
 // consumers, 5-6 for W13 hand-off, 7 for epilogue warps, and 8 for comm.
@@ -51,7 +53,7 @@ template <int NC> MOK_WARPROLE_HD int64_t total_tasks(shape s) {
     return static_cast<int64_t>(s.num_rows / M_TILE) * geometry<NC>::TASKS_PER_TILE;
 }
 // Position of a task inside one phase (all the W13 or all the W2 tasks of one
-// minibatch): n-major, so the 16 tiles of a row block share one weight slab in L2.
+// minibatch): n-major, so the tiles of a row block share one weight slab in L2.
 template <int NC> MOK_WARPROLE_HD task phase_task(task_kind kind, int q, int tiles, int64_t local) {
     return task{kind, q, first_tile_of_minibatch(q) + static_cast<int>(local % tiles),
                 static_cast<int>(local / tiles)};

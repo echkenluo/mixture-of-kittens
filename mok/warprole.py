@@ -50,7 +50,7 @@ HIDDEN = 4096
 INTERMEDIATE = 2048
 TOPK = 6
 M_TILE = 64
-MINIBATCH_ROWS = 1024
+MINIBATCH_ROWS = 2048
 K_GROUP = 128
 
 # Same defaults the terminal path uses (mok/functional.py megakernel entries).

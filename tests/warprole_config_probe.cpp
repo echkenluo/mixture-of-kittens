@@ -63,17 +63,17 @@ static void check_order(shape s) {
 
 // The header promises constexpr (i.e. __host__ __device__ constexpr under nvcc),
 // so the decode must be usable in a constant expression.
-static_assert(minibatches(shape{12288}) == 12);
+static_assert(minibatches(shape{12288}) == 12288 / MINIBATCH_ROWS);
 static_assert(total_tasks<2>(shape{12288}) == 6144);
-static_assert(decode_task<2>(16 * 16, shape{12288}).kind == task_kind::w13);   // W13(1) follows W13(0)
-static_assert(decode_task<2>(16 * 32, shape{12288}).kind == task_kind::w2);    // then W2(0)
+static_assert(decode_task<2>(MINIBATCH_TILES * 16, shape{12288}).kind == task_kind::w13);   // W13(1) follows W13(0)
+static_assert(decode_task<2>(MINIBATCH_TILES * 32, shape{12288}).kind == task_kind::w2);    // then W2(0)
 
 int main() {
     shape s{12288};                         // 2048 token/rank, EP4, uniform
-    assert(minibatches(s) == 12);
-    assert(rows_in_minibatch(s, 11) == 1024);
+    assert(minibatches(s) == 12288 / MINIBATCH_ROWS);
+    assert(rows_in_minibatch(s, minibatches(s)-1) == MINIBATCH_ROWS);
     shape t{12288 + 64};                    // one tail tile
-    assert(minibatches(t) == 13 && tiles_in_minibatch(t, 12) == 1);
+    assert(minibatches(t) == minibatches(s)+1 && tiles_in_minibatch(t, minibatches(s)) == 1);
     using G2 = geometry<2>;
     assert(G2::W13_TASKS_PER_TILE == 16 && G2::W2_TASKS_PER_TILE == 16);
     assert(total_tasks<2>(s) == 12288 / 64 * 32);
@@ -81,20 +81,20 @@ int main() {
     assert(a.kind == task_kind::w13 && a.minibatch == 0 && a.m_tile == 0 && a.n_index == 0);
     task b = decode_task<2>(1, s);          // m inner
     assert(b.kind == task_kind::w13 && b.m_tile == 1 && b.n_index == 0);
-    task c = decode_task<2>(16, s);         // second i-tile
+    task c = decode_task<2>(MINIBATCH_TILES, s);         // second i-tile
     assert(c.kind == task_kind::w13 && c.m_tile == 0 && c.n_index == 1);
-    task d = decode_task<2>(16 * 16, s);    // W13 of minibatch 1 comes before W2 of minibatch 0
-    assert(d.kind == task_kind::w13 && d.minibatch == 1 && d.m_tile == 16 && d.n_index == 0);
-    task e = decode_task<2>(16 * 32, s);    // first W2 of minibatch 0
+    task d = decode_task<2>(MINIBATCH_TILES * 16, s);    // W13 of minibatch 1 comes before W2 of minibatch 0
+    assert(d.kind == task_kind::w13 && d.minibatch == 1 && d.m_tile == MINIBATCH_TILES && d.n_index == 0);
+    task e = decode_task<2>(MINIBATCH_TILES * 32, s);    // first W2 of minibatch 0
     assert(e.kind == task_kind::w2 && e.minibatch == 0 && e.m_tile == 0 && e.n_index == 0);
-    task e2 = decode_task<2>(16 * 48, s);   // then W13 of minibatch 2
-    assert(e2.kind == task_kind::w13 && e2.minibatch == 2 && e2.m_tile == 32 && e2.n_index == 0);
+    task e2 = decode_task<2>(MINIBATCH_TILES * 48, s);   // then W13 of minibatch 2
+    assert(e2.kind == task_kind::w13 && e2.minibatch == 2 && e2.m_tile == 2 * MINIBATCH_TILES && e2.n_index == 0);
     task f = decode_task<2>(total_tasks<2>(s), s);
     assert(f.kind == task_kind::none);
     task g = decode_task<2>(total_tasks<2>(t) - 1, t);   // tail minibatch, single tile
     assert(g.kind == task_kind::w2 && g.m_tile == 192 && g.n_index == 15);
-    assert(dispatch_tickets(s, 0) == 128 && ticket_first_row(s, 1, 3) == 1024 + 24);
-    assert(x_ready_target(s, 0) == 1024 && hidden_ready_target<2>() == 16 && y_ready_target<2>() == 32);
+    assert(dispatch_tickets(s, 0) == MINIBATCH_ROWS / 8 && ticket_first_row(s, 1, 3) == MINIBATCH_ROWS + 24);
+    assert(x_ready_target(s, 0) == MINIBATCH_ROWS && hidden_ready_target<2>() == 16 && y_ready_target<2>() == 32);
 
     // A negative index is out of range just like an index past the end.
     assert(decode_task<2>(-1, s).kind == task_kind::none);
@@ -108,10 +108,10 @@ int main() {
     check_coverage<2>(t, 193);              // tail minibatch of a single tile
     check_coverage<1>(t, 193);
     check_order<2>(s); check_order<1>(s); check_order<2>(t); check_order<1>(t);
-    shape v{2048};                          // exactly two minibatches: W13(0), W13(1), W2(0), W2(1)
-    check_coverage<2>(v, 32); check_order<2>(v);
-    shape w{1024 + 128};                    // two minibatches, partial second one
-    check_coverage<2>(w, 18); check_order<2>(w); check_order<1>(w);
+    shape v{2 * MINIBATCH_ROWS};                          // exactly two minibatches: W13(0), W13(1), W2(0), W2(1)
+    check_coverage<2>(v, 2 * MINIBATCH_TILES); check_order<2>(v);
+    shape w{MINIBATCH_ROWS + 128};                    // two minibatches, partial second one
+    check_coverage<2>(w, MINIBATCH_TILES + 2); check_order<2>(w); check_order<1>(w);
 
     // A single-tile shape: one (partial) minibatch, one tile's worth of tasks.
     shape u{64};
