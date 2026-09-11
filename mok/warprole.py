@@ -151,13 +151,22 @@ def create_warprole_state(
     if device != workspace.device:
         raise ValueError("device must be the workspace device")
 
-    hidden = torch.empty(
-        capacity, INTERMEDIATE, dtype=torch.float8_e4m3fn, device=device
-    )
-    hidden_scale = torch.empty(
-        capacity, INTERMEDIATE // K_GROUP, dtype=torch.float32, device=device
-    )
-    routed_y = torch.empty(capacity, HIDDEN, dtype=torch.bfloat16, device=device)
+    arena = workspace.scratch_arena
+    if arena is None:
+        hidden = torch.empty(
+            capacity, INTERMEDIATE, dtype=torch.float8_e4m3fn, device=device
+        )
+        hidden_scale = torch.empty(
+            capacity, INTERMEDIATE // K_GROUP, dtype=torch.float32, device=device
+        )
+        routed_y = torch.empty(capacity, HIDDEN, dtype=torch.bfloat16, device=device)
+    else:
+        arena.validate(group_name=workspace.group_name, device=device, capacity=capacity)
+        if workspace.in_use is not arena.in_use:
+            raise ValueError("shared scratch requires the arena's common workspace lease")
+        hidden = arena.hidden[:capacity]
+        hidden_scale = arena.hidden_scale[:capacity]
+        routed_y = arena.routed_y[:capacity]
     output = torch.empty(
         workspace.num_local_tokens, HIDDEN, dtype=torch.bfloat16, device=device
     )

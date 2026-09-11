@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from .scratch import FP8ScratchArena, clear_scratch_arena_cache
+
 from .ops import (
     all_gather_top_experts,
     barrier_all,
@@ -159,6 +161,7 @@ class MoKFP8RouteWorkspace:
     trap_record_ptr: int          # host address; device ptr resolved in C++
     in_use: torch.Tensor          # (1,) int32 production lease guard
     epilogue_done: torch.Tensor   # (1,) int32 release completion counter
+    scratch_arena: FP8ScratchArena | None = None
 
 
 @dataclass(slots=True)
@@ -247,7 +250,7 @@ class MoKFP8TerminalWorkspace:
 
 _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
 _FP8_ROUTE_WORKSPACE_CACHE: dict[
-    tuple[str, int, int, int, int, int, int], MoKFP8RouteWorkspace
+    tuple[str, int, int, int, int, int, int, FP8ScratchArena | None], MoKFP8RouteWorkspace
 ] = {}
 _FP8_TERMINAL_WORKSPACE_CACHE: dict[
     tuple[str, int, int, int, int, int, int], MoKFP8TerminalWorkspace
@@ -493,6 +496,7 @@ def create_fp8_route_workspace(
     hidden_size: int,
     topk: int,
     num_local_experts: int,
+    scratch_arena: FP8ScratchArena | None = None,
 ) -> MoKFP8RouteWorkspace:
     """Create SM90 storage for production FP8 dispatch and BF16 combine."""
     validate_workspace_args(
@@ -519,8 +523,14 @@ def create_fp8_route_workspace(
     ep_size = dist.get_world_size(group=group)
     schedule_capacity = _fp8_route_capacity(config, num_local_tokens, topk, ep_size)
 
+    if scratch_arena is not None:
+        if not isinstance(scratch_arena, FP8ScratchArena) or hidden_size != 4096 or topk != 6:
+            raise ValueError("shared scratch requires the H4096/top-6 warp-role contract")
+        scratch_arena.validate(group_name=group_name, device=device, capacity=schedule_capacity)
+
     local_shape = torch.tensor(
-        [num_local_tokens, hidden_size, topk, num_local_experts, schedule_capacity],
+        [num_local_tokens, hidden_size, topk, num_local_experts, schedule_capacity,
+         0 if scratch_arena is None else scratch_arena.capacity],
         dtype=torch.int64,
         device=device,
     )
@@ -578,18 +588,22 @@ def create_fp8_route_workspace(
         device=device,
     )
 
-    routed_x = torch.empty(
-        schedule_capacity,
-        hidden_size,
-        dtype=torch.float8_e4m3fn,
-        device=device,
-    )
-    routed_x_scale = torch.empty(
-        schedule_capacity,
-        hidden_size // 128,
-        dtype=torch.float32,
-        device=device,
-    )
+    if scratch_arena is None:
+        routed_x = torch.empty(
+            schedule_capacity,
+            hidden_size,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        routed_x_scale = torch.empty(
+            schedule_capacity,
+            hidden_size // 128,
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        routed_x = scratch_arena.routed_x[:schedule_capacity]
+        routed_x_scale = scratch_arena.routed_x_scale[:schedule_capacity]
     m_indices = torch.empty(
         schedule_capacity, dtype=torch.int32, device=device
     )
@@ -645,7 +659,10 @@ def create_fp8_route_workspace(
     # first-writer record survives for post-mortem.
     trap_record = torch.zeros(8, dtype=torch.int64).pin_memory()
     trap_record_ptr = trap_record.data_ptr()
-    in_use = torch.zeros(1, dtype=torch.int32, device=device)
+    # Every shared shape has the SAME guard. Never zero a borrowed guard:
+    # another workspace may still hold it on a different stream.
+    in_use = (torch.zeros(1, dtype=torch.int32, device=device)
+              if scratch_arena is None else scratch_arena.in_use)
     epilogue_done = torch.zeros(1, dtype=torch.int32, device=device)
     # Warm the K1 occupancy cache for THIS workspace's device while we are
     # guaranteed to be outside any CUDA graph capture; keep the measured
@@ -662,6 +679,15 @@ def create_fp8_route_workspace(
     dist.barrier(
         group=group, async_op=True, device_ids=[device_index]
     ).block_current_stream()
+
+    if scratch_arena is not None:
+        print(
+            f"MOK_SHARED_SCRATCH|rank={ep_rank}|capacity={schedule_capacity}"
+            f"|arena_capacity={scratch_arena.capacity}"
+            f"|arena_bytes={scratch_arena.capacity * 14528 + 4}"
+            f"|guard_ptr={scratch_arena.in_use.data_ptr()}",
+            flush=True,
+        )
 
     return MoKFP8RouteWorkspace(
         group_name=group_name,
@@ -714,6 +740,7 @@ def create_fp8_route_workspace(
         trap_record_ptr=trap_record_ptr,
         in_use=in_use,
         epilogue_done=epilogue_done,
+        scratch_arena=scratch_arena,
     )
 
 
@@ -1181,6 +1208,7 @@ def get_fp8_route_workspace(
     hidden_size: int,
     topk: int,
     num_local_experts: int,
+    scratch_arena: FP8ScratchArena | None = None,
 ) -> MoKFP8RouteWorkspace:
     """Return a cached production FP8 route workspace."""
     validate_workspace_args(
@@ -1200,6 +1228,11 @@ def get_fp8_route_workspace(
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
     schedule_capacity = _fp8_route_capacity(config, num_local_tokens, topk, ep_size)
+    if scratch_arena is not None:
+        if not isinstance(scratch_arena, FP8ScratchArena) or hidden_size != 4096 or topk != 6:
+            raise ValueError("shared scratch requires the H4096/top-6 warp-role contract")
+        scratch_arena.validate(group_name=group.group_name,
+                              device=torch.device("cuda", device_index), capacity=schedule_capacity)
     cache_key = (
         group.group_name,
         device_index,
@@ -1208,6 +1241,7 @@ def get_fp8_route_workspace(
         topk,
         num_local_experts,
         schedule_capacity,
+        scratch_arena,
     )
     cached_workspace = _FP8_ROUTE_WORKSPACE_CACHE.get(cache_key)
     if cached_workspace is not None:
@@ -1221,6 +1255,7 @@ def get_fp8_route_workspace(
         hidden_size=hidden_size,
         topk=topk,
         num_local_experts=num_local_experts,
+        scratch_arena=scratch_arena,
     )
     _FP8_ROUTE_WORKSPACE_CACHE[cache_key] = workspace
     return workspace
@@ -1361,6 +1396,7 @@ def clear_workspace_cache() -> None:
         torch.cuda.synchronize(workspace.device)
     _WORKSPACE_CACHE.clear()
     _FP8_ROUTE_WORKSPACE_CACHE.clear()
+    clear_scratch_arena_cache()
     _FP8_TERMINAL_WORKSPACE_CACHE.clear()
 
 
