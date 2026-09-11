@@ -26,7 +26,7 @@ dependency left is in the split reference used by the tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -103,10 +103,15 @@ _WARPROLE_STATE_CACHE: dict[
     tuple[int, int], tuple[MoKFP8RouteWorkspace, WarpRoleState]
 ] = {}
 
+# Views retain the original workspace/state and all symmetric-memory handles.
+# Once the base state is prepared, views need no GPU allocation/rendezvous/reset.
+_TOKEN_VIEW_CACHE: dict[tuple[int, int], tuple[Any, Any, Any]] = {}
+
 
 def clear_warprole_state_cache() -> None:
     """Drop cached states; call only after every rank has synchronized."""
     _WARPROLE_STATE_CACHE.clear()
+    _TOKEN_VIEW_CACHE.clear()
 
 
 def create_warprole_state(
@@ -243,6 +248,59 @@ def get_warprole_state(
     )
     _WARPROLE_STATE_CACHE[cache_key] = (workspace, state)
     return state
+
+
+def get_warprole_token_view(workspace, group, *, num_local_tokens):
+    """Use actual M256 tokens inside an already allocated eager workspace.
+
+    All EP ranks must choose the same token count in their serialized forward.
+    Storage, lease, schedule and barrier generations remain those of the base
+    workspace. The caller still owns the entire lease through its output copy.
+    The base state is prepared on first use, just as for the ordinary API.
+    This does not bound routed scratch by macrobatch or support concurrent use.
+    """
+    if not isinstance(workspace, MoKFP8RouteWorkspace):
+        raise TypeError("workspace must be a MoKFP8RouteWorkspace")
+    if (type(num_local_tokens) is not int or num_local_tokens < 256
+            or num_local_tokens % 256
+            or num_local_tokens > workspace.num_local_tokens):
+        raise ValueError("token view must be M256 aligned and fit its base workspace")
+    if group.group_name != workspace.group_name:
+        raise ValueError("group must be the workspace's process group")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("token views are reserved for serialized eager prefill")
+    if num_local_tokens == workspace.num_local_tokens:
+        return workspace
+    key = (id(workspace), num_local_tokens)
+    cached = _TOKEN_VIEW_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
+    state = get_warprole_state(
+        workspace, group, device=workspace.device,
+        capacity=workspace.schedule_capacity,
+    )
+    # A slice along axis 1 would retain the base rank stride and be wrong for
+    # schedule construction. Pack EP*T*topk elements from offset zero instead.
+    gathered = workspace.all_gather_top_experts_buffer.view(-1)
+    gathered = gathered[:workspace.ep_size * num_local_tokens * workspace.topk]
+    view = replace(
+        workspace,
+        num_local_tokens=num_local_tokens,
+        x_buffer=workspace.x_buffer[:num_local_tokens],
+        x_scale_buffer=workspace.x_scale_buffer[:num_local_tokens],
+        combine_buffer=workspace.combine_buffer[:num_local_tokens * workspace.topk],
+        output=workspace.output[:num_local_tokens],
+        all_gather_top_experts_buffer=gathered.view(
+            workspace.ep_size, num_local_tokens, workspace.topk
+        ),
+    )
+    view_state = replace(
+        state, num_local_tokens=num_local_tokens,
+        output=state.output[:num_local_tokens],
+    )
+    _TOKEN_VIEW_CACHE[key] = (workspace, view, state)
+    _WARPROLE_STATE_CACHE[(id(view), view.schedule_capacity)] = (view, view_state)
+    return view
 
 
 def _check_tensor(
